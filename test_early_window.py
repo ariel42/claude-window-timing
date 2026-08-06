@@ -321,6 +321,35 @@ def test_formatting():
     check("a negative delta keeps its sign", ew.fmt_delta(-90), "-0h01m30s")
     check("zero", ew.fmt_delta(0), "0h00m00s")
 
+    check("ordinary usage is plain", ew.fmt_pct(74), "74%")
+    check("usage at the threshold is flagged",
+          ew.fmt_pct(ew.HIGH_USAGE_PCT), "{}%!".format(ew.HIGH_USAGE_PCT))
+    check("usage above the threshold is flagged", ew.fmt_pct(95), "95%!")
+    check("just below the threshold is not flagged",
+          ew.fmt_pct(ew.HIGH_USAGE_PCT - 1), "{}%".format(ew.HIGH_USAGE_PCT - 1))
+    check("unknown usage", ew.fmt_pct(None), "?%")
+
+
+def test_usage_line():
+    section("The usage line written to the log")
+    now = time.time()
+    five, week = now + 3600, now + 3 * 86400
+
+    line = ew.format_usage({"five_hour": {"used_percentage": 95, "resets_at": five},
+                            "seven_day": {"used_percentage": 87, "resets_at": week}})
+    check_true("both limits appear", "5-hour" in line and "weekly" in line)
+    check_true("a nearly-exhausted limit is flagged", "95%!" in line)
+    check_true("a limit with room is not flagged", "87%" in line and "87%!" not in line)
+    check_true("each reset time is shown", line.count("resets") == 2)
+    check_true("the line is a single line", "\n" not in line)
+
+    check("only one limit reported -> only that one is shown",
+          "weekly" in ew.format_usage(
+              {"seven_day": {"used_percentage": 20, "resets_at": week}}), True)
+    check("nothing reported -> nothing logged", ew.format_usage({}), "")
+    check("a limit with no figures at all is skipped",
+          ew.format_usage({"five_hour": {}}), "")
+
 
 # ---------------------------------------------------------------------------
 # Setup must not freeze a refusal into the checkpoint
@@ -372,7 +401,7 @@ def main():
     for test in (test_refusal_text, test_next_window_start, test_guard_rails,
                  test_anchor_scheduling, test_statusline_parsing,
                  test_resume_baseline_race, test_without_systemd, test_formatting,
-                 test_init_refuses_to_checkpoint_a_refusal):
+                 test_usage_line, test_init_refuses_to_checkpoint_a_refusal):
         test()
     ew.cancel_anchor()
     print("\n{}".format("-" * 60))

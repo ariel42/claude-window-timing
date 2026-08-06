@@ -258,6 +258,44 @@ def read_statusline_limits():
     return latest
 
 
+# Usage at or above this is flagged with "!" in the log and in --status, so a
+# nearly-exhausted limit stands out when scanning back through a run of pings.
+HIGH_USAGE_PCT = 90
+
+_LIMIT_NAMES = (("five_hour", "5-hour"), ("seven_day", "weekly"))
+
+
+def fmt_pct(used):
+    if used is None:
+        return "?%"
+    return "{}%{}".format(used, "!" if used >= HIGH_USAGE_PCT else "")
+
+
+def format_usage(limits=None):
+    """
+    One line summarising both limits: how much is used, and when each resets.
+
+    Logged on every ping. It costs nothing extra — the figures already arrive with
+    the statusLine report the run needs anyway — and it turns the log into a
+    record of usage over time rather than only a record of pings.
+    """
+    if limits is None:
+        limits = read_statusline_limits()
+    now = time.time()
+    parts = []
+    for key, name in _LIMIT_NAMES:
+        window = limits.get(key) or {}
+        used, resets = window.get("used_percentage"), window.get("resets_at")
+        if used is None and resets is None:
+            continue
+        piece = "{} {}".format(name, fmt_pct(used))
+        if resets:
+            piece += " (resets {}, in {})".format(fmt_time(resets),
+                                                  fmt_delta(resets - now))
+        parts.append(piece)
+    return "Usage: " + " · ".join(parts) if parts else ""
+
+
 def _local_tz_name():
     """Best-effort IANA name of the machine's timezone (e.g. 'Asia/Jerusalem')."""
     try:
@@ -766,6 +804,10 @@ def run_interactive(extra_args, prompt_text, session_id,
     else:
         log("WARNING: no new assistant turn recorded — the ping may not have counted.")
 
+    usage = format_usage()
+    if usage:
+        log(usage)
+
     log(f"Exited with code: {proc.returncode}")
     return {"completed": completed, "limited": limited, "text": text}
 
@@ -894,16 +936,16 @@ def status():
         print("Last ping     : {} ({} ago)".format(
             fmt_time(state["last_run"]), fmt_delta(now - state["last_run"])))
 
-    five = state.get("rate_limits", {}).get("five_hour") or {}
-    if five.get("resets_at"):
-        print("5-hour window : resets {} (in {}) — {}% used".format(
-            fmt_time(five["resets_at"]), fmt_delta(five["resets_at"] - now),
-            five.get("used_percentage", "?")))
-    weekly = state.get("rate_limits", {}).get("seven_day") or {}
-    if weekly.get("resets_at"):
-        print("Weekly limit  : resets {} (in {}) — {}% used".format(
-            fmt_time(weekly["resets_at"]), fmt_delta(weekly["resets_at"] - now),
-            weekly.get("used_percentage", "?")))
+    limits = state.get("rate_limits", {})
+    for key, name in _LIMIT_NAMES:
+        window = limits.get(key) or {}
+        if not window.get("resets_at"):
+            continue
+        print("{:<14}: {} used, resets {} (in {})".format(
+            "5-hour window" if key == "five_hour" else "Weekly limit",
+            fmt_pct(window.get("used_percentage")),
+            fmt_time(window["resets_at"]),
+            fmt_delta(window["resets_at"] - now)))
 
     boundary = state.get("boundary")
     if boundary:
