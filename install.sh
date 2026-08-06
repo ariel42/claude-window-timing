@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — set up and deploy claude-extra-window as a systemd *user* service.
+# install.sh — set up and deploy claude-early-window as a systemd *user* service.
 # Creates the initial checkpoint session if needed, then installs a user timer.
 #
 # A user service (rather than a system service) is used deliberately: it runs in
@@ -20,7 +20,7 @@ USER_UNIT_DIR="$HOME/.config/systemd/user"
 # read, with margin to survive a missed ping. See the README timing section.
 INTERVAL_MIN=30
 
-echo "Claude Code Extra Window — Install"
+echo "Claude Code Early Window — Install"
 echo "===================================="
 
 # ── Make sure systemctl --user is reachable from this shell ───────────────────
@@ -57,21 +57,21 @@ echo ""
 
 # ── Checkpoint session (one-time) ─────────────────────────────────────────────
 
-if [ -f "$SCRIPT_DIR/extra_window_session_id.txt" ] && \
-   [ -f "$SCRIPT_DIR/extra_window_checkpoint.jsonl.bak" ]; then
-    echo "Checkpoint already exists (session $(head -c 8 "$SCRIPT_DIR/extra_window_session_id.txt")...) — skipping init."
+if [ -f "$SCRIPT_DIR/early_window_session_id.txt" ] && \
+   [ -f "$SCRIPT_DIR/early_window_checkpoint.jsonl.bak" ]; then
+    echo "Checkpoint already exists (session $(head -c 8 "$SCRIPT_DIR/early_window_session_id.txt")...) — skipping init."
 else
     echo "Creating checkpoint session (opens an interactive Claude session briefly)..."
     cd "$SCRIPT_DIR"
-    python3 claude_extra_window.py --init
+    python3 claude_early_window.py --init
 
-    if [ ! -f "$SCRIPT_DIR/extra_window_session_id.txt" ] || \
-       [ ! -f "$SCRIPT_DIR/extra_window_checkpoint.jsonl.bak" ]; then
+    if [ ! -f "$SCRIPT_DIR/early_window_session_id.txt" ] || \
+       [ ! -f "$SCRIPT_DIR/early_window_checkpoint.jsonl.bak" ]; then
         echo "ERROR: Checkpoint creation failed. See log for details:" >&2
-        echo "  $SCRIPT_DIR/claude_extra_window.log" >&2
+        echo "  $SCRIPT_DIR/claude_early_window.log" >&2
         exit 1
     fi
-    echo "Checkpoint created: $(cat "$SCRIPT_DIR/extra_window_session_id.txt")"
+    echo "Checkpoint created: $(cat "$SCRIPT_DIR/early_window_session_id.txt")"
 fi
 echo ""
 
@@ -80,14 +80,14 @@ echo ""
 echo "Deploying systemd user service and timer..."
 mkdir -p "$USER_UNIT_DIR"
 
-cat > "$USER_UNIT_DIR/claude-extra-window.service" << EOF
+cat > "$USER_UNIT_DIR/claude-early-window.service" << EOF
 [Unit]
-Description=Claude Code Extra Window
+Description=Claude Code Early Window
 
 [Service]
 Type=oneshot
 WorkingDirectory=$SCRIPT_DIR
-ExecStart=/usr/bin/python3 $SCRIPT_DIR/claude_extra_window.py
+ExecStart=/usr/bin/python3 $SCRIPT_DIR/claude_early_window.py
 # PATH so the script can locate the claude CLI; HOME is provided by the user manager.
 Environment=PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -95,9 +95,9 @@ Environment=PATH=$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/
 WantedBy=default.target
 EOF
 
-cat > "$USER_UNIT_DIR/claude-extra-window.timer" << EOF
+cat > "$USER_UNIT_DIR/claude-early-window.timer" << EOF
 [Unit]
-Description=Claude Code Extra Window — ping every ${INTERVAL_MIN} minutes
+Description=Claude Code Early Window — ping every ${INTERVAL_MIN} minutes
 
 [Timer]
 # OnActiveSec fires shortly after the timer starts (relative to timer activation,
@@ -116,8 +116,8 @@ WantedBy=timers.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable claude-extra-window.timer
-systemctl --user restart claude-extra-window.timer
+systemctl --user enable claude-early-window.timer
+systemctl --user restart claude-early-window.timer
 
 # Keep the timer firing while logged out (best-effort; needs privilege).
 if ! loginctl show-user "$CURRENT_USER" 2>/dev/null | grep -q "Linger=yes"; then
@@ -137,10 +137,10 @@ fi
 echo ""
 echo "Installed successfully."
 echo ""
-systemctl --user status claude-extra-window.timer --no-pager || true
+systemctl --user status claude-early-window.timer --no-pager || true
 echo ""
-echo "Logs : $SCRIPT_DIR/claude_extra_window.log"
+echo "Logs : $SCRIPT_DIR/claude_early_window.log"
 echo ""
-echo "To reset the checkpoint:  rm extra_window_session_id.txt extra_window_checkpoint.jsonl.bak && ./install.sh"
+echo "To reset the checkpoint:  rm early_window_session_id.txt early_window_checkpoint.jsonl.bak && ./install.sh"
 echo ""
 echo "To uninstall:  ./uninstall.sh"

@@ -1,12 +1,12 @@
 """
-Claude Code Extra Window
+Claude Code Early Window
 Keeps a Claude Code usage window rolling in the background so that you start work
 inside a fresh, almost-untouched window. Requires Python 3.6+, Linux, and the
 Claude Code CLI.
 
 Usage:
-  python3 claude_extra_window.py --init   # one-time setup (called by install.sh)
-  python3 claude_extra_window.py          # extra-window run (called by systemd timer)
+  python3 claude_early_window.py --init   # one-time setup (called by install.sh)
+  python3 claude_early_window.py          # early-window run (called by systemd timer)
 """
 
 import json
@@ -36,9 +36,9 @@ SESSION_DIR = os.path.join(
     HOME, ".claude", "projects", SCRIPT_DIR.replace("/", "-")
 )
 
-LOG_FILE          = os.path.join(SCRIPT_DIR, "claude_extra_window.log")
-SESSION_ID_FILE   = os.path.join(SCRIPT_DIR, "extra_window_session_id.txt")
-CHECKPOINT_BACKUP = os.path.join(SCRIPT_DIR, "extra_window_checkpoint.jsonl.bak")
+LOG_FILE          = os.path.join(SCRIPT_DIR, "claude_early_window.log")
+SESSION_ID_FILE   = os.path.join(SCRIPT_DIR, "early_window_session_id.txt")
+CHECKPOINT_BACKUP = os.path.join(SCRIPT_DIR, "early_window_checkpoint.jsonl.bak")
 
 LOG_RETENTION_HOURS = 48
 
@@ -286,8 +286,8 @@ def init():
         print(f"  Session: {open(SESSION_ID_FILE).read().strip()}")
         print(f"  Backup:  {CHECKPOINT_BACKUP} "
               f"({os.path.getsize(CHECKPOINT_BACKUP)} bytes)")
-        print("To reset, delete extra_window_session_id.txt and "
-              "extra_window_checkpoint.jsonl.bak, then re-run ./install.sh.")
+        print("To reset, delete early_window_session_id.txt and "
+              "early_window_checkpoint.jsonl.bak, then re-run ./install.sh.")
         return
 
     # Clean any partial state
@@ -311,12 +311,12 @@ def init():
 
 
 # ---------------------------------------------------------------------------
-# Extra-window run (called by the systemd timer on each interval)
+# Early-window run (called by the systemd timer on each interval)
 # ---------------------------------------------------------------------------
 
 def main():
     rotate_log()
-    log("Starting extra-window run...")
+    log("Starting early-window run...")
 
     if not os.path.exists(SESSION_ID_FILE) or not os.path.exists(CHECKPOINT_BACKUP):
         log("ERROR: No checkpoint found. Run ./install.sh to initialise.")
@@ -332,8 +332,8 @@ def main():
     log(f"Resuming checkpoint {checkpoint_id[:8]}... with 'bye'")
     ok = run_interactive(["--resume", checkpoint_id], "bye", checkpoint_id)
     if not ok:
-        log("WARNING: extra-window run did not confirm a completed turn.")
-    log("Extra-window run finished.\n")
+        log("WARNING: early-window run did not confirm a completed turn.")
+    log("Early-window run finished.\n")
 
 
 # ---------------------------------------------------------------------------

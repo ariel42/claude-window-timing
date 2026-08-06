@@ -1,4 +1,4 @@
-# claude-extra-window
+# claude-early-window
 
 A lightweight systemd user service that keeps your Claude Code 5-hour usage window rolling in the background. The payoff: whenever you sit down to work, you start with a **full window's capacity** already available and — on average — only about **2.5 hours** until it refreshes into the next full window. That's roughly **half** the up-to-5-hour wait you'd otherwise face when a window only starts the moment you do.
 
@@ -53,7 +53,7 @@ Since you sit down at an arbitrary point in this rolling cycle, the time left on
 
 ```bash
 git clone <repo-url>
-cd claude-extra-window
+cd claude-early-window
 chmod +x install.sh uninstall.sh
 ./install.sh
 ```
@@ -63,18 +63,18 @@ chmod +x install.sh uninstall.sh
 ## Managing the service
 
 ```bash
-systemctl --user status claude-extra-window.timer        # status and next run time
-systemctl --user list-timers claude-extra-window.timer
-journalctl --user -u claude-extra-window.service         # service output
+systemctl --user status claude-early-window.timer        # status and next run time
+systemctl --user list-timers claude-early-window.timer
+journalctl --user -u claude-early-window.service         # service output
 ```
 
-Each run is also recorded in `claude_extra_window.log`.
+Each run is also recorded in `claude_early_window.log`.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `claude_extra_window.py` | Main script. Run with `--init` for one-time setup; otherwise performs a single ping. |
+| `claude_early_window.py` | Main script. Run with `--init` for one-time setup; otherwise performs a single ping. |
 | `install.sh` | One-step install: prerequisite checks, checkpoint creation, and timer deployment. |
 | `uninstall.sh` | Removes the systemd user units; leaves runtime files in place. |
 
@@ -84,16 +84,16 @@ The systemd units are installed to `~/.config/systemd/user/` and managed with `s
 
 | File | Purpose |
 |---|---|
-| `extra_window_session_id.txt` | UUID of the checkpoint session. |
-| `extra_window_checkpoint.jsonl.bak` | Backup of the frozen `hi` session state. |
-| `claude_extra_window.log` | Rolling 48-hour log. |
+| `early_window_session_id.txt` | UUID of the checkpoint session. |
+| `early_window_checkpoint.jsonl.bak` | Backup of the frozen `hi` session state. |
+| `claude_early_window.log` | Rolling 48-hour log. |
 
 ## Resetting the checkpoint
 
 If the checkpoint session becomes invalid, recreate it:
 
 ```bash
-rm extra_window_session_id.txt extra_window_checkpoint.jsonl.bak
+rm early_window_session_id.txt early_window_checkpoint.jsonl.bak
 ./install.sh
 ```
 
@@ -106,7 +106,7 @@ rm extra_window_session_id.txt extra_window_checkpoint.jsonl.bak
 To also remove the runtime files:
 
 ```bash
-rm -f extra_window_session_id.txt extra_window_checkpoint.jsonl.bak claude_extra_window.log
+rm -f early_window_session_id.txt early_window_checkpoint.jsonl.bak claude_early_window.log
 ```
 
 ## Billing: subscription vs. API
