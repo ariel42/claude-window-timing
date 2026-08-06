@@ -212,44 +212,49 @@ def capture_statusline():
         pass
 
 
-def statusline_api_ms():
+def statusline_records():
     """
-    Highest total_api_duration_ms seen in the statusLine payloads so far.
+    Every complete statusLine payload captured so far, oldest first.
+
+    A half-written final line is skipped rather than treated as data — the file is
+    read while Claude Code is still appending to it, so "no valid JSON yet" is an
+    ordinary state, not an error.
+    """
+    records = []
+    try:
+        with open(STATUSLINE_FILE) as f:
+            for line in f:
+                try:
+                    records.append(json.loads(line))
+                except ValueError:
+                    continue
+    except (IOError, OSError):
+        pass
+    return records
+
+
+def statusline_api_ms(records=None):
+    """
+    Highest total_api_duration_ms reported by the statusLine so far.
 
     Claude Code only writes the session JSONL on exit, so a run cannot watch that
     file to know when the reply landed. The statusLine can: this counter stays at
     its starting value until the API call completes, then jumps. That is a far
     better completion signal than guessing from when the screen stops changing.
     """
-    best = 0
-    try:
-        with open(STATUSLINE_FILE) as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                best = max(best, (obj.get("cost") or {}).get("total_api_duration_ms") or 0)
-    except (IOError, OSError):
-        pass
-    return best
+    if records is None:
+        records = statusline_records()
+    return max([(r.get("cost") or {}).get("total_api_duration_ms") or 0
+                for r in records] or [0])
 
 
 def read_statusline_limits():
     """Return the most recent {'five_hour': {...}, 'seven_day': {...}} seen, or {}."""
     latest = {}
-    try:
-        with open(STATUSLINE_FILE) as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                limits = obj.get("rate_limits")
-                if isinstance(limits, dict) and limits:
-                    latest = limits
-    except (IOError, OSError):
-        pass
+    for record in statusline_records():
+        limits = record.get("rate_limits")
+        if isinstance(limits, dict) and limits:
+            latest = limits
     return latest
 
 
@@ -411,10 +416,23 @@ def next_window_start(limits, refusal_text, was_limited):
 # back exactly on the next boundary. After one correction the series is in phase
 # again and the anchor goes quiet until something else knocks it out.
 
+class _NoSystemd(object):
+    """Stand-in result for when the systemd binaries are not installed."""
+    returncode = 1
+    stdout = "systemd not available"
+
+
+def _run(cmd):
+    """Run a systemd command, tolerating its absence rather than crashing the ping."""
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True)
+    except (OSError, ValueError):
+        return _NoSystemd()
+
+
 def _systemctl(*args):
-    return subprocess.run(["systemctl", "--user"] + list(args),
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          universal_newlines=True)
+    return _run(["systemctl", "--user"] + list(args))
 
 
 def cancel_anchor():
@@ -428,6 +446,8 @@ def anchor_pending():
     """Return the pending anchor's scheduled time as a string, or '' if none."""
     result = _systemctl("show", ANCHOR_UNIT + ".timer",
                         "--property=NextElapseUSecRealtime", "--value")
+    if result.returncode != 0:
+        return ""
     value = (result.stdout or "").strip()
     return value if value and value not in ("n/a", "0") else ""
 
@@ -447,14 +467,13 @@ def schedule_anchor(target_epoch):
     """
     cancel_anchor()
     stamp = datetime.fromtimestamp(target_epoch).strftime("%Y-%m-%d %H:%M:%S")
-    result = subprocess.run(
+    result = _run(
         ["systemd-run", "--user", "--collect",
          "--unit", ANCHOR_UNIT,
          "--description", "Claude Early Window — one-shot window-boundary anchor",
          "--on-calendar", stamp,
          "--timer-property=AccuracySec=1s",
-         "systemctl", "--user", "start", "--no-block", SERVICE_UNIT],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+         "systemctl", "--user", "start", "--no-block", SERVICE_UNIT])
     if result.returncode != 0:
         log("WARNING: could not schedule anchor: {}".format(
             (result.stdout or "").strip()))
@@ -540,6 +559,14 @@ def _assistant_entries(session_id):
     return entries
 
 
+def _discard_session(session_id):
+    """Remove a session file from a failed setup attempt so a retry starts clean."""
+    try:
+        os.remove(_session_file(session_id))
+    except OSError:
+        pass
+
+
 def backup_checkpoint(session_id):
     src = _session_file(session_id)
     shutil.copy2(src, CHECKPOINT_BACKUP)
@@ -556,7 +583,7 @@ def restore_checkpoint(session_id):
 # ---------------------------------------------------------------------------
 
 def run_interactive(extra_args, prompt_text, session_id,
-                    startup_wait=8, completion_timeout=60):
+                    startup_wait=8, completion_timeout=60, statusline_wait=10):
     """
     Spawn an interactive Claude session in a PTY, send prompt_text, wait for the
     reply to settle, then /exit and verify the turn was recorded.
@@ -619,6 +646,22 @@ def run_interactive(extra_args, prompt_text, session_id,
         os.read(master_fd, 8192)  # drain startup output
     except BlockingIOError:
         pass
+
+    # Wait for one complete statusLine report before taking the baseline. On a
+    # --resume the very first report already carries the API duration inherited
+    # from the restored session, so a baseline taken before it arrives would be 0
+    # and that inherited figure would instantly look like our own reply landing.
+    # Waiting for a parsed record — not merely for the file to exist, which happens
+    # a moment earlier — closes that race. If no report ever comes (no
+    # subscription, so no statusLine data) the baseline stays 0, the counter stays
+    # 0, and completion falls through to the PTY heuristic below.
+    statusline_deadline = time.time() + statusline_wait
+    while time.time() < statusline_deadline and not statusline_records():
+        time.sleep(0.25)
+        try:
+            os.read(master_fd, 65536)
+        except BlockingIOError:
+            pass
 
     # Claude Code only persists the session JSONL on a clean exit, not mid-run, so
     # completion cannot be detected by watching that file. Two signals are used
@@ -754,8 +797,21 @@ def init():
     log(f"Creating checkpoint session {checkpoint_id[:8]}... with 'hi'")
 
     result = run_interactive(["--session-id", checkpoint_id], "hi", checkpoint_id)
+
+    # The checkpoint is frozen once and replayed by every future ping, so it must
+    # not be built out of a refusal. That would bake the refusal into the prompt
+    # for good, and install.sh would report success over a degraded setup.
+    if result["limited"]:
+        log("ERROR: Claude refused the first message, so there is no reply to "
+            "build the checkpoint from:")
+        log("  " + result["text"].strip())
+        log("Wait for the limit to reset, then run ./install.sh again.")
+        _discard_session(checkpoint_id)
+        sys.exit(1)
+
     if not result["completed"]:
         log("ERROR: Failed to create checkpoint session.")
+        _discard_session(checkpoint_id)
         sys.exit(1)
 
     with open(SESSION_ID_FILE, "w") as f:
@@ -872,13 +928,19 @@ def status():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    args = set(sys.argv[1:])
     # Must be first: Claude Code invokes this inside its UI loop and expects a
     # status line on stdout, nothing else.
-    if "--capture-statusline" in sys.argv:
+    if "--capture-statusline" in args:
         capture_statusline()
-    elif "--init" in sys.argv:
+    elif "--init" in args:
         init()
-    elif "--status" in sys.argv:
+    elif "--status" in args:
         status()
-    else:
+    elif not args:
         main()
+    else:
+        # Never fall through to a real ping on a typo or on --help: sending one
+        # is a side effect the user did not ask for.
+        print(__doc__.strip())
+        sys.exit(0 if args <= {"--help", "-h"} else 2)

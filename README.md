@@ -102,6 +102,8 @@ chmod +x install.sh uninstall.sh
 
 `install.sh` checks the prerequisites, creates the saved conversation, and installs the timer. The first ping runs a minute later, then every 30 minutes.
 
+If you happen to be over a limit when you install, setup stops and tells you when it resets. That is deliberate: the saved conversation is created once and reused by every future ping, so it has to be built from a real reply rather than a refusal. Run `./install.sh` again once the limit has reset.
+
 ## Checking on it
 
 ```bash
@@ -140,6 +142,9 @@ Every run is also written to `claude_early_window.log`.
 | `claude_early_window.py` | The whole tool. `--init` sets up, `--status` reports, no arguments sends one ping. |
 | `install.sh` | One-step install: checks, setup, and timer deployment. |
 | `uninstall.sh` | Removes the timer and cancels anything pending. Leaves your files alone. |
+| `test_early_window.py` | Tests for the scheduling logic. Run with `python3 test_early_window.py`. |
+
+The tests cover the decisions that would otherwise fail silently — which reset time to believe, which limit sets the target, and which readings are safe to act on. They never contact Claude and never spend any of your usage.
 
 The systemd units are installed to `~/.config/systemd/user/`.
 
