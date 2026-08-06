@@ -13,13 +13,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CURRENT_USER="$(whoami)"
 USER_UNIT_DIR="$HOME/.config/systemd/user"
 
-# Ping interval (minutes). 30 divides the 5-hour window evenly, so consecutive
-# windows sit effectively back-to-back (no gap) — meaning you almost always land
-# inside an active, nearly-untouched window when you start work. It also stays well
-# under the ~1-hour prompt-cache TTL, so every ping is a (rate-limit-exempt) cache
-# read, with margin to survive a missed ping. See the README timing section.
-INTERVAL_MIN=30
-
 echo "Claude Code Early Window — Install"
 echo "===================================="
 
@@ -51,8 +44,21 @@ if ! command -v systemctl &>/dev/null; then
     exit 1
 fi
 
+# systemd-run creates the one-shot "anchor" timer that re-aligns the schedule with
+# the real window boundary. Without it the tool still pings on its fixed cadence;
+# it just cannot correct its phase after a missed ping.
+if ! command -v systemd-run &>/dev/null; then
+    echo "  WARNING: systemd-run not found — boundary anchoring will be disabled."
+fi
+
+# The ping interval lives in claude_early_window.py so there is exactly one
+# definition; the timer below is generated from it.
+INTERVAL_MIN="$(cd "$SCRIPT_DIR" && python3 -c \
+    'import claude_early_window as m; print(m.INTERVAL_MIN)')"
+
 echo "  python : $(python3 --version)"
 echo "  claude : $("$CLAUDE_BIN" --version 2>/dev/null || echo 'version unknown')"
+echo "  ping   : every ${INTERVAL_MIN} minutes"
 echo ""
 
 # ── Checkpoint session (one-time) ─────────────────────────────────────────────
@@ -102,12 +108,15 @@ Description=Claude Code Early Window — ping every ${INTERVAL_MIN} minutes
 [Timer]
 # OnActiveSec fires shortly after the timer starts (relative to timer activation,
 # so it works regardless of how long the user manager has been up); OnUnitActiveSec
-# then repeats every INTERVAL_MIN after each run completes.
+# then repeats every INTERVAL_MIN after the service was last activated.
+#
+# "Last activated" is what makes the boundary anchor work: when the one-shot anchor
+# starts this same service, the repeating series re-anchors off that run, so a
+# single correction puts every later ping back on the window boundary.
 OnActiveSec=1min
 OnUnitActiveSec=${INTERVAL_MIN}min
-# systemd's default accuracy is 1 minute, which rounds the interval up to the next
-# minute boundary and turns 59min into an effective ~60min cadence. Tighten it so
-# the interval stays just under the ~1h prompt-cache TTL as intended.
+# systemd's default accuracy is 1 minute, which would let each ping land up to a
+# minute late and quietly stretch the cadence. Tighten it so the interval is kept.
 AccuracySec=1s
 Persistent=true
 

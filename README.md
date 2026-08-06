@@ -1,53 +1,95 @@
 # claude-early-window
 
-A lightweight systemd user service that keeps your Claude Code 5-hour usage window rolling in the background. The payoff: whenever you sit down to work, you start with a **full window's capacity** already available and — on average — only about **2.5 hours** until it refreshes into the next full window. That's roughly **half** the up-to-5-hour wait you'd otherwise face when a window only starts the moment you do.
+A small background service that keeps your Claude Code 5-hour usage window running around the clock, so it always **starts before you do**.
 
-Under the hood it drives the **interactive** Claude CLI (not `claude -p`), which is what keeps each ping on your subscription's usage window rather than billing the API — see [Billing](#billing-subscription-vs-api).
+The result: when you sit down to work, you are already inside a window that is almost completely unused, and the next fresh window arrives sooner — usually in about half the time you would otherwise wait.
 
-## Background
+## The problem
 
-Claude Code subscriptions meter usage in a rolling **5-hour window**. The window does not follow a fixed clock: it starts the moment you send your first prompt and resets five hours later. Begin work at 9 am with no prior activity and your window runs 9 am–2 pm — so you may exhaust it in the middle of your most productive hours.
+Claude Code gives you a **5-hour usage window**. The clock does not start at a fixed time of day — it starts the moment you send your first message.
 
-A common manual workaround is to send a throwaway message earlier in the day, shifting the window — and its reset — to a more convenient time. This tool automates that idea and runs it around the clock.
+So if you begin work at 9:00 and haven't used Claude before that, your window runs 9:00 to 14:00. If you use it all up by 11:30, you now wait until 14:00 doing nothing. The window started late because *you* started late, and the whole day is pushed back with it.
 
-Every 30 minutes it sends a tiny ping from a single reused session. The pings cost almost nothing against your usage (see [How the timing works](#how-the-timing-works)), but they keep your windows continuously rolling. As a result, when you start work:
+A lot of people work around this by hand: send Claude a throwaway "hi" early in the morning so the window starts then, not when they actually sit down.
 
-- you are already inside a window that is **nearly untouched**, because the overnight pings consume almost none of it; and
-- because windows have been resetting on a steady cadence, **a fresh window reliably resets during your working hours**, giving you more usable capacity across the day.
+## What this tool does
 
-In practice this means you sit down with a full window's capacity already available and, on average, only about **2.5 hours** until it refreshes into the next full window — roughly **half** the 5-hour wait you'd face if the window had only started when you sat down.
+It sends that throwaway message for you, every 30 minutes, all day and all night.
 
-The background session is never something you interact with; you open your own Claude Code sessions as usual.
+The messages are tiny — a single "bye" to a saved one-line conversation — so they use almost none of your allowance. But they keep a window always running in the background.
 
-## How it works
+Here is the same morning, with the tool running:
 
-1. **Setup** creates a frozen checkpoint — a single session containing just `hi` → response — and backs up the session file in that state.
-2. **Every 30 minutes** a systemd user timer runs the script, which:
-   - restores the session file to the frozen checkpoint,
-   - resumes the session **in interactive mode** (not `claude -p`) and sends `bye`,
-   - waits for the reply, then exits.
-3. Because the checkpoint is restored before every run, the session never grows: the server always sees the same two-turn conversation, so the cost of a ping stays constant no matter how long the tool has been running.
+| | Without the tool | With the tool |
+|---|---|---|
+| Window starts | 9:00 — when you sit down | 6:40 — a background ping started it |
+| Window ends | 14:00 | 11:40 |
+| How much is left when you start at 9:00 | all of it | almost all of it — the pings used a sliver |
+| How long until a **fresh** window | 5 hours | 2 hours 40 minutes |
 
-Since you sit down at an arbitrary point in this rolling cycle, the time left on the current window when you start can be anything from 0 to 5 hours — 2.5 hours is the average, not a guarantee. The window is nearly untouched either way, so its full capacity is available regardless of how much time is left before it resets.
+You get the same full capacity, but you don't wait as long for the next refill. Where the window happens to be when you sit down is luck — sometimes it just reset and you have nearly 5 hours, sometimes it is about to reset and you have a few minutes. Averaged over many days it works out to roughly **2.5 hours**, versus a flat 5 hours if the window only ever started when you did.
+
+The background conversation is never something you talk to. You open your own Claude Code sessions exactly as usual.
+
+## Staying on schedule
+
+This is the part that makes it reliable over weeks rather than days.
+
+A window lasts 5 hours, and the pings are 30 minutes apart, so a ping lands exactly on the moment each window ends. That ping immediately starts the next window, with no gap. As long as that keeps happening, everything stays lined up on its own.
+
+**Sometimes a ping doesn't happen.** Your laptop was asleep. The internet was down. Claude was having a bad day. Or you used the window up yourself, so Claude refused the ping until your limit reset.
+
+When the ping at the end of a window is missed, the next window starts late — and it stays late. Every window after it is measured from that late start, so a single missed ping pushes your whole schedule back permanently.
+
+**An example.** Your windows have been ending neatly at 17:00.
+
+- Your laptop is asleep at 17:00, so no ping happens.
+- It wakes at 17:20, pings, and a new window starts — 20 minutes late.
+- That window now ends at 22:20 instead of 22:00. The next one ends at 03:20. The 20 minutes are gone for good, and every future window inherits the delay.
+
+**The fix.** Claude Code knows exactly when your current window ends, and now this tool reads that. Shortly before the window is due to end, it books one extra ping for **30 seconds after** that exact moment.
+
+So in the example above, the tool sees the window ends at 22:20, books a ping for 22:20:30, and that ping lands right on the boundary. Because the regular every-30-minutes rhythm restarts from whenever the last ping happened, everything after it is back in step: 22:50:30, 23:20:30, and so on — landing on the next boundary again. **One correction and the schedule is fixed.**
+
+**Why 30 seconds late instead of exactly on time?** Because being early and being late are not equally bad:
+
+- A ping that arrives a moment **too early** finds the old window still running. Nothing new starts, and the tool waits another 30 minutes. Cost: 30 minutes.
+- A ping that arrives a moment **too late** starts the new window a few seconds late. Cost: a few seconds.
+
+So it deliberately aims a little late. The extra ping only gets booked when the moment is less than 30 minutes away, because that is the point where the tool has the freshest and most accurate reading.
+
+### There are two limits, and both have a say
+
+Claude has a 5-hour limit *and* a separate weekly one. A ping has to get past **both**, so the tool aims at whichever of the two frees up **last**.
+
+Almost always that is just the 5-hour window — the weekly limit is nowhere near full and simply doesn't come into it. It only starts to matter once the weekly limit is actually used up:
+
+- **Weekly limit frees up after the window ends.** Say the window ends at 22:00 but the weekly limit doesn't reset until Sunday. A ping at 22:00 would just be refused. So the tool aims at Sunday instead.
+- **Weekly limit frees up before the window ends.** Say the weekly limit resets at 14:00 but the current window runs until 18:00. A ping at 14:00 gets through, but there is already a window running, so nothing new starts. The tool aims at 18:00.
+
+Either way: the later of the two is the first moment a ping can both get through *and* start a fresh window.
+
+**The ordinary pings never stop.** Even while the weekly limit is refusing everything, the tool keeps trying every 30 minutes. It costs nothing to keep knocking, and it means that if the limit lifts early — because you upgraded your plan, say — the very next ping picks it straight up. You are never left waiting days for a schedule the tool decided on earlier.
 
 ## Features
 
-- **Half the wait for a fresh window (the main payoff)** — you almost always sit down inside a nearly-untouched window, so full capacity is available immediately and the next reset arrives in about **2.5 hours** on average instead of 5 — roughly half the usual wait.
-- **Subscription-safe by design** — drives the *interactive* Claude CLI, not `claude -p`. The print/headless path has a billing bug that can charge API rates even under a subscription ([#43333](https://github.com/anthropics/claude-code/issues/43333)), and Anthropic's announced (currently paused) change would move `claude -p`, the Agent SDK, and GitHub Actions usage off subscription limits entirely. Interactive terminal usage stays on the subscription, so the pings keep doing their job. See [Billing](#billing-subscription-vs-api).
-- **Negligible usage cost** — the reused prompt is served from Anthropic's prompt cache, and cache reads are not charged against your usage window, so in practice only about 60 tokens per ping are actually counted. See [How the timing works](#how-the-timing-works).
-- **Minimal footprint** — each ping disables all built-in tools (`--tools ""`) and MCP servers (`--strict-mcp-config`) and uses the smallest model (`--model haiku --effort low`), keeping the request to roughly 15K cached tokens.
-- **Constant size** — a frozen checkpoint is restored before every run, so neither the on-disk session nor the context sent to the server ever accumulates.
-- **Confirmed pings** — every run verifies that the turn actually completed and records its token cost (cache read vs. write) in the log, so a failed ping is visible rather than silently assumed to have worked.
-- **Runs as a systemd user service** — no root-owned units, and no `sudo` to install or manage it. `sudo` is used only — and optionally — to enable linger so the timer keeps running while you are logged out.
-- **Keychain-friendly** — runs inside your user session, so OAuth credentials held in the system keyring are available without extra configuration.
-- **Self-contained** — pure Python standard library with no dependencies to install; all paths are derived at runtime, with nothing hardcoded.
-- **Automatic log rotation** — the log is trimmed to the most recent 48 hours on each run.
+- **A fresh window comes sooner** — you sit down inside an almost untouched window, and the next one arrives in about 2.5 hours on average instead of 5.
+- **Self-correcting schedule** — after any missed ping, the tool books one extra ping at the exact moment a new window can start and puts the whole rhythm back on time. It accounts for both the 5-hour and the weekly limit.
+- **Never gives up** — pings keep going even while a limit is refusing them, so the moment anything frees up (including an upgrade) it is picked up within 30 minutes.
+- **Costs almost nothing** — every ping reuses the identical saved conversation, so Claude serves it from its cache, and cached text is not counted against your usage. Only about 60 tokens per ping actually count.
+- **Small footprint** — each ping turns off all tools and MCP servers and uses the smallest model, so the request stays as light as possible.
+- **Never grows** — the saved conversation is reset before every ping, so it stays exactly two messages long no matter how long the tool has been running.
+- **Confirmed pings** — every run checks that Claude actually replied and writes what it cost to the log, so a failed ping is visible instead of silently assumed.
+- **Subscription-safe by design** — drives the *interactive* Claude CLI, not `claude -p`. See [Billing](#billing-subscription-vs-api).
+- **Leaves your setup alone** — the settings it needs are passed to the background ping only. Your own Claude Code configuration is never touched.
+- **Runs as a systemd user service** — no root-owned units and no `sudo` to install or manage. `sudo` is used only, and optionally, to keep the timer running while you are logged out.
+- **Self-contained** — pure Python standard library, nothing to install, no hardcoded paths.
 
 ## Requirements
 
 - Linux with systemd
 - Python 3.6 or later
-- [Claude Code CLI](https://claude.ai/download), installed and signed in to a **Pro or Max subscription** (see [Billing](#billing-subscription-vs-api))
+- [Claude Code CLI](https://claude.ai/download), signed in to a **Pro or Max subscription** (see [Billing](#billing-subscription-vs-api))
 
 ## Quick start
 
@@ -58,39 +100,62 @@ chmod +x install.sh uninstall.sh
 ./install.sh
 ```
 
-`install.sh` runs the prerequisite checks, creates the checkpoint session, and installs the systemd user timer. The timer starts immediately and fires every 30 minutes.
+`install.sh` checks the prerequisites, creates the saved conversation, and installs the timer. The first ping runs a minute later, then every 30 minutes.
 
-## Managing the service
+## Checking on it
 
 ```bash
-systemctl --user status claude-early-window.timer        # status and next run time
-systemctl --user list-timers claude-early-window.timer
-journalctl --user -u claude-early-window.service         # service output
+python3 claude_early_window.py --status
 ```
 
-Each run is also recorded in `claude_early_window.log`.
+```
+Claude Code Early Window — status
+==================================
+Checkpoint    : 715429f4-26c4-4720-b986-8c786c9d997b
+Last ping     : 2026-08-06 17:36:13 (0h00m02s ago)
+5-hour window : resets 2026-08-06 21:40:00 (in 4h03m45s) — 84% used
+Weekly limit  : resets 2026-08-10 22:00:00 (in 100h23m45s) — 86% used
+Next start-of-window opportunity: 2026-08-06 21:40:00 (in 4h03m45s)
+  set by the 5-hour window   [via statusline]
+Anchor        : none scheduled
+Next ping     : Thu 2026-08-06 18:05:59 IDT
+```
+
+"Next start-of-window opportunity" is the first moment a ping could both get through and start a fresh window, and it says which limit decided that. "Anchor" is the extra ping described in [Staying on schedule](#staying-on-schedule) — most of the time there is none scheduled, because most of the time the regular rhythm is already correct.
+
+The usual systemd commands work too:
+
+```bash
+systemctl --user status claude-early-window.timer
+systemctl --user list-timers claude-early-window.timer
+journalctl --user -u claude-early-window.service
+```
+
+Every run is also written to `claude_early_window.log`.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `claude_early_window.py` | Main script. Run with `--init` for one-time setup; otherwise performs a single ping. |
-| `install.sh` | One-step install: prerequisite checks, checkpoint creation, and timer deployment. |
-| `uninstall.sh` | Removes the systemd user units; leaves runtime files in place. |
+| `claude_early_window.py` | The whole tool. `--init` sets up, `--status` reports, no arguments sends one ping. |
+| `install.sh` | One-step install: checks, setup, and timer deployment. |
+| `uninstall.sh` | Removes the timer and cancels anything pending. Leaves your files alone. |
 
-The systemd units are installed to `~/.config/systemd/user/` and managed with `systemctl --user`.
+The systemd units are installed to `~/.config/systemd/user/`.
 
-### Runtime files (created by install.sh, gitignored)
+### Files created while running (gitignored)
 
 | File | Purpose |
 |---|---|
-| `early_window_session_id.txt` | UUID of the checkpoint session. |
-| `early_window_checkpoint.jsonl.bak` | Backup of the frozen `hi` session state. |
+| `early_window_session_id.txt` | Which saved conversation to reuse. |
+| `early_window_checkpoint.jsonl.bak` | The saved two-message conversation, restored before every ping. |
+| `early_window_state.json` | When the window resets, and whether an extra ping is booked. |
+| `early_window_statusline.jsonl` | How Claude reports the window reset time. Rewritten each run. |
 | `claude_early_window.log` | Rolling 48-hour log. |
 
-## Resetting the checkpoint
+## Starting over
 
-If the checkpoint session becomes invalid, recreate it:
+If the saved conversation stops working, recreate it:
 
 ```bash
 rm early_window_session_id.txt early_window_checkpoint.jsonl.bak
@@ -103,42 +168,45 @@ rm early_window_session_id.txt early_window_checkpoint.jsonl.bak
 ./uninstall.sh
 ```
 
-To also remove the runtime files:
+To also remove the files it created:
 
 ```bash
-rm -f early_window_session_id.txt early_window_checkpoint.jsonl.bak claude_early_window.log
+rm -f early_window_session_id.txt early_window_checkpoint.jsonl.bak \
+      early_window_state.json early_window_statusline.jsonl claude_early_window.log
 ```
 
 ## Billing: subscription vs. API
 
-Whether usage counts against your subscription or your pay-as-you-go API account is decided by **authentication**, not by which mode the CLI runs in:
+Whether usage counts against your subscription or your pay-as-you-go API account is decided by **how you are signed in**, not by which mode the CLI runs in:
 
-- The tool is only useful when Claude Code is signed in to a **Pro or Max subscription** (OAuth). Under API-key authentication the pings would be billed per token, and the tool serves no purpose.
-- If `ANTHROPIC_API_KEY` is set, the CLI prefers it and bills the API account. The script runs Claude with a clean environment that omits `ANTHROPIC_API_KEY`, keeping pings on your subscription.
-- Pings run in interactive mode rather than `--print`, because `claude --print` under OAuth has a reported issue where it can be billed as API usage ([anthropics/claude-code#43333](https://github.com/anthropics/claude-code/issues/43333)).
+- The tool is only useful when Claude Code is signed in to a **Pro or Max subscription**. With an API key the pings would simply be billed per token and the tool would serve no purpose.
+- If `ANTHROPIC_API_KEY` is set, the CLI prefers it and bills the API account. The script runs Claude with a clean environment that leaves that variable out, keeping pings on your subscription.
+- Pings run in interactive mode rather than `--print`, because `claude --print` under a subscription login has a reported problem where it can be billed as API usage ([anthropics/claude-code#43333](https://github.com/anthropics/claude-code/issues/43333)). Anthropic's announced (currently paused) change would also move `claude -p`, the Agent SDK, and GitHub Actions usage off subscription limits entirely. Interactive terminal usage stays on the subscription.
 
 ## Notes and caveats
 
 - This project is not affiliated with or endorsed by Anthropic. Running an automated background process against a subscription around the clock may conflict with Anthropic's terms of service; use it at your own discretion.
-- Pings are cheap but not free. They also draw a small amount from the separate **7-day** usage limit (roughly 48 pings per day).
-- The tool depends on the Claude Code session-storage layout under `~/.claude/projects/`, an internal detail that could change in future CLI releases.
-- Tested on Linux with systemd only; macOS and Windows are not supported.
+- Pings are cheap but not free. They also draw a small amount from the separate **weekly** limit (about 48 pings a day).
+- If you hit your weekly limit, pings keep being sent and keep being refused until it resets. That is deliberate — see [There are two limits](#there-are-two-limits-and-both-have-a-say).
+- A booked extra ping does not survive a reboot. That is harmless: after a restart the next ordinary ping reads the reset times again and books a new one if needed.
+- The tool relies on where Claude Code stores its sessions (`~/.claude/projects/`) and on the window reset time it reports. Both are internal details that could change in a future release.
+- Tested on Linux with systemd only. macOS and Windows are not supported.
 
-## How the timing works
+## Why 30 minutes
 
-The 30-minute interval balances two goals: keeping each ping free, and minimizing the gap between consecutive windows.
+Two things decide the interval.
 
-**Keeping pings free.** Every ping reuses the *identical* frozen session, so the bulk of the request — roughly 15K tokens of system prompt — is byte-for-byte the same each time and is served from the prompt cache. And:
+**Keeping pings free.** Every ping reuses the identical saved conversation, so Claude recognises it and serves it from its cache. Cached text is not counted against your limit:
 
 > Cache reads are not deducted from your rate limit. — [Anthropic documentation](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 
-So a cached ping costs on the order of 60 counted tokens (the new `bye` plus the short reply), with the ~15K-token prompt riding along for free. The catch is the cache lifetime: Anthropic's documented default is a 5-minute TTL with a 1-hour option (server-controlled), but in practice Claude Code sessions are cached for about an hour and each read refreshes that lifetime. Any interval comfortably under ~1 hour keeps every ping a free read.
+The cache only lasts about an hour, though, and each ping refreshes it. Anything comfortably under an hour keeps every ping free. Go over an hour and the cache lapses, and each ping suddenly costs its full size.
 
-**Minimizing the window gap.** A 5-hour window starts on your first prompt and resets exactly five hours later, and a new window only begins on the next ping *after* the previous one expires. If the interval doesn't divide evenly into five hours, that leaves a stretch with no active window — a 59-minute interval, for example, leaves a ~54-minute gap. **30 minutes divides the 5-hour window evenly**, so consecutive windows sit effectively back-to-back (a few minutes of scheduling jitter aside). That matters because it means when you sit down at a random time you almost always land *inside* an active, nearly-untouched window, with — on average — about **2.5 hours** until it resets into the next full window. (2.5 hours is the theoretical minimum for a 5-hour window with random arrival; any gap only pushes the average higher.)
+**Landing on the boundary.** A window lasts 5 hours, and a new one only starts on the first ping *after* the old one ends. 30 minutes goes into 5 hours a whole number of times, so a ping falls exactly on the end of each window and the next one starts immediately, with no dead gap in between. An interval that doesn't divide evenly — 59 minutes, say — would leave a stretch of nearly an hour with no window running at all, which is exactly when you might sit down.
 
-A 30-minute interval also adds resilience: a single missed ping (a transient error, or the machine asleep) no longer risks a long gap or a cold cache, because the next attempt is only 30 minutes away — still within the ~1-hour cache lifetime. The cost is ~48 tiny pings per day instead of ~24, which is still negligible.
+30 minutes also means a single missed ping is not a disaster: the next attempt is only half an hour away, still inside the cache lifetime. The cost is about 48 tiny pings a day instead of 24.
 
-The interval is defined in one place: `INTERVAL_MIN` in `install.sh` (which sets the timer's `OnUnitActiveSec`). Each run logs `cache_read` versus `cache_write`, so you can confirm pings are being served from cache. If you'd rather halve the request count and don't mind a larger between-window gap, a value just under 60 also works (it stays within the cache lifetime); going *above* ~1 hour is the real mistake, since the cache would lapse and each ping would become a counted ~15K-token write.
+The interval is defined in one place — `INTERVAL_MIN` in `claude_early_window.py` — and `install.sh` reads it from there when writing the timer.
 
 ## License
 

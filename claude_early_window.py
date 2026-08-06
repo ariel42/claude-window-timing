@@ -5,13 +5,16 @@ inside a fresh, almost-untouched window. Requires Python 3.6+, Linux, and the
 Claude Code CLI.
 
 Usage:
-  python3 claude_early_window.py --init   # one-time setup (called by install.sh)
-  python3 claude_early_window.py          # early-window run (called by systemd timer)
+  python3 claude_early_window.py --init    # one-time setup (called by install.sh)
+  python3 claude_early_window.py           # early-window run (called by systemd timer)
+  python3 claude_early_window.py --status  # show the current window / anchor state
 """
 
 import json
 import os
 import pty
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -39,8 +42,38 @@ SESSION_DIR = os.path.join(
 LOG_FILE          = os.path.join(SCRIPT_DIR, "claude_early_window.log")
 SESSION_ID_FILE   = os.path.join(SCRIPT_DIR, "early_window_session_id.txt")
 CHECKPOINT_BACKUP = os.path.join(SCRIPT_DIR, "early_window_checkpoint.jsonl.bak")
+STATE_FILE        = os.path.join(SCRIPT_DIR, "early_window_state.json")
+STATUSLINE_FILE   = os.path.join(SCRIPT_DIR, "early_window_statusline.jsonl")
 
 LOG_RETENTION_HOURS = 48
+
+# ---------------------------------------------------------------------------
+# Timing
+# ---------------------------------------------------------------------------
+#
+# INTERVAL_MIN is the single source of truth for the ping cadence: install.sh
+# reads it from here when it writes the systemd timer. 30 divides the 5-hour
+# window evenly, so consecutive windows sit back-to-back, and it stays well under
+# the ~1-hour prompt-cache TTL so every ping is a (rate-limit-exempt) cache read.
+INTERVAL_MIN = 30
+
+# A window reset reported as 17:00:00 is pinged at 17:00:30. Firing *early* is the
+# only real failure mode — the ping would land inside the old window, be wasted,
+# and leave us waiting another full interval — so we deliberately aim late. The
+# ping itself needs ~8s of CLI startup before it reaches the API, so the request
+# actually arrives around +38s. That lateness is harmless; earliness is not.
+RESET_GUARD_SEC = 30
+
+WINDOW_HOURS = 5
+
+# systemd units. The anchor is a transient one-shot timer created with systemd-run;
+# it exists only between being scheduled and firing.
+SERVICE_UNIT = "claude-early-window.service"
+ANCHOR_UNIT  = "claude-early-window-anchor"
+
+# Give up on re-anchoring after this many consecutive anchors that still came back
+# rate-limited — if the reset time we parsed were wrong, this stops a hot loop.
+MAX_ANCHOR_STREAK = 3
 
 
 # Environment variables to pass through to the Claude subprocess *if* present.
@@ -104,6 +137,381 @@ def rotate_log():
 
 
 # ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+def read_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (IOError, OSError, ValueError):
+        return {}
+
+
+def write_state(state):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, STATE_FILE)
+
+
+def fmt_time(epoch):
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_delta(seconds):
+    seconds = int(round(seconds))
+    sign = "-" if seconds < 0 else ""
+    seconds = abs(seconds)
+    return "{}{}h{:02d}m{:02d}s".format(sign, seconds // 3600,
+                                        (seconds % 3600) // 60, seconds % 60)
+
+
+# ---------------------------------------------------------------------------
+# Learning when the current window resets
+# ---------------------------------------------------------------------------
+#
+# Two sources, in order of preference:
+#
+#   1. Claude Code's statusLine payload. For Pro/Max accounts it carries
+#      rate_limits.five_hour.resets_at as Unix epoch seconds — exact, and present
+#      after every *successful* API response. We attach a statusLine to the ping
+#      process only, via `--settings` with inline JSON, so nothing about the
+#      user's own Claude Code configuration is touched.
+#   2. The 429 refusal text ("You've hit your session limit · resets 9:30pm
+#      (Asia/Jerusalem)"). Only available when a ping is actually blocked, and
+#      only to the minute, but that is exactly the case where source 1 is silent.
+
+def statusline_settings():
+    """Inline --settings JSON that points Claude's statusLine back at this script."""
+    command = " ".join(shlex.quote(part) for part in (
+        sys.executable or "/usr/bin/python3",
+        os.path.abspath(__file__),
+        "--capture-statusline",
+    ))
+    return json.dumps({
+        "statusLine": {"type": "command", "command": command, "padding": 0}
+    })
+
+
+def capture_statusline():
+    """
+    Append the statusLine payload to STATUSLINE_FILE as one JSON object per line.
+
+    Claude Code invokes this repeatedly during a session and only the later
+    invocations carry rate_limits, so we append rather than overwrite and pick the
+    freshest usable record afterwards. Prints nothing: the status line stays blank.
+    This must stay silent and side-effect-free — it runs inside the Claude UI loop.
+    """
+    try:
+        raw = sys.stdin.read()
+        json.loads(raw)  # validate before storing
+        with open(STATUSLINE_FILE, "a") as f:
+            f.write(raw.replace("\n", " ") + "\n")
+    except Exception:
+        pass
+
+
+def statusline_api_ms():
+    """
+    Highest total_api_duration_ms seen in the statusLine payloads so far.
+
+    Claude Code only writes the session JSONL on exit, so a run cannot watch that
+    file to know when the reply landed. The statusLine can: this counter stays at
+    its starting value until the API call completes, then jumps. That is a far
+    better completion signal than guessing from when the screen stops changing.
+    """
+    best = 0
+    try:
+        with open(STATUSLINE_FILE) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                best = max(best, (obj.get("cost") or {}).get("total_api_duration_ms") or 0)
+    except (IOError, OSError):
+        pass
+    return best
+
+
+def read_statusline_limits():
+    """Return the most recent {'five_hour': {...}, 'seven_day': {...}} seen, or {}."""
+    latest = {}
+    try:
+        with open(STATUSLINE_FILE) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                limits = obj.get("rate_limits")
+                if isinstance(limits, dict) and limits:
+                    latest = limits
+    except (IOError, OSError):
+        pass
+    return latest
+
+
+def _local_tz_name():
+    """Best-effort IANA name of the machine's timezone (e.g. 'Asia/Jerusalem')."""
+    try:
+        link = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in link:
+            return link.split("/zoneinfo/", 1)[1]
+    except OSError:
+        pass
+    try:
+        with open("/etc/timezone") as f:
+            return f.read().strip()
+    except (IOError, OSError):
+        return ""
+
+
+_MONTHS = {name: n + 1 for n, name in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+# Matches both shapes Claude Code produces, the second with a date because a
+# weekly reset can be days away:
+#   "... resets 9:30pm (Asia/Jerusalem)"
+#   "... resets Aug 10, 10pm (Asia/Jerusalem)"
+_RESET_TEXT_RE = re.compile(
+    r"resets\s+(?:([A-Za-z]{3,9})\s+(\d{1,2}),?\s+)?"
+    r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)", re.I)
+
+
+def parse_reset_from_text(text, now=None):
+    """
+    Pull the reset time, and which limit it belongs to, out of a refusal message.
+
+        "You've hit your session limit · resets 9:30pm (Asia/Jerusalem)"
+        "You've hit your weekly limit · resets Aug 10, 10pm (Asia/Jerusalem)"
+
+    Returns (epoch_seconds, "session"|"weekly"), or None when the message names no
+    limit we recognise, has no parseable time, or reports a timezone other than
+    this machine's — Python 3.6 has no zoneinfo, so rather than guess at an offset
+    we decline. The statusLine source is unaffected either way.
+    """
+    if not text:
+        return None
+
+    lowered = text.lower()
+    if "weekly limit" in lowered:
+        kind = "weekly"
+    elif "session limit" in lowered:
+        kind = "session"
+    else:
+        return None
+
+    match = _RESET_TEXT_RE.search(text)
+    if not match:
+        return None
+
+    month_name, day, hour, minute, meridiem, tz = match.groups()
+    hour, minute = int(hour), int(minute or 0)
+    if meridiem.lower() == "pm" and hour != 12:
+        hour += 12
+    elif meridiem.lower() == "am" and hour == 12:
+        hour = 0
+
+    local_tz = _local_tz_name()
+    if local_tz and tz.strip() and tz.strip() != local_tz:
+        return None
+
+    now_dt = datetime.fromtimestamp(now if now is not None else time.time())
+    try:
+        if month_name:
+            month = _MONTHS.get(month_name.lower()[:3])
+            if not month:
+                return None
+            target = now_dt.replace(month=month, day=int(day), hour=hour,
+                                    minute=minute, second=0, microsecond=0)
+            if target < now_dt:                       # the date is next year
+                target = target.replace(year=now_dt.year + 1)
+        else:
+            target = now_dt.replace(hour=hour, minute=minute,
+                                    second=0, microsecond=0)
+            if target <= now_dt:                      # the reset is tomorrow
+                target += timedelta(days=1)
+    except ValueError:                                # e.g. Feb 30, or Feb 29 rolled
+        return None
+    return target.timestamp(), kind
+
+
+# A ping has to satisfy *both* limits, so both decide when the next one can land.
+FIVE_HOUR_HORIZON = WINDOW_HOURS * 3600 + 600
+WEEKLY_HORIZON    = 7 * 24 * 3600 + 3600
+
+
+def _weekly_is_blocking(seven_day, refusal_text, was_limited):
+    """
+    Is the weekly limit what is actually stopping pings right now?
+
+    It matters only when it is exhausted. The rest of the time its reset is days
+    away and has nothing to do with when the next 5-hour window can start.
+    """
+    if (seven_day.get("used_percentage") or 0) >= 100:
+        return True
+    return bool(was_limited and "weekly" in (refusal_text or "").lower())
+
+
+def next_window_start(limits, refusal_text, was_limited):
+    """
+    The earliest moment a ping can both get through *and* start a new window.
+
+    Normally that is simply when the 5-hour window resets. But a ping also has to
+    get past the weekly limit, so when that one is exhausted the answer is
+    whichever of the two resets **last** — aiming at the 5-hour boundary would be
+    pointless if the weekly limit is still going to refuse the ping when it lands,
+    and aiming at the weekly reset would be premature if the 5-hour window has not
+    finished yet. Taking the later of the two is right in both directions.
+
+    Returns (epoch, horizon, label); horizon is how far ahead this reading is
+    allowed to be before we treat it as nonsense. (None, None, "") if unknown.
+    """
+    five  = limits.get("five_hour") or {}
+    seven = limits.get("seven_day") or {}
+    candidates = []
+
+    if five.get("resets_at"):
+        candidates.append((five["resets_at"], FIVE_HOUR_HORIZON, "5-hour window"))
+    if seven.get("resets_at") and _weekly_is_blocking(seven, refusal_text, was_limited):
+        candidates.append((seven["resets_at"], WEEKLY_HORIZON, "weekly limit"))
+
+    # A refused ping may produce no statusLine figures at all, and its text names
+    # the limit it is talking about — so always take a look at it too.
+    if was_limited:
+        parsed = parse_reset_from_text(refusal_text)
+        if parsed:
+            epoch, kind = parsed
+            if kind == "weekly":
+                candidates.append((epoch, WEEKLY_HORIZON, "weekly limit"))
+            else:
+                candidates.append((epoch, FIVE_HOUR_HORIZON, "5-hour window"))
+
+    if not candidates:
+        return None, None, ""
+    return max(candidates, key=lambda c: c[0])
+
+
+# ---------------------------------------------------------------------------
+# The anchor: a one-shot run placed exactly on the next window boundary
+# ---------------------------------------------------------------------------
+#
+# Normally the timer's own 30-minute cadence lands on the boundary by itself,
+# because 30 minutes divides 5 hours evenly. It stops doing so whenever a ping is
+# missed — an outage, a suspended machine, or the user's own work exhausting the
+# window so that pings are refused. Then the first ping of the next window is up
+# to a full interval late, and *every* window after it inherits that late phase.
+#
+# The anchor fixes the phase in one shot. It starts the *same* service unit, so
+# systemd's OnUnitActiveSec=30min re-anchors the regular series off it too: an
+# anchor at 17:00:30 slides the whole series to 17:30:30, 18:00:30 … 22:00:30 —
+# back exactly on the next boundary. After one correction the series is in phase
+# again and the anchor goes quiet until something else knocks it out.
+
+def _systemctl(*args):
+    return subprocess.run(["systemctl", "--user"] + list(args),
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          universal_newlines=True)
+
+
+def cancel_anchor():
+    """Clear any pending anchor so a new one can take its place."""
+    for unit in (ANCHOR_UNIT + ".timer", ANCHOR_UNIT + ".service"):
+        _systemctl("stop", unit)
+    _systemctl("reset-failed", ANCHOR_UNIT + ".timer", ANCHOR_UNIT + ".service")
+
+
+def anchor_pending():
+    """Return the pending anchor's scheduled time as a string, or '' if none."""
+    result = _systemctl("show", ANCHOR_UNIT + ".timer",
+                        "--property=NextElapseUSecRealtime", "--value")
+    value = (result.stdout or "").strip()
+    return value if value and value not in ("n/a", "0") else ""
+
+
+def schedule_anchor(target_epoch):
+    """
+    Create a transient one-shot timer that starts the ping service at target_epoch.
+
+    OnCalendar (wall clock) rather than OnActiveSec (monotonic) is deliberate:
+    monotonic timers do not advance while the machine is suspended, which is one
+    of the very situations this is meant to recover from.
+
+    The anchor starts the ping service with --no-block so it finishes immediately
+    instead of waiting for the ping to return. Otherwise the anchor unit would
+    still be active *during* the run it triggered, and that run deciding it needs
+    another anchor would end up trying to cancel its own parent.
+    """
+    cancel_anchor()
+    stamp = datetime.fromtimestamp(target_epoch).strftime("%Y-%m-%d %H:%M:%S")
+    result = subprocess.run(
+        ["systemd-run", "--user", "--collect",
+         "--unit", ANCHOR_UNIT,
+         "--description", "Claude Early Window — one-shot window-boundary anchor",
+         "--on-calendar", stamp,
+         "--timer-property=AccuracySec=1s",
+         "systemctl", "--user", "start", "--no-block", SERVICE_UNIT],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    if result.returncode != 0:
+        log("WARNING: could not schedule anchor: {}".format(
+            (result.stdout or "").strip()))
+        return False
+    log("Anchor scheduled for {} (in {})".format(
+        stamp, fmt_delta(target_epoch - time.time())))
+    return True
+
+
+def maybe_schedule_anchor(boundary, horizon, label, state, was_limited):
+    """
+    Decide whether the next window boundary needs a one-shot anchor.
+
+    Only the last regular run before the boundary schedules one. Waiting until
+    then is deliberate: that run has the freshest reading of the reset time, the
+    shortest gap in which anything can change, and the least clock drift. Runs
+    further out do nothing, because a later run will always get another look.
+
+    That also means a boundary days away — a weekly limit — costs nothing to
+    track: the ordinary pings carry on every 30 minutes regardless, so if the
+    limit lifts early (an upgrade, say) the very next ping picks it straight up.
+    """
+    now = time.time()
+    if not boundary:
+        return
+
+    # Sanity-bound the reading before acting on it: a reset in the past is stale,
+    # and one further out than the limit it came from could ever run is nonsense.
+    # This is the guard against clock skew or an unexpected payload.
+    if not (now < boundary <= now + horizon):
+        log("Reset time {} is out of range for the {} — ignoring.".format(
+            fmt_time(boundary), label))
+        return
+
+    streak = state.get("anchor_streak", 0)
+    if was_limited and streak >= MAX_ANCHOR_STREAK:
+        log("Anchored {} times in a row and still rate-limited — no more anchors "
+            "until a ping succeeds (ordinary pings carry on).".format(streak))
+        return
+
+    target = boundary + RESET_GUARD_SEC
+    if target - now > INTERVAL_MIN * 60:
+        log("Next ping can start a window at {} (in {}, set by the {}) — "
+            "more than one interval away, no anchor needed yet.".format(
+                fmt_time(boundary), fmt_delta(boundary - now), label))
+        return
+
+    log("Next ping can start a window at {} (in {}, set by the {}) — "
+        "within one interval.".format(
+            fmt_time(boundary), fmt_delta(boundary - now), label))
+    if schedule_anchor(target):
+        state["anchor_target"] = target
+        state["anchor_label"] = label
+        state["anchor_streak"] = streak + 1 if was_limited else 1
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint backup / restore
 # ---------------------------------------------------------------------------
 
@@ -156,23 +564,35 @@ def run_interactive(extra_args, prompt_text, session_id,
       * --tools ""                       strips built-in tool definitions
       * --strict-mcp-config --mcp-config minimises the system prompt to no MCP servers
       * --model haiku --effort low       cheapest possible turn
+      * --settings                       attaches our statusLine to *this process
+                                         only*, so the run can report when the
+                                         usage window resets
 
     Completion is detected adaptively from PTY output (output appears, then goes
     quiet) rather than by a fixed sleep. Claude Code only flushes the session JSONL
     on exit, so success is confirmed *after* /exit by checking that a new assistant
     turn was persisted; its token usage is logged (cache read, which is
     rate-limit-exempt, vs cache write) so each run's real cost is visible.
-    Returns True only if a new assistant turn was recorded.
+
+    Returns {"completed": bool, "limited": bool, "text": str}.
     """
     if not os.path.isfile(CLAUDE_PATH):
         log(f"ERROR: Claude CLI not found at {CLAUDE_PATH}. "
             "Install Claude Code from https://claude.ai/download")
-        return False
+        return {"completed": False, "limited": False, "text": ""}
+
+    # Start each run with a clean statusLine capture so stale readings from the
+    # previous run can never be mistaken for this one's.
+    try:
+        os.remove(STATUSLINE_FILE)
+    except OSError:
+        pass
 
     master_fd, slave_fd = pty.openpty()
     cmd = [CLAUDE_PATH,
            "--tools", "",
            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+           "--settings", statusline_settings(),
            "--model", "haiku", "--effort", "low"] + extra_args
 
     try:
@@ -189,7 +609,7 @@ def run_interactive(extra_args, prompt_text, session_id,
         log(f"ERROR: Failed to spawn Claude: {e}")
         os.close(master_fd)
         os.close(slave_fd)
-        return False
+        return {"completed": False, "limited": False, "text": ""}
 
     os.close(slave_fd)
     os.set_blocking(master_fd, False)
@@ -201,18 +621,25 @@ def run_interactive(extra_args, prompt_text, session_id,
         pass
 
     # Claude Code only persists the session JSONL on a clean exit, not mid-run, so
-    # completion can't be detected by watching the file. Instead we wait on the PTY:
-    # the turn is done once output has gone quiet for `idle_threshold` seconds. We
-    # also enforce `min_settle` first, because the gap before the model starts
-    # replying (especially on a cache miss, e.g. the very first ping) can be several
-    # seconds with no output — exiting during that gap would abort the turn.
+    # completion cannot be detected by watching that file. Two signals are used
+    # instead, in order of reliability:
+    #
+    #   1. The statusLine's API duration counter, which jumps once the reply has
+    #      actually landed. This is a fact reported by Claude Code itself.
+    #   2. If that never moves — no subscription, so no statusLine payload — fall
+    #      back to watching the PTY go quiet for `idle_threshold` seconds, with
+    #      `min_settle` enforced first because the pause before the model starts
+    #      replying (especially on a cache miss) can itself be several seconds.
+    #
     # Draining the PTY throughout also keeps the child from blocking on a full buffer.
     baseline = len(_assistant_entries(session_id))
+    api_baseline = statusline_api_ms()
     log(f"Sending: '{prompt_text}'")
     os.write(master_fd, (prompt_text + "\r").encode())
 
     min_settle = 10.0
     idle_threshold = 5.0
+    settle_after_reply = 2.0
     start = time.time()
     deadline = start + completion_timeout
     last_activity = start
@@ -226,17 +653,37 @@ def run_interactive(extra_args, prompt_text, session_id,
         if chunk:
             saw_output = True
             last_activity = time.time()
-        elif (saw_output
-              and (time.time() - start) >= min_settle
-              and (time.time() - last_activity) >= idle_threshold):
-            break  # output settled — turn finished
+
+        if statusline_api_ms() > api_baseline:
+            # Reply confirmed. Give the UI a moment to finish rendering before
+            # /exit, so the transcript is written with the turn complete.
+            drain_until = time.time() + settle_after_reply
+            while time.time() < drain_until:
+                time.sleep(0.25)
+                try:
+                    os.read(master_fd, 65536)
+                except BlockingIOError:
+                    pass
+            break
+
+        if (not chunk and saw_output
+                and (time.time() - start) >= min_settle
+                and (time.time() - last_activity) >= idle_threshold):
+            break  # output settled — assume the turn finished
 
     os.write(master_fd, b"/exit\r")
 
-    for _ in range(8):
+    # Keep draining while it shuts down: Claude Code emits a burst of terminal
+    # escape sequences on exit, and a full PTY buffer would block it from exiting
+    # cleanly — which is exactly when the session file would not get written.
+    for _ in range(16):
         if proc.poll() is not None:
             break
-        time.sleep(1)
+        time.sleep(0.5)
+        try:
+            os.read(master_fd, 65536)
+        except BlockingIOError:
+            pass
 
     if proc.poll() is None:
         log("Process still running — sending SIGTERM")
@@ -252,24 +699,32 @@ def run_interactive(extra_args, prompt_text, session_id,
     # assistant turn was recorded and log its token usage (cache read vs write).
     entries = _assistant_entries(session_id)
     completed = len(entries) > baseline
+    text, limited = "", False
     if completed:
-        usage = entries[-1].get("message", {}).get("usage", {})
-        text = ""
-        for block in entries[-1].get("message", {}).get("content", []):
+        record = entries[-1]
+        usage = record.get("message", {}).get("usage", {})
+        for block in record.get("message", {}).get("content", []):
             if isinstance(block, dict) and block.get("type") == "text":
                 text = block.get("text", "")
-        limited = "hit your" in text.lower()
+        # A refused ping is recorded as an ordinary assistant turn whose text is the
+        # refusal. Key off the structured fields Claude Code stores alongside it
+        # rather than the wording, which is English-only and free to change.
+        limited = (record.get("apiErrorStatus") == 429
+                   or record.get("error") == "rate_limit"
+                   or "hit your" in text.lower())
         log("Turn confirmed{}: cache_read={} cache_write={} in={} out={}".format(
             " [RATE-LIMITED]" if limited else "",
             usage.get("cache_read_input_tokens", 0),
             usage.get("cache_creation_input_tokens", 0),
             usage.get("input_tokens", 0),
             usage.get("output_tokens", 0)))
+        if limited:
+            log("Refusal: {}".format(text.strip()))
     else:
         log("WARNING: no new assistant turn recorded — the ping may not have counted.")
 
     log(f"Exited with code: {proc.returncode}")
-    return completed
+    return {"completed": completed, "limited": limited, "text": text}
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +753,8 @@ def init():
     checkpoint_id = str(uuid.uuid4())
     log(f"Creating checkpoint session {checkpoint_id[:8]}... with 'hi'")
 
-    ok = run_interactive(["--session-id", checkpoint_id], "hi", checkpoint_id)
-    if not ok:
+    result = run_interactive(["--session-id", checkpoint_id], "hi", checkpoint_id)
+    if not result["completed"]:
         log("ERROR: Failed to create checkpoint session.")
         sys.exit(1)
 
@@ -330,16 +785,100 @@ def main():
     restore_checkpoint(checkpoint_id)
 
     log(f"Resuming checkpoint {checkpoint_id[:8]}... with 'bye'")
-    ok = run_interactive(["--resume", checkpoint_id], "bye", checkpoint_id)
-    if not ok:
+    result = run_interactive(["--resume", checkpoint_id], "bye", checkpoint_id)
+    if not result["completed"]:
         log("WARNING: early-window run did not confirm a completed turn.")
+
+    state = read_state()
+    state["last_run"] = time.time()
+
+    # Work out the earliest moment the next ping could start a window — which
+    # depends on both the 5-hour and the weekly limit — then decide whether that
+    # moment needs a one-shot anchor. A successful ping reports both limits
+    # exactly via the statusLine; a refused one says so in the refusal text.
+    limits = read_statusline_limits()
+    if limits:
+        state["rate_limits"] = limits
+        state["limits_source"] = "statusline"
+
+    boundary, horizon, label = next_window_start(
+        limits, result["text"], result["limited"])
+    if boundary:
+        state["boundary"] = boundary
+        state["boundary_label"] = label
+        if not limits:
+            state["limits_source"] = "refusal-text"
+    else:
+        log("No reset time reported this run — leaving the schedule as it is.")
+
+    if result["completed"] and not result["limited"]:
+        state["anchor_streak"] = 0        # back to normal; forget past corrections
+
+    maybe_schedule_anchor(boundary, horizon, label, state, result["limited"])
+    write_state(state)
+
     log("Early-window run finished.\n")
+
+
+# ---------------------------------------------------------------------------
+# Status (for humans)
+# ---------------------------------------------------------------------------
+
+def status():
+    now = time.time()
+    print("Claude Code Early Window — status")
+    print("=" * 34)
+
+    installed = os.path.exists(SESSION_ID_FILE) and os.path.exists(CHECKPOINT_BACKUP)
+    print("Checkpoint    : {}".format(
+        open(SESSION_ID_FILE).read().strip() if installed else "MISSING — run ./install.sh"))
+
+    state = read_state()
+    if state.get("last_run"):
+        print("Last ping     : {} ({} ago)".format(
+            fmt_time(state["last_run"]), fmt_delta(now - state["last_run"])))
+
+    five = state.get("rate_limits", {}).get("five_hour") or {}
+    if five.get("resets_at"):
+        print("5-hour window : resets {} (in {}) — {}% used".format(
+            fmt_time(five["resets_at"]), fmt_delta(five["resets_at"] - now),
+            five.get("used_percentage", "?")))
+    weekly = state.get("rate_limits", {}).get("seven_day") or {}
+    if weekly.get("resets_at"):
+        print("Weekly limit  : resets {} (in {}) — {}% used".format(
+            fmt_time(weekly["resets_at"]), fmt_delta(weekly["resets_at"] - now),
+            weekly.get("used_percentage", "?")))
+
+    boundary = state.get("boundary")
+    if boundary:
+        stale = "" if boundary > now else " — passed, awaiting next ping"
+        print("Next start-of-window opportunity: {} (in {}){}".format(
+            fmt_time(boundary), fmt_delta(boundary - now), stale))
+        print("  set by the {}   [via {}]".format(
+            state.get("boundary_label", "?"), state.get("limits_source", "?")))
+    else:
+        print("Next start-of-window opportunity: not known yet — run one ping first")
+
+    pending = anchor_pending()
+    print("Anchor        : {}".format(
+        "pending — " + pending if pending else "none scheduled"))
+
+    result = _systemctl("list-timers", "--all", "claude-early-window.timer")
+    for line in (result.stdout or "").splitlines():
+        if "claude-early-window.timer" in line:
+            print("Next ping     : {}".format(" ".join(line.split()[:4])))
 
 
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if "--init" in sys.argv:
+    # Must be first: Claude Code invokes this inside its UI loop and expects a
+    # status line on stdout, nothing else.
+    if "--capture-statusline" in sys.argv:
+        capture_statusline()
+    elif "--init" in sys.argv:
         init()
+    elif "--status" in sys.argv:
+        status()
     else:
         main()

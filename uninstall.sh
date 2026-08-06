@@ -12,6 +12,14 @@ echo "======================================"
 
 systemctl --user disable --now claude-early-window.timer 2>/dev/null && echo "Disabled timer." || true
 systemctl --user stop claude-early-window.service 2>/dev/null || true
+
+# The boundary anchor is a transient unit created on demand by systemd-run, so it
+# has no file to delete — but one may be pending right now, and it would otherwise
+# fire after the uninstall and restart the service.
+systemctl --user stop claude-early-window-anchor.timer 2>/dev/null \
+    && echo "Cancelled pending anchor." || true
+systemctl --user stop claude-early-window-anchor.service 2>/dev/null || true
+
 rm -f "$USER_UNIT_DIR/claude-early-window.service" \
       "$USER_UNIT_DIR/claude-early-window.timer"
 systemctl --user daemon-reload 2>/dev/null || true
@@ -24,4 +32,5 @@ echo ""
 echo "Uninstalled successfully."
 echo ""
 echo "Runtime files were left in place. To remove them:"
-echo "  rm -f early_window_session_id.txt early_window_checkpoint.jsonl.bak claude_early_window.log"
+echo "  rm -f early_window_session_id.txt early_window_checkpoint.jsonl.bak \\"
+echo "        early_window_state.json early_window_statusline.jsonl claude_early_window.log"
