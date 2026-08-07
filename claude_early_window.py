@@ -258,17 +258,11 @@ def read_statusline_limits():
     return latest
 
 
-# Usage at or above this is flagged with "!" in the log and in --status, so a
-# nearly-exhausted limit stands out when scanning back through a run of pings.
-HIGH_USAGE_PCT = 90
-
 _LIMIT_NAMES = (("five_hour", "5-hour"), ("seven_day", "weekly"))
 
 
 def fmt_pct(used):
-    if used is None:
-        return "?%"
-    return "{}%{}".format(used, "!" if used >= HIGH_USAGE_PCT else "")
+    return "?%" if used is None else "{}%".format(used)
 
 
 def format_usage(limits=None):

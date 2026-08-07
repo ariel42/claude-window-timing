@@ -80,7 +80,7 @@ Either way: the later of the two is the first moment a ping can both get through
 - **Small footprint** — each ping turns off all tools and MCP servers and uses the smallest model, so the request stays as light as possible.
 - **Never grows** — the saved conversation is reset before every ping, so it stays exactly two messages long no matter how long the tool has been running.
 - **Confirmed pings** — every run checks that Claude actually replied and writes what it cost to the log, so a failed ping is visible instead of silently assumed.
-- **A usage history for free** — each ping records where both limits stood, so the log shows how your usage moved through the day, with a `!` on anything at 90% or more.
+- **A usage history for free** — each ping records where both limits stood, so the log shows how your usage moved through the day.
 - **Subscription-safe by design** — drives the *interactive* Claude CLI, not `claude -p`. See [Billing](#billing-subscription-vs-api).
 - **Leaves your setup alone** — the settings it needs are passed to the background ping only. Your own Claude Code configuration is never touched.
 - **Runs as a systemd user service** — no root-owned units and no `sudo` to install or manage. `sudo` is used only, and optionally, to keep the timer running while you are logged out.
@@ -116,7 +116,7 @@ Claude Code Early Window — status
 ==================================
 Checkpoint    : 9ba094bc-ab11-451f-adc1-9edd0c4d582c
 Last ping     : 2026-08-06 18:26:23 (0h00m02s ago)
-5-hour window : 98%! used, resets 2026-08-06 21:40:00 (in 3h13m34s)
+5-hour window : 98% used, resets 2026-08-06 21:40:00 (in 3h13m34s)
 Weekly limit  : 87% used, resets 2026-08-10 22:00:00 (in 99h33m34s)
 Next start-of-window opportunity: 2026-08-06 21:40:00 (in 3h13m34s)
   set by the 5-hour window   [via statusline]
@@ -138,10 +138,10 @@ Every run is also written to `claude_early_window.log`, including where both lim
 
 ```
 [2026-08-06 18:26:23] Turn confirmed: cache_read=9581 cache_write=6035 in=10 out=63
-[2026-08-06 18:26:23] Usage: 5-hour 98%! (resets 2026-08-06 21:40:00, in 3h13m37s) · weekly 87% (resets 2026-08-10 22:00:00, in 99h33m37s)
+[2026-08-06 18:26:23] Usage: 5-hour 98% (resets 2026-08-06 21:40:00, in 3h13m37s) · weekly 87% (resets 2026-08-10 22:00:00, in 99h33m37s)
 ```
 
-Since a ping happens every 30 minutes, the log doubles as a record of how your usage moved through the day. A `!` marks a limit at 90% or more, so a nearly-exhausted one is easy to spot when scanning back. The figures come from the report the tool already needs, so writing them down costs nothing.
+Since a ping happens every 30 minutes, the log doubles as a record of how your usage moved through the day. The figures come from the report the tool already needs, so writing them down costs nothing.
 
 ## Files
 
