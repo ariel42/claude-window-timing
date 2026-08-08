@@ -11,6 +11,7 @@ drifts, or anchors to the wrong moment.
 
 import json
 import os
+import pty
 import subprocess
 import sys
 import tempfile
@@ -387,6 +388,66 @@ def test_init_refuses_to_checkpoint_a_refusal():
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# PTY teardown
+# ---------------------------------------------------------------------------
+#
+# Once the prompt has been sent the ping has already reached Claude and started a
+# window. A run that dies during teardown therefore never writes its state or
+# books the boundary anchor, and the schedule stays late for good. These two
+# tests pin the failure that actually happened: 5 of 98 runs over 48 hours died
+# in the post-/exit drain because `except BlockingIOError` did not cover EIO.
+
+def test_pty_drain_tolerates_a_departed_child():
+    section("PTY drain -> survives the child closing the terminal")
+
+    master, slave = pty.openpty()
+    os.set_blocking(master, False)
+
+    check("no output pending reads as empty", ew._drain(master), b"")
+
+    os.write(slave, b"hello")
+    time.sleep(0.05)
+    check("pending output is still returned", ew._drain(master).strip(), b"hello")
+
+    # On Linux a master whose slave has closed reports EIO rather than EOF, and
+    # the child exiting is exactly what the teardown drain is waiting for.
+    os.close(slave)
+    check("a closed slave reads as empty, not EIO", ew._drain(master), b"")
+    check("and stays that way when retried", ew._drain(master), b"")
+
+    os.close(master)
+    check("a write to a dead fd reports failure", ew._send(master, b"x"), False)
+
+
+def test_run_interactive_survives_an_immediate_exit():
+    section("run_interactive -> returns a result when Claude dies at once")
+
+    tmp = tempfile.mkdtemp()
+    fake = os.path.join(tmp, "claude")
+    with open(fake, "w") as f:
+        f.write("#!/bin/sh\necho starting\nexit 0\n")
+    os.chmod(fake, 0o755)
+
+    saved = (ew.CLAUDE_PATH, ew.SESSION_DIR, ew.STATUSLINE_FILE)
+    ew.CLAUDE_PATH     = fake
+    ew.SESSION_DIR     = os.path.join(tmp, "projects")
+    ew.STATUSLINE_FILE = os.path.join(tmp, "statusline.jsonl")
+    os.makedirs(ew.SESSION_DIR)
+    try:
+        # Every drain site runs against an already-dead child here. Before the
+        # fix this raised OSError out of the first one.
+        result = ew.run_interactive([], "hi", "no-such-session",
+                                    startup_wait=0.2, completion_timeout=1.5,
+                                    statusline_wait=0.3)
+    finally:
+        ew.CLAUDE_PATH, ew.SESSION_DIR, ew.STATUSLINE_FILE = saved
+
+    check("returns a result rather than raising",
+          sorted(result), ["completed", "limited", "text"])
+    check("reports the turn as not completed", result["completed"], False)
+
+
 def main():
     # Log somewhere disposable: several decisions are only visible in the log, so
     # the tests read it, and they should not scribble on the running tool's.
@@ -396,7 +457,9 @@ def main():
     for test in (test_refusal_text, test_next_window_start, test_guard_rails,
                  test_anchor_scheduling, test_statusline_parsing,
                  test_resume_baseline_race, test_without_systemd, test_formatting,
-                 test_usage_line, test_init_refuses_to_checkpoint_a_refusal):
+                 test_usage_line, test_init_refuses_to_checkpoint_a_refusal,
+                 test_pty_drain_tolerates_a_departed_child,
+                 test_run_interactive_survives_an_immediate_exit):
         test()
     ew.cancel_anchor()
     print("\n{}".format("-" * 60))

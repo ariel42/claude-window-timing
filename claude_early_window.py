@@ -613,6 +613,50 @@ def restore_checkpoint(session_id):
 # ---------------------------------------------------------------------------
 # Interactive Claude session (PTY)
 # ---------------------------------------------------------------------------
+#
+# One rule governs everything below: **once the prompt has been sent, nothing in
+# the teardown may abort the run.** By that point the ping has already reached
+# Claude and started a window; if the run dies afterwards it never writes its
+# state or books the boundary anchor, so a crash that looks harmless costs a
+# permanently late schedule. Both PTY helpers exist to keep that promise.
+
+
+def _drain(fd, size=65536):
+    """
+    Read whatever is waiting on the PTY master; return b"" when there is nothing.
+
+    Two conditions are ordinary here and neither is a failure:
+
+      * `BlockingIOError` — the fd is non-blocking and no output is pending.
+      * `OSError` with EIO — the child closed the slave side. On Linux a master
+        whose slave is gone reports EIO rather than EOF, and the child exiting is
+        exactly what the post-`/exit` drain is waiting for.
+
+    `BlockingIOError` is a subclass of `OSError`, so one clause covers both. This
+    used to be `except BlockingIOError` alone, which let the EIO escape and abort
+    the run after a successful ping — measured at 5 of 98 runs over 48 hours.
+    """
+    try:
+        return os.read(fd, size)
+    except OSError:
+        return b""
+
+
+def _send(fd, data):
+    """
+    Write to the PTY master, reporting rather than raising if the child is gone.
+
+    Returns True if the bytes were handed over. A dead child does not reliably
+    fail this call — the master accepts writes into its buffer even after the
+    slave closes — so a True result means "sent", not "received". The guard is
+    here because a raising teardown would break the rule stated above.
+    """
+    try:
+        os.write(fd, data)
+        return True
+    except OSError:
+        return False
+
 
 def run_interactive(extra_args, prompt_text, session_id,
                     startup_wait=8, completion_timeout=60, statusline_wait=10):
@@ -674,10 +718,7 @@ def run_interactive(extra_args, prompt_text, session_id,
     os.set_blocking(master_fd, False)
 
     time.sleep(startup_wait)
-    try:
-        os.read(master_fd, 8192)  # drain startup output
-    except BlockingIOError:
-        pass
+    _drain(master_fd, 8192)  # drain startup output
 
     # Wait for one complete statusLine report before taking the baseline. On a
     # --resume the very first report already carries the API duration inherited
@@ -690,10 +731,7 @@ def run_interactive(extra_args, prompt_text, session_id,
     statusline_deadline = time.time() + statusline_wait
     while time.time() < statusline_deadline and not statusline_records():
         time.sleep(0.25)
-        try:
-            os.read(master_fd, 65536)
-        except BlockingIOError:
-            pass
+        _drain(master_fd)
 
     # Claude Code only persists the session JSONL on a clean exit, not mid-run, so
     # completion cannot be detected by watching that file. Two signals are used
@@ -710,7 +748,9 @@ def run_interactive(extra_args, prompt_text, session_id,
     baseline = len(_assistant_entries(session_id))
     api_baseline = statusline_api_ms()
     log(f"Sending: '{prompt_text}'")
-    os.write(master_fd, (prompt_text + "\r").encode())
+    sent = _send(master_fd, (prompt_text + "\r").encode())
+    if not sent:
+        log("ERROR: could not send the prompt — the Claude process is already gone.")
 
     min_settle = 10.0
     idle_threshold = 5.0
@@ -719,12 +759,9 @@ def run_interactive(extra_args, prompt_text, session_id,
     deadline = start + completion_timeout
     last_activity = start
     saw_output = False
-    while time.time() < deadline:
+    while sent and time.time() < deadline:
         time.sleep(0.5)
-        try:
-            chunk = os.read(master_fd, 65536)
-        except BlockingIOError:
-            chunk = b""
+        chunk = _drain(master_fd)
         if chunk:
             saw_output = True
             last_activity = time.time()
@@ -735,10 +772,7 @@ def run_interactive(extra_args, prompt_text, session_id,
             drain_until = time.time() + settle_after_reply
             while time.time() < drain_until:
                 time.sleep(0.25)
-                try:
-                    os.read(master_fd, 65536)
-                except BlockingIOError:
-                    pass
+                _drain(master_fd)
             break
 
         if (not chunk and saw_output
@@ -746,7 +780,7 @@ def run_interactive(extra_args, prompt_text, session_id,
                 and (time.time() - last_activity) >= idle_threshold):
             break  # output settled — assume the turn finished
 
-    os.write(master_fd, b"/exit\r")
+    _send(master_fd, b"/exit\r")
 
     # Keep draining while it shuts down: Claude Code emits a burst of terminal
     # escape sequences on exit, and a full PTY buffer would block it from exiting
@@ -755,10 +789,7 @@ def run_interactive(extra_args, prompt_text, session_id,
         if proc.poll() is not None:
             break
         time.sleep(0.5)
-        try:
-            os.read(master_fd, 65536)
-        except BlockingIOError:
-            pass
+        _drain(master_fd)
 
     if proc.poll() is None:
         log("Process still running — sending SIGTERM")
