@@ -4,12 +4,23 @@ Keeps a Claude Code usage window rolling in the background so that you start wor
 inside a fresh, almost-untouched window. Requires Python 3.6+, Linux, and the
 Claude Code CLI.
 
+Supports several Claude subscriptions at once. Accounts are configured in
+accounts.json (see accounts.example.json); with no such file the tool runs a
+single account against Claude Code's default ~/.claude.
+
 Usage:
-  python3 claude_early_window.py --init    # one-time setup (called by install.sh)
-  python3 claude_early_window.py           # early-window run (called by systemd timer)
-  python3 claude_early_window.py --status  # show the current window / anchor state
+  ./install.sh                 # the setup wizard, safe to re-run
+  claude-window                # what every account is doing
+  claude-window which          # which account to use right now
+  claude-window ping 2         # send one ping; this is what the timer runs
+  claude-window --help         # everything else
+
+Setup writes `claude-window` into the repository's bin/ directory; until then,
+run `python3 claude_early_window.py <command>` directly.
 """
 
+import argparse
+import collections
 import json
 import os
 import pty
@@ -33,17 +44,31 @@ USER       = os.environ.get("USER") or os.environ.get("LOGNAME") or "user"
 # Claude CLI: prefer PATH lookup, fall back to ~/.local/bin/claude
 CLAUDE_PATH = shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
 
-# Claude Code stores session files under ~/.claude/projects/<cwd-as-path>/
-# where every "/" in the cwd is replaced with "-".
-SESSION_DIR = os.path.join(
-    HOME, ".claude", "projects", SCRIPT_DIR.replace("/", "-")
-)
+ACCOUNTS_FILE = os.path.join(SCRIPT_DIR, "accounts.json")
+STATE_ROOT    = os.path.join(SCRIPT_DIR, "state")
 
-LOG_FILE          = os.path.join(SCRIPT_DIR, "claude_early_window.log")
-SESSION_ID_FILE   = os.path.join(SCRIPT_DIR, "early_window_session_id.txt")
-CHECKPOINT_BACKUP = os.path.join(SCRIPT_DIR, "early_window_checkpoint.jsonl.bak")
-STATE_FILE        = os.path.join(SCRIPT_DIR, "early_window_state.json")
-STATUSLINE_FILE   = os.path.join(SCRIPT_DIR, "early_window_statusline.jsonl")
+# Where Claude Code keeps *the user's* data. This tool never reads, writes or
+# links anything here — it is not ours. `doctor` looks at whose login it holds,
+# to warn when the user is signed in as an account nobody is pinging, and that is
+# the only contact of any kind.
+USER_CONFIG_DIR  = os.path.join(HOME, ".claude")
+USER_CONFIG_JSON = os.path.join(HOME, ".claude.json")
+
+
+def ping_config_dir(name):
+    """
+    Where account `name`'s ping directory lives: ~/.claude-<name>.
+
+    Beside the user's own directory rather than hidden under ~/.local/share:
+    someone looking for where their Claude accounts are looks next to
+    ~/.claude, and Claude Code itself ignores XDG.
+    """
+    return os.path.join(HOME, ".claude-{}".format(name))
+
+# What this tool is called on the command line. Every message that suggests a
+# next step spells it out in full, because a hint the reader cannot paste is
+# worse than no hint.
+COMMAND = "claude-window"
 
 LOG_RETENTION_HOURS = 48
 
@@ -64,16 +89,924 @@ INTERVAL_MIN = 30
 # actually arrives around +38s. That lateness is harmless; earliness is not.
 RESET_GUARD_SEC = 30
 
+# Accounts are spaced 5/N hours apart, and for N=2 that is an exact multiple of
+# the 30-minute interval — so without this every account would ping in the same
+# second, forever. Each account adds index * PING_STAGGER_SEC to its guard, which
+# shifts its whole grid by a constant and is therefore absorbed into its measured
+# phase. Staggering the *cadence* instead does not work: the anchor re-anchors
+# each series to its own window boundary and pulls any cadence offset back out.
+PING_STAGGER_SEC = 60
+
 WINDOW_HOURS = 5
 
-# systemd units. The anchor is a transient one-shot timer created with systemd-run;
-# it exists only between being scheduled and firing.
-SERVICE_UNIT = "claude-early-window.service"
-ANCHOR_UNIT  = "claude-early-window-anchor"
+# How long a ping waits on its Claude subprocess. Named rather than inline so a
+# test can shorten them: with a stand-in CLI the fixed startup pause is otherwise
+# most of the suite's runtime.
+STARTUP_WAIT_SEC = 8
+COMPLETION_TIMEOUT_SEC = 60
+STATUSLINE_WAIT_SEC = 10
 
 # Give up on re-anchoring after this many consecutive anchors that still came back
 # rate-limited — if the reset time we parsed were wrong, this stops a hot loop.
 MAX_ANCHOR_STREAK = 3
+
+
+# ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+#
+# Everything the tool does is per-account: a config directory (which is the only
+# thing that makes one Claude login distinct from another), a checkpoint
+# conversation, state, a log, and a pair of systemd units.
+#
+# One ping process drives one account, but `status` and `pick` have to reason
+# about all of them at once, so an account is passed around as an object rather
+# than kept in module-level globals. That is the whole reason for this class.
+
+# Account names appear in systemd unit names and in paths, so keep them boring.
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+# Fields an accounts.json entry may carry; anything else is a typo.
+_ACCOUNT_KEYS = frozenset(("name", "config_dir", "label"))
+
+
+class Account(object):
+    """One Claude login, and everywhere its files and units live."""
+
+    def __init__(self, name, config_dir=None, index=0, label=""):
+        self.name       = name
+        self.index      = index
+        self.label      = label
+        self.config_dir = os.path.abspath(
+            os.path.expanduser(config_dir or ping_config_dir(name)))
+
+        self.state_dir         = os.path.join(STATE_ROOT, name)
+        self.session_id_file   = os.path.join(self.state_dir, "session_id.txt")
+        self.checkpoint_backup = os.path.join(self.state_dir, "checkpoint.jsonl.bak")
+        self.state_file        = os.path.join(self.state_dir, "state.json")
+        self.statusline_file   = os.path.join(self.state_dir, "statusline.jsonl")
+        # Per-account rather than one shared log: rotate_log() rewrites the whole
+        # file, which is not safe against a second account rotating at the same
+        # moment. `claude-window log` merges them for display when that is wanted.
+        self.log_file          = os.path.join(self.state_dir, "ping.log")
+
+    # -- Claude Code's own layout --------------------------------------------
+
+    @property
+    def session_dir(self):
+        """
+        Where Claude Code stores this account's transcripts for our working
+        directory: <config dir>/projects/<cwd with "/" replaced by "-">.
+
+        Deriving this from the account's config dir rather than ~/.claude is what
+        lets a second account exist at all — otherwise every account would look
+        for its checkpoint in the first account's tree.
+        """
+        return os.path.join(self.config_dir, "projects",
+                            SCRIPT_DIR.replace("/", "-"))
+
+    # -- systemd --------------------------------------------------------------
+
+    @property
+    def service_unit(self):
+        return "claude-early-window@{}.service".format(self.name)
+
+    @property
+    def timer_unit(self):
+        return "claude-early-window@{}.timer".format(self.name)
+
+    @property
+    def anchor_unit(self):
+        # Deliberately not templated: this is created on demand by systemd-run as
+        # a transient unit, and a transient name containing "@" reads as an
+        # instance of a template that does not exist.
+        return "claude-early-window-anchor-{}".format(self.name)
+
+    # -- timing ---------------------------------------------------------------
+
+    @property
+    def guard_sec(self):
+        return RESET_GUARD_SEC + self.index * PING_STAGGER_SEC
+
+    # -- Claude Code's own config file ----------------------------------------
+
+    @property
+    def config_json(self):
+        """
+        This account's `.claude.json`.
+
+        Claude Code resolves it as `join(CLAUDE_CONFIG_DIR || homedir(),
+        ".claude.json")` — beside the config directory, not inside it. Every ping
+        sets the variable, so each account gets its own here and the user's
+        ~/.claude.json is never involved.
+        """
+        return os.path.join(self.config_dir, ".claude.json")
+
+    # -- misc -----------------------------------------------------------------
+
+    @property
+    def display(self):
+        return "{} ({})".format(self.name, self.label) if self.label else self.name
+
+    def ensure_state_dir(self):
+        if not os.path.isdir(self.state_dir):
+            os.makedirs(self.state_dir, 0o700)
+
+    def __repr__(self):
+        return "<Account {} at {}>".format(self.name, self.config_dir)
+
+
+def _read_json(path):
+    """Parse a JSON file, treating "missing" and "unreadable" as empty."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (IOError, OSError, ValueError):
+        return {}
+
+
+# The whole of what a ping directory needs in its .claude.json. Proven
+# sufficient: a directory holding only credentials and these three keys ran a
+# complete session with no prompt of any kind. Written by us rather than copied
+# from the user, which is what removes any need to touch ~/.claude.json at all.
+def ping_config(cwd):
+    return {
+        "hasCompletedOnboarding": True,
+        "hasCompletedClaudeInChromeOnboarding": True,
+        "projects": {cwd: {"hasTrustDialogAccepted": True}},
+    }
+
+
+def ensure_ping_config(account):
+    """
+    Make sure this ping directory's config lets a ping run unattended.
+
+    Merged rather than overwritten: Claude Code keeps caches and counters in the
+    same file and there is no reason to discard them. Only the keys a ping
+    depends on are asserted. Returns True if anything changed.
+    """
+    if not os.path.isdir(account.config_dir):
+        os.makedirs(account.config_dir, 0o700)
+    config = _read_json(account.config_json)
+    changed = False
+    for key, value in ping_config(SCRIPT_DIR).items():
+        if key == "projects":
+            entry = config.setdefault("projects", {}).setdefault(SCRIPT_DIR, {})
+            if not entry.get("hasTrustDialogAccepted"):
+                entry["hasTrustDialogAccepted"] = True
+                changed = True
+        elif config.get(key) != value:
+            config[key] = value
+            changed = True
+    if changed:
+        tmp = account.config_json + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(config, f, indent=2, sort_keys=True)
+        os.replace(tmp, account.config_json)
+    return changed
+
+
+class ConfigError(Exception):
+    """accounts.json says something that cannot be acted on."""
+
+
+def parse_accounts(data):
+    """
+    Turn parsed accounts.json into a list of Accounts, or raise ConfigError.
+
+    Validation is strict and early because every mistake here is one that would
+    otherwise show up much later as a puzzle: two accounts sharing a config dir
+    are the same login wearing two hats, and a name with a slash or a space in it
+    produces a systemd unit that cannot be started.
+    """
+    if not isinstance(data, dict):
+        raise ConfigError("accounts.json must contain a JSON object")
+
+    entries = data.get("accounts")
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError("accounts.json needs a non-empty \"accounts\" list")
+
+    accounts, seen_names, seen_dirs = [], {}, {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ConfigError("account #{} must be an object".format(index + 1))
+
+        # Reject unknown keys rather than ignoring them. A typo like "configdir"
+        # would otherwise leave the account silently pointing at the default
+        # directory, which is the one mistake that turns two subscriptions back
+        # into one. Anything starting with "_" is treated as a comment.
+        unknown = sorted(k for k in entry
+                         if k not in _ACCOUNT_KEYS and not k.startswith("_"))
+        if unknown:
+            raise ConfigError(
+                "account #{} has unrecognised field(s) {} — valid fields are: "
+                "{}".format(index + 1, ", ".join(repr(k) for k in unknown),
+                            ", ".join(sorted(_ACCOUNT_KEYS))))
+
+        config_dir = entry.get("config_dir")
+        if config_dir is not None and not isinstance(config_dir, str):
+            raise ConfigError(
+                "account #{}: config_dir must be a string, not {}".format(
+                    index + 1, type(config_dir).__name__))
+
+        name = entry.get("name")
+        if not isinstance(name, str) or not _NAME_RE.match(name):
+            raise ConfigError(
+                "account #{} has an invalid name {!r}: use letters, digits, "
+                "\"-\" or \"_\", starting with a letter or digit".format(
+                    index + 1, name))
+        if name in seen_names:
+            raise ConfigError("two accounts are both named {!r}".format(name))
+        seen_names[name] = True
+
+        account = Account(name, config_dir, index, entry.get("label") or "")
+        if account.config_dir in seen_dirs:
+            raise ConfigError(
+                "accounts {!r} and {!r} share the config directory {} — they "
+                "would be the same Claude login".format(
+                    seen_dirs[account.config_dir], name, account.config_dir))
+        seen_dirs[account.config_dir] = name
+        accounts.append(account)
+
+    return accounts
+
+
+def default_accounts():
+    """The implied configuration when there is no accounts.json: one account."""
+    return [Account("1", ping_config_dir("1"), 0)]
+
+
+def load_accounts(path=None):
+    """
+    Every configured account, in slot order. Falls back to a single default
+    account so that the tool works before it has ever been configured.
+    """
+    path = path or ACCOUNTS_FILE
+    if not os.path.exists(path):
+        return default_accounts()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except ValueError as e:
+        raise ConfigError("{} is not valid JSON: {}".format(path, e))
+    except (IOError, OSError) as e:
+        raise ConfigError("cannot read {}: {}".format(path, e))
+    return parse_accounts(data)
+
+
+def find_account(accounts, name):
+    """The named account, or raise ConfigError naming the ones that do exist."""
+    for account in accounts:
+        if account.name == name:
+            return account
+    raise ConfigError("no account named {!r} — configured accounts are: {}".format(
+        name, ", ".join(a.name for a in accounts) or "(none)"))
+
+
+# ---------------------------------------------------------------------------
+# Upgrading from the single-account layout
+# ---------------------------------------------------------------------------
+#
+# The repository *is* the deployment: the units run the checked-out script in
+# place, so a `git pull` swaps the code under a running service with no restart
+# and no chance to say anything first. An upgrade that expected the user to move
+# files by hand would therefore find its state already gone — the next ping would
+# see no checkpoint, build a fresh one, and restart the window phase it had spent
+# days getting right.
+#
+# So this runs itself, before anything reads state, and it moves rather than
+# copies: leaving both copies would make it ambiguous which one is authoritative.
+
+_LEGACY_FILES = (
+    ("early_window_session_id.txt",       "session_id.txt"),
+    ("early_window_checkpoint.jsonl.bak", "checkpoint.jsonl.bak"),
+    ("early_window_state.json",           "state.json"),
+    ("early_window_statusline.jsonl",     "statusline.jsonl"),
+    ("claude_early_window.log",           "ping.log"),
+)
+
+
+def migrate_legacy_state(account):
+    """
+    Move a pre-multi-account install's files into the first account's state dir.
+
+    Returns what moved. Does nothing if the account already has a checkpoint —
+    the existing one always wins, so this can never overwrite a working setup,
+    and running it repeatedly is safe.
+    """
+    if os.path.exists(account.session_id_file):
+        return []
+    moved = []
+    for old_name, new_name in _LEGACY_FILES:
+        old = os.path.join(SCRIPT_DIR, old_name)
+        if not os.path.exists(old):
+            continue
+        account.ensure_state_dir()
+        shutil.move(old, os.path.join(account.state_dir, new_name))
+        moved.append(old_name)
+    return moved
+
+
+# ---------------------------------------------------------------------------
+# Which account to use right now
+# ---------------------------------------------------------------------------
+#
+# Two questions, both answered by observation rather than by rule:
+#
+#   Can this account serve a request at all?   -> availability
+#   How soon does its current window expire?   -> urgency
+#
+# Availability is one idea with no special cases. A weekly limit spent, a lapsed
+# subscription, a revoked login and a dead network are the same state: not usable
+# now, usable again at some point. Nothing downstream asks which it was.
+#
+# Given a choice of usable accounts, spend the most perishable one first. Quota
+# does not carry over — whatever is left when a window ends is simply gone — so
+# using the account that expires soonest is the classic perishable-stock rule.
+# With windows spaced evenly it has a simpler form: use whichever account did
+# *not* most recently refill.
+
+# Pings that fail for reasons that say nothing about the account (no network, a
+# crashed CLI) should not condemn it. Enough of them in a row should.
+UNHEALTHY_AFTER = 3
+
+SCHEDULE_FILE = os.path.join(SCRIPT_DIR, "schedule.json")
+
+
+def next_expiry(state, now):
+    """
+    When this account's current window ends, rolled forward if the reading is old.
+
+    A missed ping leaves a reset time in the past. Windows tile back to back, so
+    the honest correction is to add whole windows until it is in the future
+    rather than to distrust the reading — it is still the right phase.
+    """
+    resets = ((state.get("rate_limits") or {}).get("five_hour") or {}).get("resets_at")
+    if not resets:
+        return float("inf")
+    window = WINDOW_HOURS * 3600
+    if resets <= now:
+        resets += window * (int((now - resets) // window) + 1)
+    return resets
+
+
+def rank_account(account, state, now):
+    """
+    Sort key for choosing an account: lower is better.
+
+    Availability first, urgency second. An account we cannot judge — one whose
+    last few pings failed — sorts last rather than being recommended into a
+    login that is probably broken.
+    """
+    if state.get("consecutive_failures", 0) >= UNHEALTHY_AFTER:
+        return (2, 0.0, account.index)
+    available_at = state.get("available_at")
+    if available_at is not None and available_at > now:
+        return (1, available_at, account.index)     # unusable; soonest back first
+    return (0, next_expiry(state, now), account.index)   # usable; most perishable
+
+
+def choose_account(accounts, states=None, now=None):
+    """
+    The account to use right now, and why, as (account, reason).
+
+    This is advice. Nothing acts on it: the tool does not choose an account for
+    anyone, it only says which one it would pick.
+    """
+    now = time.time() if now is None else now
+    states = states or {a.name: read_state(a) for a in accounts}
+
+    ranked = sorted(accounts, key=lambda a: rank_account(a, states[a.name], now))
+    best = ranked[0]
+    state = states[best.name]
+    key = rank_account(best, state, now)
+
+    if key[0] == 2:
+        return best, "nothing is known to be usable; this one last worked most recently"
+    if key[0] == 1:
+        return best, "every account is out of quota — this one returns first, {}".format(
+            fmt_time(key[1]))
+    expiry = next_expiry(state, now)
+    if expiry == float("inf"):
+        return best, "no window information yet — run a ping first"
+    if len(accounts) == 1:
+        return best, "the only account; its window ends {}".format(fmt_time(expiry))
+    return best, "its window ends first, {} (in {})".format(
+        fmt_time(expiry), fmt_delta(expiry - now))
+
+
+def publish_schedule(accounts):
+    """
+    Write what other machines need in order to choose an account themselves.
+
+    Only the machine running the pings can observe any of this, but selection
+    needs nothing live: a window's *phase* is a constant, so a laptop with a copy
+    of this file can work out which account is most perishable with arithmetic
+    alone — no network call, no daemon, and nothing to go stale but the phase,
+    which changes only when the schedule is realigned.
+    """
+    now = time.time()
+    window = WINDOW_HOURS * 3600
+    entry = []
+    for account in accounts:
+        state = read_state(account)
+        expiry = next_expiry(state, now)
+        five = ((state.get("rate_limits") or {}).get("five_hour") or {})
+        entry.append({
+            "name": account.name,
+            "label": account.label,
+            "config_dir": account.config_dir,
+            "window_phase": (expiry % window) if expiry != float("inf") else None,
+            "expires_at": expiry if expiry != float("inf") else None,
+            "available_at": state.get("available_at"),
+            "used_percentage": five.get("used_percentage"),
+            "last_run": state.get("last_run"),
+        })
+
+    document = {"written_at": now, "window_hours": WINDOW_HOURS,
+                "accounts": entry}
+    tmp = SCHEDULE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(document, f, indent=2, sort_keys=True)
+    os.replace(tmp, SCHEDULE_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Keeping the windows evenly spaced
+# ---------------------------------------------------------------------------
+#
+# N accounts are worth most when their windows are spread evenly — 5/N hours
+# apart. No arrangement creates capacity: the expected number of refills in any
+# stretch of time is the same however the windows sit. What even spacing changes
+# is the *shape* of the supply, and since unused quota expires at every reset,
+# shape is worth real money. It also halves the worst-case wait for a fresh
+# window, from 5 hours to 5/N.
+#
+# One constraint governs everything here:
+#
+#     A window starts on the first ping *after* the previous one ends, so a
+#     phase can only ever be delayed, never advanced.
+#
+# Every correction therefore costs a deliberate gap with no window running, and
+# the job is to find the cheapest set of delays that lands the accounts evenly
+# spaced. Note that only *relative* offsets matter — the whole arrangement may
+# rotate freely — which is what makes common drift free to ignore.
+
+# Ignore errors smaller than this. Each window's phase creeps forward by roughly
+# the CLI's startup time, and that creep is near-identical across accounts, so
+# it cancels out of the relative offsets. Chasing it would mean paying real dead
+# time to correct noise.
+ALIGN_DEADBAND_SEC = 5 * 60
+
+# Correct silently up to here. Beyond it, say what it would cost and wait to be
+# told: a multi-hour hold that nobody asked for is not something a tool other
+# people install should do on its own.
+AUTO_CORRECT_MAX_SEC = 45 * 60
+
+ALIGNMENT_FILE = os.path.join(STATE_ROOT, "alignment.json")
+
+
+def window_phase(state, now):
+    """Where this account's boundary falls within the 5-hour cycle, or None."""
+    expiry = next_expiry(state, now)
+    if expiry == float("inf"):
+        return None
+    return expiry % (WINDOW_HOURS * 3600)
+
+
+def is_participating(state, now):
+    """
+    Can this account still hold its place in the rotation?
+
+    An account keeps its phase only while its pings keep succeeding across window
+    boundaries. A brief exhaustion of the 5-hour quota does not break it — the
+    window still ends on time and the boundary ping starts the next one. But if
+    the account cannot serve a request until *after* its own window ends, that
+    boundary passes with nothing getting through and the phase is simply gone.
+
+    Stated that way it needs no knowledge of which limit is responsible, which is
+    the point: a spent weekly limit, a lapsed subscription and a revoked login
+    all fail this test for the same reason and recover the same way.
+    """
+    boundary = next_expiry(state, now)
+    if boundary == float("inf"):
+        return False
+    available_at = state.get("available_at")
+    return not (available_at and available_at > boundary)
+
+
+def plan_alignment(phases, window=None):
+    """
+    The cheapest set of forward-only delays that spaces these phases evenly.
+
+    `phases` maps name -> phase in seconds within the window. Returns
+    (delays, total) where delays maps name -> seconds to hold that account back.
+
+    Because targets are evenly spaced, sliding a single global offset covers
+    every way of assigning accounts to slots, and the optimum always leaves at
+    least one account untouched — so it is enough to try the offset that zeroes
+    each account in turn. That is N candidates, each costing N to evaluate.
+
+    Worth noticing what falls out: correcting one account that has drifted late
+    is usually done by delaying *the others* a little, not by dragging the late
+    one all the way around.
+    """
+    window = window or WINDOW_HOURS * 3600
+    names = sorted(phases, key=lambda n: (phases[n], n))
+    count = len(names)
+    if count < 2:
+        return {name: 0.0 for name in names}, 0.0
+
+    spacing = float(window) / count
+    best_delays, best_total = None, None
+    for zeroed in range(count):
+        offset = (phases[names[zeroed]] - zeroed * spacing) % window
+        delays, total = {}, 0.0
+        for position, name in enumerate(names):
+            delay = ((offset + position * spacing) - phases[name]) % window
+            delays[name] = delay
+            total += delay
+        if best_total is None or total < best_total - 1e-9:
+            best_delays, best_total = delays, total
+    return best_delays, best_total
+
+
+def read_alignment():
+    try:
+        with open(ALIGNMENT_FILE) as f:
+            return json.load(f)
+    except (IOError, OSError, ValueError):
+        return {}
+
+
+def write_alignment(data):
+    """
+    Record the shared alignment view. Failing to is survivable, and must be.
+
+    This runs *after* the ping, from the same stretch of code that still has to
+    write the account's state and book the boundary anchor. Spacing is advisory;
+    those two are not. So a full disk here costs a slightly stale spacing view
+    rather than a permanently late schedule.
+    """
+    try:
+        if not os.path.isdir(STATE_ROOT):
+            os.makedirs(STATE_ROOT, 0o700)
+        tmp = ALIGNMENT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp, ALIGNMENT_FILE)
+    except (IOError, OSError) as e:
+        sys.stderr.write("Could not record the spacing view: {}\n".format(e))
+
+
+def alignment_plan(accounts, states, now, record=True):
+    """
+    What the spacing should be, and what it would cost to get there.
+
+    Returns (delays, total, participants, settled). With `record` false it
+    reports without writing anything, which is what the commands that only
+    *look* — status, doctor — must do: noting a change in the participating set
+    starts the settling clock, and a diagnostic should never quietly move the
+    schedule it is reporting on.
+
+    `settled` is False while the set of participating accounts is still new: an account dropping out changes
+    the ideal spacing for everyone, and acting on that immediately would mean
+    paying for a re-space twice if it comes back shortly. So the set has to hold
+    steady for a full window before it moves the target.
+    """
+    window = WINDOW_HOURS * 3600
+    participants = sorted(a.name for a in accounts
+                          if is_participating(states[a.name], now))
+
+    alignment = read_alignment()
+    previous = alignment.get("participants")
+    if previous != participants and record:
+        alignment["participants"] = participants
+        # A *first* sighting is not a change. There is no earlier arrangement to
+        # thrash against and nothing has been paid for one yet, so waiting would
+        # only mean a freshly installed setup sitting visibly misaligned for a
+        # whole window with nothing to show for the patience.
+        alignment["participants_since"] = now if previous is not None \
+            else now - window
+        write_alignment(alignment)
+    settled = now - alignment.get("participants_since", now) >= window
+
+    phases = {}
+    for account in accounts:
+        if account.name in participants:
+            phase = window_phase(states[account.name], now)
+            if phase is not None:
+                phases[account.name] = phase
+
+    delays, total = plan_alignment(phases, window)
+    return delays, total, participants, settled
+
+
+def describe_alignment(accounts, states, now, suggest_realign=True,
+                       note_waiting=True, record=False):
+    """
+    A human summary of the spacing and what correcting it would cost.
+
+    `suggest_realign` is off when `realign` is itself the caller, which is
+    already showing the fuller version of that advice. `note_waiting` is off
+    when the caller is about to correct the spacing regardless — an explicit
+    request overrides the wait, and saying both would contradict itself.
+    """
+    delays, total, participants, settled = alignment_plan(accounts, states, now,
+                                                         record=record)
+    lines = []
+    window = WINDOW_HOURS * 3600
+    if len(participants) < 2:
+        lines.append("Only one account is holding a window — nothing to space.")
+        return lines, delays, total, settled
+
+    lines.append("Windows should sit {} apart.".format(
+        fmt_delta(window / float(len(participants)))))
+
+    # A hold that has been booked but not yet served leaves the phases exactly
+    # where they were, so the arithmetic still reports the full error. Saying
+    # only that would read as though nothing had been done.
+    booked = False
+    for account in accounts:
+        if account.name not in delays:
+            lines.append("  account {:<10} not holding a window right now".format(
+                account.display))
+            continue
+        delay = delays[account.name]
+        boundary = next_expiry(states[account.name], now)
+        hold = states[account.name].get("hold") or {}
+        if hold.get("until", 0) > now:
+            booked = True
+            note = "   already held back to {}".format(fmt_time(hold["until"]))
+        elif delay < ALIGN_DEADBAND_SEC:
+            note = ""
+        else:
+            note = "   hold {} to line up".format(fmt_delta(delay))
+        lines.append("  account {:<10} next window starts {}{}".format(
+            account.display, fmt_time(boundary), note))
+
+    if total < ALIGN_DEADBAND_SEC:
+        lines.append("Spacing is correct.")
+    elif booked:
+        lines.append("A correction is already booked. The spacing will be right "
+                     "once those windows have started.")
+    elif not settled:
+        if note_waiting:
+            lines.append("Spacing is off, but the set of active accounts changed "
+                         "recently — waiting for it to settle before correcting.")
+    elif total > AUTO_CORRECT_MAX_SEC:
+        # The flag suppresses the sentence, not the branch: dropping into the
+        # "small enough" case for a correction this size would contradict the
+        # very next line `realign` prints.
+        if suggest_realign:
+            lines.append("Correcting this means {} with no window running on "
+                         "the accounts being held, which is too much to do "
+                         "unasked. See what it involves with:  {} "
+                         "realign".format(fmt_delta(total), COMMAND))
+    else:
+        lines.append("Small enough to fix without asking — the ping at the next "
+                     "window boundary will do it.")
+    return lines, delays, total, settled
+
+
+def apply_alignment(account, accounts, states, state, now, boundary):
+    """
+    How long this account should hold its next window back, in seconds.
+
+    `boundary` is the moment the next window could otherwise start, and is passed
+    in rather than recomputed: the caller derives it from *both* limits, while
+    the spacing arithmetic only ever reasons about the 5-hour cycle. Those two
+    coincide for a healthy account and diverge when a weekly limit is in the way,
+    so mixing them would place a hold relative to the wrong instant.
+    """
+    if not boundary or len(accounts) < 2:
+        return 0.0
+
+    delays, total, participants, settled = alignment_plan(accounts, states, now)
+    delay = delays.get(account.name, 0.0)
+
+    if delay < ALIGN_DEADBAND_SEC:
+        return 0.0
+    if not settled:
+        log(account, "Spacing is out by {} but the active accounts changed "
+                     "recently — leaving it alone until that settles.".format(
+                         fmt_delta(delay)))
+        return 0.0
+
+    if total > AUTO_CORRECT_MAX_SEC:
+        alignment = read_alignment()
+        alignment["proposal"] = {"delays": delays, "total": total,
+                                 "created_at": now}
+        write_alignment(alignment)
+        log(account, "Spacing is out by {} in total, which needs a hold of {} "
+                     "on this account. That is too long to do unasked — run "
+                     "`{} realign --confirm` to apply it.".format(
+                         fmt_delta(total), fmt_delta(delay), COMMAND))
+        return 0.0
+
+    state["hold"] = {"from": boundary, "until": boundary + delay,
+                     "reason": "spacing this account {} later".format(
+                         fmt_delta(delay))}
+    log(account, "Holding the next window back by {} so the accounts stay "
+                 "{} apart: it will start at {}.".format(
+                     fmt_delta(delay),
+                     fmt_delta(WINDOW_HOURS * 3600 / float(len(participants))),
+                     fmt_time(boundary + delay)))
+    return delay
+
+
+def active_hold(state, now):
+    """The hold currently suppressing pings for this account, or None."""
+    hold = state.get("hold")
+    if not hold:
+        return None
+    if hold.get("from", 0) <= now < hold.get("until", 0):
+        return hold
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Checking a multi-account setup makes sense
+# ---------------------------------------------------------------------------
+#
+# Most ways of getting this wrong keep working — they just quietly stop being
+# worth anything. Logging in to the same account twice is the clearest example:
+# every timer runs, every ping succeeds, and the second subscription buys
+# nothing. So the checks that matter run before setup finishes and again from
+# `doctor`, and they name the consequence rather than the symptom.
+
+Finding = collections.namedtuple("Finding", "level message hint")
+
+REFRESH_WARNING_DAYS = 7
+
+# Markers left by file-sync tools in the directories they manage. Sharing session
+# directories relies on symlinks, and sync tools handle those inconsistently —
+# some replace them with copies, at which point conversations stop being shared
+# and nothing announces it.
+_SYNC_MARKERS = (".stfolder", ".stignore", ".dropbox", ".dropbox.cache",
+                 ".syncthing", ".nextcloudsync.log", ".csync_journal.db")
+
+
+def _epoch_seconds(value):
+    """Claude Code writes some timestamps in milliseconds; normalise to seconds."""
+    if not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return value / 1000.0 if value > 1e11 else float(value)
+
+
+def account_identity(account):
+    """
+    Who an account is, from Claude Code's own files. Empty when never logged in.
+
+    Two files are involved: the identity lives in .claude.json's oauthAccount,
+    while the token and plan live in .credentials.json inside the config
+    directory. On macOS the latter is in Keychain instead, so a missing file
+    means "cannot tell", never "not logged in".
+    """
+    oauth = (_read_json(account.config_json).get("oauthAccount") or {})
+    creds = _read_json(os.path.join(account.config_dir, ".credentials.json"))
+    claude_ai = creds.get("claudeAiOauth") or {}
+    return {
+        "account_uuid": oauth.get("accountUuid"),
+        "email": oauth.get("emailAddress"),
+        "organization_uuid": (oauth.get("organizationUuid")
+                              or creds.get("organizationUuid")),
+        "subscription": claude_ai.get("subscriptionType"),
+        "tier": (claude_ai.get("rateLimitTier")
+                 or oauth.get("organizationRateLimitTier")),
+        "refresh_expires_at": _epoch_seconds(claude_ai.get("refreshTokenExpiresAt")),
+        "has_token": bool(claude_ai.get("accessToken")),
+    }
+
+
+def sign_in_command(account):
+    """How to sign in to this account's ping directory."""
+    return "CLAUDE_CONFIG_DIR={} claude".format(account.config_dir)
+
+
+def _sync_marker(path):
+    """The first file-sync marker found at or above path, or ''."""
+    seen = set()
+    while path and path not in seen and path != os.path.dirname(path):
+        seen.add(path)
+        for marker in _SYNC_MARKERS:
+            if os.path.exists(os.path.join(path, marker)):
+                return os.path.join(path, marker)
+        if path == HOME:
+            break
+        path = os.path.dirname(path)
+    return ""
+
+
+def validate_accounts(accounts, check_sharing=None):
+    """
+    Everything worth saying about a configured set of accounts, worst first.
+
+    Returns Findings rather than printing, so setup, `doctor` and the tests can
+    each present them their own way.
+    """
+    findings = []
+    identities = {}
+
+    for account in accounts:
+        identity = identities[account.name] = account_identity(account)
+
+        if not os.path.isdir(account.config_dir):
+            findings.append(Finding(
+                "error",
+                "Account {}: {} does not exist".format(
+                    account.name, account.config_dir),
+                "Create it and sign in with: {}".format(sign_in_command(account))))
+            continue
+
+        if not identity["has_token"] and not identity["account_uuid"]:
+            findings.append(Finding(
+                "error",
+                "Account {} is not signed in".format(account.name),
+                "Sign in with: {}   then /login (this sends no message, so it "
+                "starts no usage window)".format(sign_in_command(account))))
+
+        subscription = (identity["subscription"] or "").lower()
+        if subscription and subscription in ("free", "none"):
+            findings.append(Finding(
+                "error",
+                "Account {} is on the {} plan".format(
+                    account.name, identity["subscription"]),
+                "This tool only does anything useful for a paid subscription."))
+
+        expires = identity["refresh_expires_at"]
+        if expires and expires - time.time() < REFRESH_WARNING_DAYS * 86400:
+            findings.append(Finding(
+                "warning",
+                "Account {}'s login expires {}".format(
+                    account.name, fmt_time(expires)),
+                "Sign in again before then; an expired login looks exactly like "
+                "the tool having stopped working."))
+
+        mode = _permissions(account.config_dir)
+        if mode is not None and mode & 0o077:
+            findings.append(Finding(
+                "warning",
+                "{} is readable by other users (mode {:o})".format(
+                    account.config_dir, mode),
+                "It holds an access token: chmod 700 {}".format(
+                    account.config_dir)))
+
+        marker = _sync_marker(account.config_dir)
+        if marker:
+            findings.append(Finding(
+                "warning",
+                "Account {}'s config directory is inside a synced folder "
+                "({})".format(account.name, marker),
+                "Sync tools handle symlinks inconsistently. If shared "
+                "conversations stop working, check that with: {} "
+                "doctor".format(COMMAND)))
+
+    # The mistake that leaves everything apparently working and worth nothing.
+    by_uuid = {}
+    for account in accounts:
+        uuid_ = (identities[account.name]["account_uuid"]
+                 or identities[account.name]["email"])
+        if not uuid_:
+            continue
+        if uuid_ in by_uuid:
+            findings.append(Finding(
+                "error",
+                "Accounts {} and {} are the same Claude account ({})".format(
+                    by_uuid[uuid_], account.name,
+                    identities[account.name]["email"] or uuid_),
+                "Two logins to one account share one usage window, so the "
+                "second subscription buys nothing. Sign one of them in as a "
+                "different account."))
+        else:
+            by_uuid[uuid_] = account.name
+
+    tiers = set(identities[a.name]["tier"] for a in accounts
+                if identities[a.name]["tier"])
+    if len(tiers) > 1:
+        findings.append(Finding(
+            "warning",
+            "The accounts are on different plans ({})".format(
+                ", ".join(sorted(tiers))),
+            "Windows are spaced evenly, which assumes each account supplies a "
+            "similar amount. Uneven plans still work; the spacing is just no "
+            "longer optimal."))
+
+    order = {"error": 0, "warning": 1}
+    return sorted(findings, key=lambda f: order.get(f.level, 2))
+
+
+def _permissions(path):
+    try:
+        return os.stat(path).st_mode & 0o777
+    except OSError:
+        return None
+
+
+# Set on every ping so a wrapper can recognise one and step aside. The default
+# account always sets CLAUDE_CONFIG_DIR, but a marker is clearer than inferring
+# intent from a path, and anything wrapping `claude` can use it to step aside.
+PING_MARKER_ENV = "CLAUDE_EARLY_WINDOW_PING"
 
 
 # Environment variables to pass through to the Claude subprocess *if* present.
@@ -89,8 +1022,13 @@ _ENV_PASSTHROUGH = (
 )
 
 
-def build_claude_env():
-    """Build a clean, minimal environment for the Claude subprocess."""
+def build_claude_env(account):
+    """
+    Build a clean, minimal environment for the Claude subprocess.
+
+    CLAUDE_CONFIG_DIR is always set, and always to this account's own ping
+    directory. Nothing here can reach the user's ~/.claude.
+    """
     env = {
         "HOME":  HOME,
         "USER":  USER,
@@ -98,6 +1036,8 @@ def build_claude_env():
         "SHELL": "/bin/bash",
         "PATH":  os.path.join(HOME, ".local", "bin")
                  + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        PING_MARKER_ENV: "1",
+        "CLAUDE_CONFIG_DIR": account.config_dir,
     }
     for key in _ENV_PASSTHROUGH:
         if key in os.environ:
@@ -109,19 +1049,20 @@ def build_claude_env():
 # Logging
 # ---------------------------------------------------------------------------
 
-def log(msg):
+def log(account, msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
-    with open(LOG_FILE, "a") as f:
+    account.ensure_state_dir()
+    with open(account.log_file, "a") as f:
         f.write(line + "\n")
     print(line)
 
 
-def rotate_log():
-    if not os.path.exists(LOG_FILE):
+def rotate_log(account):
+    if not os.path.exists(account.log_file):
         return
     cutoff = datetime.now() - timedelta(hours=LOG_RETENTION_HOURS)
-    with open(LOG_FILE, "r") as f:
+    with open(account.log_file, "r") as f:
         lines = f.readlines()
     kept = []
     for line in lines:
@@ -132,7 +1073,7 @@ def rotate_log():
         except ValueError:
             if not line.strip():
                 kept.append(line)  # preserve blank separator lines between runs
-    with open(LOG_FILE, "w") as f:
+    with open(account.log_file, "w") as f:
         f.writelines(kept)
 
 
@@ -140,19 +1081,20 @@ def rotate_log():
 # State
 # ---------------------------------------------------------------------------
 
-def read_state():
+def read_state(account):
     try:
-        with open(STATE_FILE) as f:
+        with open(account.state_file) as f:
             return json.load(f)
     except (IOError, OSError, ValueError):
         return {}
 
 
-def write_state(state):
-    tmp = STATE_FILE + ".tmp"
+def write_state(account, state):
+    account.ensure_state_dir()
+    tmp = account.state_file + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2, sort_keys=True)
-    os.replace(tmp, STATE_FILE)
+    os.replace(tmp, account.state_file)
 
 
 def fmt_time(epoch):
@@ -182,21 +1124,29 @@ def fmt_delta(seconds):
 #      (Asia/Jerusalem)"). Only available when a ping is actually blocked, and
 #      only to the minute, but that is exactly the case where source 1 is silent.
 
-def statusline_settings():
-    """Inline --settings JSON that points Claude's statusLine back at this script."""
+def statusline_settings(account):
+    """
+    Inline --settings JSON that points Claude's statusLine back at this script.
+
+    The account travels as an explicit argument rather than through the
+    environment. Claude Code spawns this command itself, so relying on inherited
+    environment would make a second account's readings land in the first
+    account's file — a failure that would look like nothing more than slightly
+    stale numbers.
+    """
     command = " ".join(shlex.quote(part) for part in (
         sys.executable or "/usr/bin/python3",
         os.path.abspath(__file__),
-        "--capture-statusline",
+        "capture-statusline", account.name,
     ))
     return json.dumps({
         "statusLine": {"type": "command", "command": command, "padding": 0}
     })
 
 
-def capture_statusline():
+def capture_statusline(account):
     """
-    Append the statusLine payload to STATUSLINE_FILE as one JSON object per line.
+    Append the statusLine payload to the account's file, one JSON object per line.
 
     Claude Code invokes this repeatedly during a session and only the later
     invocations carry rate_limits, so we append rather than overwrite and pick the
@@ -206,13 +1156,14 @@ def capture_statusline():
     try:
         raw = sys.stdin.read()
         json.loads(raw)  # validate before storing
-        with open(STATUSLINE_FILE, "a") as f:
+        account.ensure_state_dir()
+        with open(account.statusline_file, "a") as f:
             f.write(raw.replace("\n", " ") + "\n")
     except Exception:
         pass
 
 
-def statusline_records():
+def statusline_records(account):
     """
     Every complete statusLine payload captured so far, oldest first.
 
@@ -222,7 +1173,7 @@ def statusline_records():
     """
     records = []
     try:
-        with open(STATUSLINE_FILE) as f:
+        with open(account.statusline_file) as f:
             for line in f:
                 try:
                     records.append(json.loads(line))
@@ -233,7 +1184,7 @@ def statusline_records():
     return records
 
 
-def statusline_api_ms(records=None):
+def statusline_api_ms(account, records=None):
     """
     Highest total_api_duration_ms reported by the statusLine so far.
 
@@ -243,15 +1194,15 @@ def statusline_api_ms(records=None):
     better completion signal than guessing from when the screen stops changing.
     """
     if records is None:
-        records = statusline_records()
+        records = statusline_records(account)
     return max([(r.get("cost") or {}).get("total_api_duration_ms") or 0
                 for r in records] or [0])
 
 
-def read_statusline_limits():
+def read_statusline_limits(account):
     """Return the most recent {'five_hour': {...}, 'seven_day': {...}} seen, or {}."""
     latest = {}
-    for record in statusline_records():
+    for record in statusline_records(account):
         limits = record.get("rate_limits")
         if isinstance(limits, dict) and limits:
             latest = limits
@@ -265,7 +1216,7 @@ def fmt_pct(used):
     return "?%" if used is None else "{}%".format(used)
 
 
-def format_usage(limits=None):
+def format_usage(account, limits=None):
     """
     One line summarising both limits: how much is used, and when each resets.
 
@@ -274,7 +1225,7 @@ def format_usage(limits=None):
     record of usage over time rather than only a record of pings.
     """
     if limits is None:
-        limits = read_statusline_limits()
+        limits = read_statusline_limits(account)
     now = time.time()
     parts = []
     for key, name in _LIMIT_NAMES:
@@ -467,16 +1418,17 @@ def _systemctl(*args):
     return _run(["systemctl", "--user"] + list(args))
 
 
-def cancel_anchor():
+def cancel_anchor(account):
     """Clear any pending anchor so a new one can take its place."""
-    for unit in (ANCHOR_UNIT + ".timer", ANCHOR_UNIT + ".service"):
+    for unit in (account.anchor_unit + ".timer", account.anchor_unit + ".service"):
         _systemctl("stop", unit)
-    _systemctl("reset-failed", ANCHOR_UNIT + ".timer", ANCHOR_UNIT + ".service")
+    _systemctl("reset-failed",
+               account.anchor_unit + ".timer", account.anchor_unit + ".service")
 
 
-def anchor_pending():
+def anchor_pending(account):
     """Return the pending anchor's scheduled time as a string, or '' if none."""
-    result = _systemctl("show", ANCHOR_UNIT + ".timer",
+    result = _systemctl("show", account.anchor_unit + ".timer",
                         "--property=NextElapseUSecRealtime", "--value")
     if result.returncode != 0:
         return ""
@@ -484,7 +1436,7 @@ def anchor_pending():
     return value if value and value not in ("n/a", "0") else ""
 
 
-def schedule_anchor(target_epoch):
+def schedule_anchor(account, target_epoch):
     """
     Create a transient one-shot timer that starts the ping service at target_epoch.
 
@@ -497,25 +1449,27 @@ def schedule_anchor(target_epoch):
     still be active *during* the run it triggered, and that run deciding it needs
     another anchor would end up trying to cancel its own parent.
     """
-    cancel_anchor()
+    cancel_anchor(account)
     stamp = datetime.fromtimestamp(target_epoch).strftime("%Y-%m-%d %H:%M:%S")
     result = _run(
         ["systemd-run", "--user", "--collect",
-         "--unit", ANCHOR_UNIT,
-         "--description", "Claude Early Window — one-shot window-boundary anchor",
+         "--unit", account.anchor_unit,
+         "--description",
+         "Claude Early Window — window-boundary anchor for account "
+         + account.name,
          "--on-calendar", stamp,
          "--timer-property=AccuracySec=1s",
-         "systemctl", "--user", "start", "--no-block", SERVICE_UNIT])
+         "systemctl", "--user", "start", "--no-block", account.service_unit])
     if result.returncode != 0:
-        log("WARNING: could not schedule anchor: {}".format(
+        log(account, "WARNING: could not schedule anchor: {}".format(
             (result.stdout or "").strip()))
         return False
-    log("Anchor scheduled for {} (in {})".format(
+    log(account, "Anchor scheduled for {} (in {})".format(
         stamp, fmt_delta(target_epoch - time.time())))
     return True
 
 
-def maybe_schedule_anchor(boundary, horizon, label, state, was_limited):
+def maybe_schedule_anchor(account, boundary, horizon, label, state, was_limited):
     """
     Decide whether the next window boundary needs a one-shot anchor.
 
@@ -536,27 +1490,30 @@ def maybe_schedule_anchor(boundary, horizon, label, state, was_limited):
     # and one further out than the limit it came from could ever run is nonsense.
     # This is the guard against clock skew or an unexpected payload.
     if not (now < boundary <= now + horizon):
-        log("Reset time {} is out of range for the {} — ignoring.".format(
+        log(account, "Reset time {} is out of range for the {} — ignoring.".format(
             fmt_time(boundary), label))
         return
 
     streak = state.get("anchor_streak", 0)
     if was_limited and streak >= MAX_ANCHOR_STREAK:
-        log("Anchored {} times in a row and still rate-limited — no more anchors "
+        log(account,
+            "Anchored {} times in a row and still rate-limited — no more anchors "
             "until a ping succeeds (ordinary pings carry on).".format(streak))
         return
 
-    target = boundary + RESET_GUARD_SEC
+    target = boundary + account.guard_sec
     if target - now > INTERVAL_MIN * 60:
-        log("Next ping can start a window at {} (in {}, set by the {}) — "
+        log(account,
+            "Next ping can start a window at {} (in {}, set by the {}) — "
             "more than one interval away, no anchor needed yet.".format(
                 fmt_time(boundary), fmt_delta(boundary - now), label))
         return
 
-    log("Next ping can start a window at {} (in {}, set by the {}) — "
+    log(account,
+        "Next ping can start a window at {} (in {}, set by the {}) — "
         "within one interval.".format(
             fmt_time(boundary), fmt_delta(boundary - now), label))
-    if schedule_anchor(target):
+    if schedule_anchor(account, target):
         state["anchor_target"] = target
         state["anchor_label"] = label
         state["anchor_streak"] = streak + 1 if was_limited else 1
@@ -566,13 +1523,13 @@ def maybe_schedule_anchor(boundary, horizon, label, state, was_limited):
 # Checkpoint backup / restore
 # ---------------------------------------------------------------------------
 
-def _session_file(session_id):
-    return os.path.join(SESSION_DIR, f"{session_id}.jsonl")
+def _session_file(account, session_id):
+    return os.path.join(account.session_dir, f"{session_id}.jsonl")
 
 
-def _assistant_entries(session_id):
+def _assistant_entries(account, session_id):
     """Return the (deduplicated) assistant-turn objects recorded in the session file."""
-    path = _session_file(session_id)
+    path = _session_file(account, session_id)
     if not os.path.exists(path):
         return []
     entries, seen = [], set()
@@ -591,23 +1548,28 @@ def _assistant_entries(session_id):
     return entries
 
 
-def _discard_session(session_id):
+def _discard_session(account, session_id):
     """Remove a session file from a failed setup attempt so a retry starts clean."""
     try:
-        os.remove(_session_file(session_id))
+        os.remove(_session_file(account, session_id))
     except OSError:
         pass
 
 
-def backup_checkpoint(session_id):
-    src = _session_file(session_id)
-    shutil.copy2(src, CHECKPOINT_BACKUP)
-    log(f"Checkpoint backed up ({os.path.getsize(CHECKPOINT_BACKUP)} bytes)")
+def backup_checkpoint(account, session_id):
+    account.ensure_state_dir()
+    shutil.copy2(_session_file(account, session_id), account.checkpoint_backup)
+    log(account, "Checkpoint backed up ({} bytes)".format(
+        os.path.getsize(account.checkpoint_backup)))
 
 
-def restore_checkpoint(session_id):
-    shutil.copy2(CHECKPOINT_BACKUP, _session_file(session_id))
-    log("Checkpoint restored to frozen 'hi' state")
+def restore_checkpoint(account, session_id):
+    # The session directory belongs to Claude Code and may not exist yet on a
+    # freshly created account, so make it rather than assume it.
+    if not os.path.isdir(account.session_dir):
+        os.makedirs(account.session_dir, 0o700)
+    shutil.copy2(account.checkpoint_backup, _session_file(account, session_id))
+    log(account, "Checkpoint restored to frozen 'hi' state")
 
 
 # ---------------------------------------------------------------------------
@@ -658,8 +1620,9 @@ def _send(fd, data):
         return False
 
 
-def run_interactive(extra_args, prompt_text, session_id,
-                    startup_wait=8, completion_timeout=60, statusline_wait=10):
+def run_interactive(account, extra_args, prompt_text, session_id,
+                    startup_wait=None, completion_timeout=None,
+                    statusline_wait=None):
     """
     Spawn an interactive Claude session in a PTY, send prompt_text, wait for the
     reply to settle, then /exit and verify the turn was recorded.
@@ -680,22 +1643,36 @@ def run_interactive(extra_args, prompt_text, session_id,
     Returns {"completed": bool, "limited": bool, "text": str}.
     """
     if not os.path.isfile(CLAUDE_PATH):
-        log(f"ERROR: Claude CLI not found at {CLAUDE_PATH}. "
+        log(account, f"ERROR: Claude CLI not found at {CLAUDE_PATH}. "
             "Install Claude Code from https://claude.ai/download")
         return {"completed": False, "limited": False, "text": ""}
 
     # Start each run with a clean statusLine capture so stale readings from the
     # previous run can never be mistaken for this one's.
+    account.ensure_state_dir()
     try:
-        os.remove(STATUSLINE_FILE)
+        os.remove(account.statusline_file)
     except OSError:
         pass
+
+    startup_wait = STARTUP_WAIT_SEC if startup_wait is None else startup_wait
+    completion_timeout = (COMPLETION_TIMEOUT_SEC if completion_timeout is None
+                          else completion_timeout)
+    statusline_wait = (STATUSLINE_WAIT_SEC if statusline_wait is None
+                       else statusline_wait)
 
     master_fd, slave_fd = pty.openpty()
     cmd = [CLAUDE_PATH,
            "--tools", "",
+           # A background ping has no business driving a browser, and without
+           # this an account that has never answered the "Claude in Chrome
+           # detected" prompt sits on it forever with nobody to press a key.
+           # That prompt appeared in 2.1.x, which is the general lesson: a new
+           # first-run question can block the ping at any release, so the ping
+           # asks for as little of Claude Code as it can.
+           "--no-chrome",
            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-           "--settings", statusline_settings(),
+           "--settings", statusline_settings(account),
            "--model", "haiku", "--effort", "low"] + extra_args
 
     try:
@@ -706,10 +1683,10 @@ def run_interactive(extra_args, prompt_text, session_id,
             stderr=slave_fd,
             cwd=SCRIPT_DIR,
             preexec_fn=os.setsid,
-            env=build_claude_env(),
+            env=build_claude_env(account),
         )
     except Exception as e:
-        log(f"ERROR: Failed to spawn Claude: {e}")
+        log(account, f"ERROR: Failed to spawn Claude: {e}")
         os.close(master_fd)
         os.close(slave_fd)
         return {"completed": False, "limited": False, "text": ""}
@@ -729,7 +1706,7 @@ def run_interactive(extra_args, prompt_text, session_id,
     # subscription, so no statusLine data) the baseline stays 0, the counter stays
     # 0, and completion falls through to the PTY heuristic below.
     statusline_deadline = time.time() + statusline_wait
-    while time.time() < statusline_deadline and not statusline_records():
+    while time.time() < statusline_deadline and not statusline_records(account):
         time.sleep(0.25)
         _drain(master_fd)
 
@@ -745,12 +1722,13 @@ def run_interactive(extra_args, prompt_text, session_id,
     #      replying (especially on a cache miss) can itself be several seconds.
     #
     # Draining the PTY throughout also keeps the child from blocking on a full buffer.
-    baseline = len(_assistant_entries(session_id))
-    api_baseline = statusline_api_ms()
-    log(f"Sending: '{prompt_text}'")
+    baseline = len(_assistant_entries(account, session_id))
+    api_baseline = statusline_api_ms(account)
+    log(account, f"Sending: '{prompt_text}'")
     sent = _send(master_fd, (prompt_text + "\r").encode())
     if not sent:
-        log("ERROR: could not send the prompt — the Claude process is already gone.")
+        log(account,
+            "ERROR: could not send the prompt — the Claude process is already gone.")
 
     min_settle = 10.0
     idle_threshold = 5.0
@@ -766,7 +1744,7 @@ def run_interactive(extra_args, prompt_text, session_id,
             saw_output = True
             last_activity = time.time()
 
-        if statusline_api_ms() > api_baseline:
+        if statusline_api_ms(account) > api_baseline:
             # Reply confirmed. Give the UI a moment to finish rendering before
             # /exit, so the transcript is written with the turn complete.
             drain_until = time.time() + settle_after_reply
@@ -792,7 +1770,7 @@ def run_interactive(extra_args, prompt_text, session_id,
         _drain(master_fd)
 
     if proc.poll() is None:
-        log("Process still running — sending SIGTERM")
+        log(account, "Process still running — sending SIGTERM")
         proc.terminate()
         proc.wait()
 
@@ -803,7 +1781,7 @@ def run_interactive(extra_args, prompt_text, session_id,
 
     # Now that the process has exited, the session file is flushed: verify a new
     # assistant turn was recorded and log its token usage (cache read vs write).
-    entries = _assistant_entries(session_id)
+    entries = _assistant_entries(account, session_id)
     completed = len(entries) > baseline
     text, limited = "", False
     if completed:
@@ -818,22 +1796,24 @@ def run_interactive(extra_args, prompt_text, session_id,
         limited = (record.get("apiErrorStatus") == 429
                    or record.get("error") == "rate_limit"
                    or "hit your" in text.lower())
-        log("Turn confirmed{}: cache_read={} cache_write={} in={} out={}".format(
+        log(account,
+            "Turn confirmed{}: cache_read={} cache_write={} in={} out={}".format(
             " [RATE-LIMITED]" if limited else "",
             usage.get("cache_read_input_tokens", 0),
             usage.get("cache_creation_input_tokens", 0),
             usage.get("input_tokens", 0),
             usage.get("output_tokens", 0)))
         if limited:
-            log("Refusal: {}".format(text.strip()))
+            log(account, "Refusal: {}".format(text.strip()))
     else:
-        log("WARNING: no new assistant turn recorded — the ping may not have counted.")
+        log(account,
+            "WARNING: no new assistant turn recorded — the ping may not have counted.")
 
-    usage = format_usage()
+    usage = format_usage(account)
     if usage:
-        log(usage)
+        log(account, usage)
 
-    log(f"Exited with code: {proc.returncode}")
+    log(account, f"Exited with code: {proc.returncode}")
     return {"completed": completed, "limited": limited, "text": text}
 
 
@@ -841,85 +1821,120 @@ def run_interactive(extra_args, prompt_text, session_id,
 # Init (one-time, called by install.sh)
 # ---------------------------------------------------------------------------
 
-def init():
+def init(account):
     """
     Create the frozen checkpoint session with a single 'hi' message and back it up.
-    Must be run once before the systemd timer starts. Called via --init flag.
+    Must be run once per account before its systemd timer starts.
     """
-    if os.path.exists(SESSION_ID_FILE) and os.path.exists(CHECKPOINT_BACKUP):
-        print("Checkpoint already exists.")
-        print(f"  Session: {open(SESSION_ID_FILE).read().strip()}")
-        print(f"  Backup:  {CHECKPOINT_BACKUP} "
-              f"({os.path.getsize(CHECKPOINT_BACKUP)} bytes)")
-        print("To reset, delete early_window_session_id.txt and "
-              "early_window_checkpoint.jsonl.bak, then re-run ./install.sh.")
+    if os.path.exists(account.session_id_file) and \
+       os.path.exists(account.checkpoint_backup):
+        print("Account {}: checkpoint already exists.".format(account.display))
+        print("  Session: {}".format(open(account.session_id_file).read().strip()))
+        print("  Backup:  {} ({} bytes)".format(
+            account.checkpoint_backup, os.path.getsize(account.checkpoint_backup)))
+        print("  To rebuild it, delete {} and re-run ./install.sh.".format(
+            account.state_dir))
         return
 
-    # Clean any partial state
-    for f in (SESSION_ID_FILE, CHECKPOINT_BACKUP):
-        if os.path.exists(f):
-            os.remove(f)
+    account.ensure_state_dir()
+    # A ping directory is ours, so we assert what a ping needs rather than
+    # hoping the user's config happens to contain it.
+    ensure_ping_config(account)
+    for path in (account.session_id_file, account.checkpoint_backup):
+        if os.path.exists(path):
+            os.remove(path)          # clean up a half-finished earlier attempt
 
     checkpoint_id = str(uuid.uuid4())
-    log(f"Creating checkpoint session {checkpoint_id[:8]}... with 'hi'")
+    log(account, f"Creating checkpoint session {checkpoint_id[:8]}... with 'hi'")
 
-    result = run_interactive(["--session-id", checkpoint_id], "hi", checkpoint_id)
+    result = run_interactive(account, ["--session-id", checkpoint_id], "hi",
+                             checkpoint_id)
 
     # The checkpoint is frozen once and replayed by every future ping, so it must
     # not be built out of a refusal. That would bake the refusal into the prompt
     # for good, and install.sh would report success over a degraded setup.
     if result["limited"]:
-        log("ERROR: Claude refused the first message, so there is no reply to "
-            "build the checkpoint from:")
-        log("  " + result["text"].strip())
-        log("Wait for the limit to reset, then run ./install.sh again.")
-        _discard_session(checkpoint_id)
+        log(account, "ERROR: Claude refused the first message, so there is no "
+                     "reply to build the checkpoint from:")
+        log(account, "  " + result["text"].strip())
+        log(account, "Wait for the limit to reset, then run ./install.sh again.")
+        _discard_session(account, checkpoint_id)
         sys.exit(1)
 
     if not result["completed"]:
-        log("ERROR: Failed to create checkpoint session.")
-        _discard_session(checkpoint_id)
+        log(account, "ERROR: Failed to create checkpoint session.")
+        _discard_session(account, checkpoint_id)
         sys.exit(1)
 
-    with open(SESSION_ID_FILE, "w") as f:
+    with open(account.session_id_file, "w") as f:
         f.write(checkpoint_id)
 
-    backup_checkpoint(checkpoint_id)
-    log(f"Checkpoint ready: {checkpoint_id}")
+    backup_checkpoint(account, checkpoint_id)
+    log(account, f"Checkpoint ready: {checkpoint_id}")
 
 
 # ---------------------------------------------------------------------------
 # Early-window run (called by the systemd timer on each interval)
 # ---------------------------------------------------------------------------
 
-def main():
-    rotate_log()
-    log("Starting early-window run...")
+def ping(account, accounts=None):
+    rotate_log(account)
+    accounts = accounts or [account]
+    states = {a.name: read_state(a) for a in accounts}
+    state = states[account.name]
+    now = time.time()
 
-    if not os.path.exists(SESSION_ID_FILE) or not os.path.exists(CHECKPOINT_BACKUP):
-        log("ERROR: No checkpoint found. Run ./install.sh to initialise.")
+    # A hold is the one reason a ping is ever skipped, and it is always about
+    # timing, never about whether the account looks usable. Pings to an account
+    # that cannot serve anything carry on regardless: they cost nothing and they
+    # are the only way to notice it coming back.
+    hold = active_hold(state, now)
+    if hold:
+        log(account, "Holding account {} until {} — {}. Not pinging, because a "
+                     "ping now would start the window at the wrong time.".format(
+                         account.display, fmt_time(hold["until"]),
+                         hold.get("reason", "alignment")))
+        schedule_anchor(account, hold["until"] + account.guard_sec)
+        write_state(account, state)
+        return
+
+    log(account, "Starting early-window run for account {}...".format(
+        account.display))
+    ensure_ping_config(account)
+
+    if not os.path.exists(account.session_id_file) or \
+       not os.path.exists(account.checkpoint_backup):
+        log(account, "ERROR: No checkpoint for account {}. Run ./install.sh to "
+                     "initialise.".format(account.name))
         sys.exit(1)
 
-    with open(SESSION_ID_FILE) as f:
+    with open(account.session_id_file) as f:
         checkpoint_id = f.read().strip()
 
     # Restore the frozen 'hi' state so --resume always sees the same 2-message
     # context, regardless of what the previous run left behind.
-    restore_checkpoint(checkpoint_id)
+    restore_checkpoint(account, checkpoint_id)
 
-    log(f"Resuming checkpoint {checkpoint_id[:8]}... with 'bye'")
-    result = run_interactive(["--resume", checkpoint_id], "bye", checkpoint_id)
+    log(account, f"Resuming checkpoint {checkpoint_id[:8]}... with 'bye'")
+    result = run_interactive(account, ["--resume", checkpoint_id], "bye",
+                             checkpoint_id)
     if not result["completed"]:
-        log("WARNING: early-window run did not confirm a completed turn.")
+        log(account, "WARNING: early-window run did not confirm a completed turn.")
 
-    state = read_state()
+    # Clear a hold only once it has actually been served. A hold set for a
+    # future boundary — by `realign --confirm`, say — has to survive every
+    # ordinary ping between now and then, or the correction is discarded by the
+    # next tick and nothing says so.
+    spent = state.get("hold")
+    if spent and time.time() >= spent.get("until", 0):
+        state.pop("hold", None)
     state["last_run"] = time.time()
 
     # Work out the earliest moment the next ping could start a window — which
     # depends on both the 5-hour and the weekly limit — then decide whether that
     # moment needs a one-shot anchor. A successful ping reports both limits
     # exactly via the statusLine; a refused one says so in the refusal text.
-    limits = read_statusline_limits()
+    limits = read_statusline_limits(account)
     if limits:
         state["rate_limits"] = limits
         state["limits_source"] = "statusline"
@@ -932,82 +1947,1211 @@ def main():
         if not limits:
             state["limits_source"] = "refusal-text"
     else:
-        log("No reset time reported this run — leaving the schedule as it is.")
+        log(account, "No reset time reported this run — leaving the schedule "
+                     "as it is.")
 
+    # Availability is an observation, never a stored belief. A ping that got
+    # through proves the account is usable right now; a refusal reports when it
+    # will be. Nothing here asks *which* limit refused: a weekly limit spent, a
+    # lapsed subscription and a revoked login are the same state, and all three
+    # recover the same way — by an ordinary ping succeeding again.
     if result["completed"] and not result["limited"]:
-        state["anchor_streak"] = 0        # back to normal; forget past corrections
+        state["available_at"] = time.time()          # proven by demonstration
+        state["consecutive_failures"] = 0
+        state["anchor_streak"] = 0    # back to normal; forget past corrections
+    elif result["limited"]:
+        if boundary:
+            state["available_at"] = boundary
+        state["consecutive_failures"] = 0            # it answered; it just said no
+    else:
+        # No answer at all says nothing about the account — that is a local
+        # problem until it keeps happening.
+        state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
 
-    maybe_schedule_anchor(boundary, horizon, label, state, result["limited"])
-    write_state(state)
+    # Spacing is decided from what every account is *observed* to be doing, not
+    # from a schedule agreed earlier — so nothing here can fall out of date, and
+    # a user who ignored the setup advice simply gets a different plan.
+    states[account.name] = state
+    extra = apply_alignment(account, accounts, states, state, time.time(),
+                            boundary)
 
-    log("Early-window run finished.\n")
+    # The anchor has to land on the *held* moment, and the horizon that
+    # sanity-checks it has to stretch by the same amount or it would reject its
+    # own target as implausible.
+    maybe_schedule_anchor(account,
+                          boundary + extra if boundary else boundary,
+                          horizon + extra if horizon else horizon,
+                          label, state, result["limited"])
+    write_state(account, state)
+
+    log(account, "Early-window run finished.\n")
+
+
+def realign(accounts, confirm=False):
+    """Show what correcting the spacing would cost, and apply it when asked."""
+    now = time.time()
+    states = {a.name: read_state(a) for a in accounts}
+    lines, delays, total, settled = describe_alignment(
+        accounts, states, now, suggest_realign=False, note_waiting=not confirm)
+    for line in lines:
+        print(line)
+
+    if total < ALIGN_DEADBAND_SEC:
+        return 0
+    print()
+    print("Correcting this costs {} in total with no window running — the "
+          "accounts being held cannot start a new window until they are back "
+          "in step.".format(fmt_delta(total)))
+    if confirm and not settled:
+        # The wait exists to stop the tool re-spacing on its own initiative
+        # while accounts come and go. An explicit request is not that.
+        print("The set of active accounts changed recently, so this would not "
+              "have happened by itself — but you asked, so here it is.")
+    if not confirm:
+        print("Re-run with --confirm to apply it.")
+        return 0
+
+    for account in accounts:
+        delay = delays.get(account.name, 0.0)
+        if delay < ALIGN_DEADBAND_SEC:
+            continue
+        state = states[account.name]
+        boundary = next_expiry(state, now)
+        if boundary == float("inf"):
+            continue
+        state["hold"] = {"from": boundary, "until": boundary + delay,
+                         "reason": "realigning, on your say-so"}
+        write_state(account, state)
+        schedule_anchor(account, boundary + delay + account.guard_sec)
+        print("  account {}: next window will start {}".format(
+            account.display, fmt_time(boundary + delay)))
+
+    alignment = read_alignment()
+    alignment.pop("proposal", None)
+    alignment["last_applied"] = now
+    write_alignment(alignment)
+    return 0
 
 
 # ---------------------------------------------------------------------------
 # Status (for humans)
 # ---------------------------------------------------------------------------
 
-def status():
+def status(accounts):
     now = time.time()
+    states = {a.name: read_state(a) for a in accounts}
+
     print("Claude Code Early Window — status")
     print("=" * 34)
+    print()
 
-    installed = os.path.exists(SESSION_ID_FILE) and os.path.exists(CHECKPOINT_BACKUP)
-    print("Checkpoint    : {}".format(
-        open(SESSION_ID_FILE).read().strip() if installed else "MISSING — run ./install.sh"))
+    chosen, reason = choose_account(accounts, states, now)
+    print("Use account {} right now".format(chosen.display))
+    print("  {}".format(reason))
 
-    state = read_state()
-    if state.get("last_run"):
-        print("Last ping     : {} ({} ago)".format(
-            fmt_time(state["last_run"]), fmt_delta(now - state["last_run"])))
+    for account in accounts:
+        state = states[account.name]
+        print()
+        print("Account {}".format(account.display))
+        print("  Config dir    : {}".format(account.config_dir))
 
-    limits = state.get("rate_limits", {})
-    for key, name in _LIMIT_NAMES:
-        window = limits.get(key) or {}
-        if not window.get("resets_at"):
-            continue
-        print("{:<14}: {} used, resets {} (in {})".format(
-            "5-hour window" if key == "five_hour" else "Weekly limit",
-            fmt_pct(window.get("used_percentage")),
-            fmt_time(window["resets_at"]),
-            fmt_delta(window["resets_at"] - now)))
+        installed = (os.path.exists(account.session_id_file)
+                     and os.path.exists(account.checkpoint_backup))
+        print("  Checkpoint    : {}".format(
+            open(account.session_id_file).read().strip() if installed
+            else "MISSING — run ./install.sh"))
 
-    boundary = state.get("boundary")
-    if boundary:
-        stale = "" if boundary > now else " — passed, awaiting next ping"
-        print("Next start-of-window opportunity: {} (in {}){}".format(
-            fmt_time(boundary), fmt_delta(boundary - now), stale))
-        print("  set by the {}   [via {}]".format(
-            state.get("boundary_label", "?"), state.get("limits_source", "?")))
-    else:
-        print("Next start-of-window opportunity: not known yet — run one ping first")
+        if state.get("last_run"):
+            print("  Last ping     : {} ({} ago)".format(
+                fmt_time(state["last_run"]), fmt_delta(now - state["last_run"])))
+        failures = state.get("consecutive_failures", 0)
+        if failures:
+            print("  Failed pings  : {} in a row{}".format(
+                failures, "  — not being recommended"
+                if failures >= UNHEALTHY_AFTER else ""))
 
-    pending = anchor_pending()
-    print("Anchor        : {}".format(
-        "pending — " + pending if pending else "none scheduled"))
+        limits = state.get("rate_limits", {})
+        for key, name in _LIMIT_NAMES:
+            window = limits.get(key) or {}
+            if not window.get("resets_at"):
+                continue
+            print("  {:<14}: {} used, resets {} (in {})".format(
+                "5-hour window" if key == "five_hour" else "Weekly limit",
+                fmt_pct(window.get("used_percentage")),
+                fmt_time(window["resets_at"]),
+                fmt_delta(window["resets_at"] - now)))
 
-    result = _systemctl("list-timers", "--all", "claude-early-window.timer")
-    for line in (result.stdout or "").splitlines():
-        if "claude-early-window.timer" in line:
-            print("Next ping     : {}".format(" ".join(line.split()[:4])))
+        available_at = state.get("available_at")
+        if available_at and available_at > now:
+            print("  Usable again  : {} (in {})".format(
+                fmt_time(available_at), fmt_delta(available_at - now)))
+
+        boundary = state.get("boundary")
+        if boundary:
+            stale = "" if boundary > now else " — passed, awaiting next ping"
+            print("  Next start-of-window opportunity: {} (in {}){}".format(
+                fmt_time(boundary), fmt_delta(boundary - now), stale))
+            print("    set by the {}   [via {}]".format(
+                state.get("boundary_label", "?"),
+                state.get("limits_source", "?")))
+        else:
+            print("  Next start-of-window opportunity: not known yet — "
+                  "run one ping first")
+
+        hold = state.get("hold")
+        if hold and hold.get("until", 0) > now:
+            print("  Holding       : until {} — {}".format(
+                fmt_time(hold["until"]), hold.get("reason", "alignment")))
+
+        pending = anchor_pending(account)
+        print("  Anchor        : {}".format(
+            "pending — " + pending if pending else "none scheduled"))
+
+        result = _systemctl("list-timers", "--all", account.timer_unit)
+        for line in (result.stdout or "").splitlines():
+            if account.timer_unit in line:
+                print("  Next ping     : {}".format(" ".join(line.split()[:4])))
+
+    if len(accounts) > 1:
+        print()
+        print("Spacing")
+        for line in describe_alignment(accounts, states, now)[0]:
+            print("  {}".format(line))
+    return 0
 
 
 # ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+#
+# Everything validate_accounts() checks, plus the parts that only make sense once
+# the tool is actually deployed. For something strangers install, being able to
+# say precisely what is wrong is not an extra — most of these failures are silent,
+# and "it stopped helping" is all the user would otherwise see.
+
+def doctor(accounts):
+    findings = validate_accounts(accounts)
+    now = time.time()
+
+    for account in accounts:
+        state = read_state(account)
+
+        if not os.path.exists(account.session_id_file):
+            findings.append(Finding(
+                "error", "Account {} has no checkpoint".format(account.name),
+                "Run ./install.sh"))
+
+        ok, detail = account_auth_ok(account)
+        if not ok:
+            findings.append(Finding(
+                "error", "Account {}'s login is not usable: {}".format(
+                    account.name, detail),
+                "Sign in again with: {}".format(sign_in_command(account))))
+
+        enabled = _systemctl("is-enabled", account.timer_unit)
+        if (enabled.stdout or "").strip() != "enabled":
+            findings.append(Finding(
+                "error", "The timer for account {} is not enabled".format(
+                    account.name),
+                "systemctl --user enable --now {}".format(account.timer_unit)))
+
+        # A timer can be enabled, active, and still never fire again — a drop-in
+        # that resets systemd's monotonic timer list does exactly that. Nothing
+        # announces it: the account simply stops being pinged.
+        elif not _timer_will_fire_again(account):
+            findings.append(Finding(
+                "error",
+                "The timer for account {} is running but has nothing scheduled "
+                "— it will never fire again".format(account.name),
+                "Re-run ./install.sh to rewrite the timer units."))
+
+        # The failure mode that used to be invisible: a run that dies after the
+        # ping has already succeeded still leaves the ping counted, but skips the
+        # state write and the boundary anchor. Comparing the two counts is the
+        # cheapest way to notice it.
+        started, finished = _log_run_counts(account)
+        if started and finished < started:
+            findings.append(Finding(
+                "warning",
+                "Account {}: {} of {} recent runs did not finish".format(
+                    account.name, started - finished, started),
+                "Each unfinished run may have skipped a boundary anchor. See "
+                + account.log_file))
+
+        last_run = state.get("last_run")
+        if last_run and now - last_run > 3 * INTERVAL_MIN * 60:
+            findings.append(Finding(
+                "warning", "Account {} has not pinged since {}".format(
+                    account.name, fmt_time(last_run)),
+                "Check: systemctl --user status {}".format(account.timer_unit)))
+
+        # A reset time far outside the window it belongs to means the machine
+        # clock and the server disagree, and every timing decision here is built
+        # on comparing the two.
+        resets = ((state.get("rate_limits") or {}).get("five_hour")
+                  or {}).get("resets_at")
+        if resets and not (now - 86400 < resets < now + FIVE_HOUR_HORIZON):
+            findings.append(Finding(
+                "warning", "Account {}'s reported reset time is implausible "
+                           "({})".format(account.name, fmt_time(resets)),
+                "The machine clock may be wrong; every schedule here depends "
+                "on it."))
+
+    findings.extend(_user_account_findings(accounts))
+    findings.extend(_stray_unit_findings(accounts))
+
+    if len(accounts) > 1:
+        _, total, _, settled = alignment_plan(
+            accounts, {a.name: read_state(a) for a in accounts}, now,
+            record=False)
+        if total >= ALIGN_DEADBAND_SEC and settled:
+            findings.append(Finding(
+                "warning",
+                "The windows are {} away from evenly spaced".format(
+                    fmt_delta(total)),
+                "See what correcting it would cost: {} realign".format(
+                    COMMAND)))
+
+    order = {"error": 0, "warning": 1}
+    return report_findings(sorted(findings, key=lambda f: order.get(f.level, 2)))
+
+
+_NO_ELAPSE = ("", "infinity", "n/a", "0")
+
+
+def _timer_will_fire_again(account):
+    """
+    Whether systemd still has a next elapse for this account's timer.
+
+    Both properties have to be consulted. A monotonic timer — which is what the
+    ping cadence is — reports NextElapseUSecMonotonic and leaves the realtime one
+    empty; a calendar timer does the opposite. Reading only one of them calls a
+    perfectly healthy timer broken, and a diagnostic that cries wolf is worse
+    than no diagnostic at all.
+
+    Unknown counts as fine: without systemd there is nothing to report.
+    """
+    for prop in ("NextElapseUSecMonotonic", "NextElapseUSecRealtime"):
+        result = _systemctl("show", account.timer_unit,
+                            "--property=" + prop, "--value")
+        if result.returncode != 0:
+            return True
+        if (result.stdout or "").strip() not in _NO_ELAPSE:
+            return True
+    return False
+
+
+def _stray_unit_findings(accounts):
+    """
+    Failed units that look like this tool but are not part of it.
+
+    An earlier version installed under another name, or a hand-rolled attempt at
+    the same idea, leaves a failed entry systemd remembers indefinitely — long
+    after its unit file is gone. It cannot run, but it is the first thing anyone
+    diagnosing this will trip over, so say what it is rather than leave them to
+    wonder.
+    """
+    ours = set()
+    for account in accounts:
+        ours.update((account.timer_unit, account.service_unit,
+                     account.anchor_unit + ".timer",
+                     account.anchor_unit + ".service"))
+    result = _systemctl("list-units", "--failed", "--all", "--plain",
+                        "--no-legend")
+    findings = []
+    for line in (result.stdout or "").splitlines():
+        unit = line.split()[0] if line.split() else ""
+        if not unit or unit in ours:
+            continue
+        if "claude" in unit and "window" in unit:
+            findings.append(Finding(
+                "warning",
+                "{} is in a failed state but is not part of this "
+                "install".format(unit),
+                "Probably an earlier or hand-rolled version. It cannot run, but "
+                "it will confuse the next person to look. Clear it with: "
+                "systemctl --user reset-failed {}".format(unit)))
+    return findings
+
+
+def account_auth_ok(account):
+    """
+    Whether this account's login actually works, according to Claude Code.
+
+    Costs nothing: `auth status --json` reads the credentials and reports,
+    without contacting the API or touching a usage window. Returns
+    (ok, description) — and "cannot tell" counts as ok, since inventing a fault
+    is worse than missing one.
+    """
+    # No credentials at all is answerable without spawning anything, and the
+    # answer is not in doubt.
+    if not os.path.exists(os.path.join(account.config_dir, ".credentials.json")):
+        return False, "not signed in"
+    try:
+        result = subprocess.run(
+            [CLAUDE_PATH, "auth", "status", "--json"],
+            env=build_claude_env(account), cwd=SCRIPT_DIR, timeout=60,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return True, "could not run the CLI"
+    try:
+        report = json.loads((result.stdout or "").strip())
+    except ValueError:
+        return True, "no readable answer"
+    if not report.get("loggedIn"):
+        return False, "not signed in"
+    plan = (report.get("subscriptionType") or "").lower()
+    if plan in ("free", "none", ""):
+        return False, "no paid subscription ({})".format(plan or "unknown")
+    return True, plan
+
+
+def _user_account_findings(accounts):
+    """
+    Warn when the user's own Claude is signed in as an account nobody pings.
+
+    This is the one way this design can deliver nothing while reporting perfect
+    health: the tool no longer owns ~/.claude, so the account the user actually
+    works with can drift away from the ones being kept warm — a third account, or
+    a re-login they have forgotten — and every other check would still pass.
+
+    Read-only. Their directory is not ours to change; it is only ours to notice.
+    """
+    identity = (_read_json(USER_CONFIG_JSON).get("oauthAccount") or {})
+    theirs = identity.get("accountUuid")
+    if not theirs:
+        return []                       # never signed in here, or not a user of it
+
+    pinged = {}
+    for account in accounts:
+        who = account_identity(account)
+        if who["account_uuid"]:
+            pinged[who["account_uuid"]] = who["email"] or account.name
+    if not pinged or theirs in pinged:
+        return []
+
+    return [Finding(
+        "warning",
+        "Your own Claude Code is signed in as {}, which is not one of the "
+        "accounts being pinged".format(identity.get("emailAddress") or theirs[:8]),
+        "You are getting no early-window benefit from this tool. Either sign in "
+        "as one of {}, or add the account you actually use to accounts.json and "
+        "re-run ./install.sh.".format(", ".join(sorted(pinged.values()))))]
+
+
+def _log_run_counts(account):
+    try:
+        with open(account.log_file) as f:
+            body = f.read()
+    except (IOError, OSError):
+        return 0, 0
+    return (body.count("Starting early-window run"),
+            body.count("Early-window run finished"))
+
+
+def _read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except (IOError, OSError):
+        return ""
+
+
+def which(accounts):
+    """Say which account to use, for a machine that runs no wrapper at all."""
+    now = time.time()
+    states = {a.name: read_state(a) for a in accounts}
+    chosen, reason = choose_account(accounts, states, now)
+
+    print("Use account {}".format(chosen.display))
+    print("  {}".format(reason))
+    print("  That is the window to spend; how you use the account is up to you.")
+
+    if len(accounts) > 1:
+        print()
+        for account in sorted(accounts,
+                              key=lambda a: rank_account(a, states[a.name], now)):
+            state = states[account.name]
+            expiry = next_expiry(state, now)
+            available = state.get("available_at")
+            if state.get("consecutive_failures", 0) >= UNHEALTHY_AFTER:
+                note = "pings failing — cannot tell"
+            elif available is not None and available > now:
+                note = "out of quota until {}".format(fmt_time(available))
+            elif expiry == float("inf"):
+                note = "no window information yet"
+            else:
+                note = "window ends in {}".format(fmt_delta(expiry - now))
+            print("  {:<12} {}{}".format(
+                account.display, note, "   <- use this" if account is chosen else ""))
+    return 0
+
+
+WRAPPER_DIR = os.path.join(SCRIPT_DIR, "bin")
+
+_ENTRY_POINT = '''#!/usr/bin/env bash
+# Generated by claude-early-window. Put this directory on your PATH.
+exec /usr/bin/python3 {script} "$@"
+'''
+
+
+def write_entry_point():
+    """
+    Write bin/claude-window, so the tool is a command rather than a path.
+
+    Separate from the claude wrappers because it is not one: those intercept
+    Claude Code, this simply *is* this program. Both live in bin/ so a single
+    PATH entry covers everything.
+    """
+    if not os.path.isdir(WRAPPER_DIR):
+        os.makedirs(WRAPPER_DIR, 0o755)
+    path = os.path.join(WRAPPER_DIR, COMMAND)
+    with open(path, "w") as f:
+        f.write(_ENTRY_POINT.format(script=shlex.quote(os.path.abspath(__file__))))
+    os.chmod(path, 0o755)
+    return path
+
+
+def report_findings(findings):
+    """Print validation findings for a human. Returns an exit code."""
+    if not findings:
+        print("Everything checks out.")
+        return 0
+    for finding in findings:
+        print("{}: {}".format(finding.level.upper(), finding.message))
+        if finding.hint:
+            print("  -> {}".format(finding.hint))
+    errors = sum(1 for f in findings if f.level == "error")
+    print()
+    print("{} error(s), {} warning(s).".format(errors, len(findings) - errors))
+    return 1 if errors else 0
+
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+#
+# One pass, plain questions, and nothing irreversible without saying so first.
+# Two things matter more than they look:
+#
+#   * Signing in starts no usage window, because it sends no message. Saying so
+#     removes the main reason people put this off until "a good moment" — there
+#     isn't one, and waiting for it is the actual mistake.
+#   * Nothing here asks the user to be awake at a particular hour. Alignment is
+#     the runtime's job; the worst that comes of ignoring the advice is that the
+#     tool spends a little longer getting the spacing right.
+
+def _ask(prompt, default=""):
+    try:
+        answer = input("{} ".format(prompt)).strip()
+    except EOFError:
+        return default
+    return answer or default
+
+
+def _ask_yes(prompt, default=True):
+    suffix = "[Y/n]" if default else "[y/N]"
+    answer = _ask("{} {}".format(prompt, suffix)).lower()
+    if not answer:
+        return default
+    return answer.startswith("y")
+
+
+def setup(argv_accounts=None):
+    """The whole first-run experience. Safe to re-run at any time."""
+    print("Claude Code Early Window — setup")
+    print("=" * 32)
+    print()
+
+    try:
+        existing = load_accounts()
+    except ConfigError:
+        existing = default_accounts()
+    configured = os.path.exists(ACCOUNTS_FILE)
+
+    if configured:
+        print("Currently configured:")
+        for account in existing:
+            print("  account {:<10} {}".format(account.display, account.config_dir))
+        print()
+
+    count = argv_accounts
+    if count is None:
+        answer = _ask("How many Claude accounts do you want to use?",
+                      str(len(existing) if configured else 2))
+        try:
+            count = int(answer)
+        except ValueError:
+            print("That is not a number.")
+            return 2
+    if count < 1:
+        print("You need at least one account.")
+        return 2
+    if count > 4:
+        print()
+        print("Beyond three accounts this stops being the cheaper option: four")
+        print("Pro subscriptions cost about the same as one Max plan, which")
+        print("gives you a single pool instead of four you cannot combine.")
+        if not _ask_yes("Continue with {} anyway?".format(count), default=False):
+            return 0
+
+    accounts = _plan_accounts(existing if configured else [], count)
+    print()
+    print("Layout:")
+    for account in accounts:
+        print("  account {:<10} {}".format(account.name, account.config_dir))
+    if count > 1:
+        print()
+        print("A fresh window will arrive every {}, instead of every {}."
+              .format(fmt_delta(WINDOW_HOURS * 3600 / float(count)),
+                      fmt_delta(WINDOW_HOURS * 3600)))
+    print()
+    if not _ask_yes("Go ahead?"):
+        return 0
+
+    _write_accounts_file(accounts)
+    print("Wrote {}".format(ACCOUNTS_FILE))
+
+    # Must happen before the checkpoint check below, or an upgrade would look
+    # like a fresh install and spend a ping rebuilding what it already has.
+    moved = migrate_legacy_state(accounts[0])
+    if moved:
+        print("Moved {} from the previous single-account layout into {}".format(
+            ", ".join(moved), accounts[0].state_dir))
+
+    # ── Signing in ──────────────────────────────────────────────────────────
+    for account in accounts:
+        ensure_ping_config(account)
+
+    missing = [a for a in accounts if not account_identity(a)["has_token"]]
+    if missing:
+        print()
+        print("Sign in to each of these directories. They belong to this tool —")
+        print("they are not where you work, and nothing you do in Claude Code")
+        print("touches them. Signing in sends no message, so it starts no usage")
+        print("window and there is no wrong time to do it.")
+        print()
+        print("Sign in even if you already use that account elsewhere: each")
+        print("directory gets its own login rather than a copy of one, so a")
+        print("token refresh here can never log you out over there.")
+        for account in missing:
+            print()
+            print("  Account {}:".format(account.display))
+            print("    {}    then /login".format(sign_in_command(account)))
+        print()
+        _ask("Press Enter once every account is signed in.")
+
+    # ── Sharing, then checking ──────────────────────────────────────────────
+    print()
+    print()
+    findings = validate_accounts(accounts)
+    if findings:
+        report_findings(findings)
+        if any(f.level == "error" for f in findings):
+            print()
+            print("Setup stopped. Fix the errors above and run it again.")
+            return 1
+        print()
+        if not _ask_yes("Continue despite the warnings?"):
+            return 0
+
+    # ── Checkpoints ─────────────────────────────────────────────────────────
+    for account in accounts:
+        if os.path.exists(account.session_id_file) and \
+           os.path.exists(account.checkpoint_backup):
+            continue
+        print()
+        print("Creating account {}'s background conversation...".format(
+            account.display))
+        init(account)
+
+    # ── Timers and wrappers ─────────────────────────────────────────────────
+    print()
+    install_units(accounts)
+    print()
+    write_entry_point()
+    print("Wrote {}".format(os.path.join(WRAPPER_DIR, COMMAND)))
+    print("  put it on your PATH with:  "
+          "export PATH=\"{}:$PATH\"".format(WRAPPER_DIR))
+
+    # ── What happens next ───────────────────────────────────────────────────
+    print()
+    print("Done.")
+    print()
+    if len(accounts) > 1:
+        print("The first ping for each account runs within a minute. From there")
+        print("the service works out where each window sits and spaces them out")
+        print("for you, holding an account back when that is what it takes.")
+        print()
+        print("For the quickest result, avoid using the accounts other than")
+        print("{} for the next few hours. If you do use them, nothing breaks —"
+              .format(accounts[0].display))
+        print("the service re-plans from wherever things actually end up.")
+        print()
+        print("  {} status     what each account is doing".format(COMMAND))
+        print("  {} which      which one to use right now".format(COMMAND))
+    return 0
+
+
+def _plan_accounts(existing, count):
+    """Keep the accounts already configured, add or drop to reach `count`."""
+    accounts = []
+    for index in range(count):
+        if index < len(existing):
+            source = existing[index]
+            accounts.append(Account(source.name, source.config_dir, index,
+                                    source.label))
+            continue
+        name = str(index + 1)
+        accounts.append(Account(name, ping_config_dir(name), index))
+    return accounts
+
+
+def _write_accounts_file(accounts):
+    document = {"accounts": [
+        dict([("name", a.name), ("config_dir", _tilde(a.config_dir))]
+             + ([("label", a.label)] if a.label else []))
+        for a in accounts]}
+    tmp = ACCOUNTS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(document, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, ACCOUNTS_FILE)
+
+
+def _tilde(path):
+    return "~" + path[len(HOME):] if path.startswith(HOME + os.sep) else path
+
+
+UNIT_DIR = os.path.join(HOME, ".config", "systemd", "user")
+
+_SERVICE_UNIT = """[Unit]
+Description=Claude Code Early Window — ping for account %i
+
+[Service]
+Type=oneshot
+WorkingDirectory={script_dir}
+ExecStart=/usr/bin/python3 {script} ping %i
+# PATH so the script can locate the claude CLI; HOME comes from the user manager.
+Environment=PATH={home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target
+"""
+
+_TIMER_UNIT = """[Unit]
+Description=Claude Code Early Window — ping account %i every {interval} minutes
+
+[Timer]
+# OnActiveSec fires shortly after the timer starts; OnUnitActiveSec then repeats
+# every interval after the service was last activated. "Last activated" is what
+# makes the boundary anchor work: when the one-shot anchor starts this same
+# service, the repeating series re-anchors off that run, so a single correction
+# puts every later ping back on the window boundary.
+OnActiveSec=1min
+OnUnitActiveSec={interval}min
+# systemd's default accuracy is 1 minute, which would let each ping land up to a
+# minute late and quietly stretch the cadence. Tighten it so the interval holds.
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def installed_instances():
+    """
+    Account names that currently have a timer enabled.
+
+    Read from timers.target.wants rather than asked of systemd: `enable` works
+    by putting a symlink there, so it is the authoritative record and it still
+    answers when the user manager is not reachable.
+    """
+    wants = os.path.join(UNIT_DIR, "timers.target.wants")
+    pattern = re.compile(r"^claude-early-window@(.+)\.timer$")
+    try:
+        entries = os.listdir(wants)
+    except (IOError, OSError):
+        return set()
+    return {m.group(1) for m in (pattern.match(e) for e in entries) if m}
+
+
+def install_units(accounts):
+    """Write the templated units and start one timer per account."""
+    if not os.path.isdir(UNIT_DIR):
+        os.makedirs(UNIT_DIR)
+
+    # An upgrade from the single-account layout: leaving these enabled would run
+    # a second, unaccounted-for ping series against the default account.
+    for legacy in ("claude-early-window.timer", "claude-early-window.service"):
+        path = os.path.join(UNIT_DIR, legacy)
+        if os.path.exists(path):
+            _systemctl("disable", "--now", legacy)
+            os.remove(path)
+            print("Removed the old single-account unit {}".format(legacy))
+
+    # An account that has been removed keeps its timer otherwise: it fires every
+    # interval, fails because the account no longer exists, and goes on doing so
+    # forever. Nothing else would ever clean it up, since the tool no longer
+    # knows that account is something it should think about.
+    for name in sorted(installed_instances()):
+        if name in {a.name for a in accounts}:
+            continue
+        _systemctl("disable", "--now", "claude-early-window@{}.timer".format(name))
+        _systemctl("stop", "claude-early-window-anchor-{}.timer".format(name))
+        _systemctl("stop", "claude-early-window-anchor-{}.service".format(name))
+        _systemctl("reset-failed",
+                   "claude-early-window@{}.service".format(name),
+                   "claude-early-window-anchor-{}.timer".format(name))
+        drop_in = os.path.join(UNIT_DIR, "claude-early-window@{}.timer.d".format(name))
+        if os.path.isdir(drop_in):
+            shutil.rmtree(drop_in)
+        print("Stopped the timer for account {}, which is no longer "
+              "configured".format(name))
+
+    script = os.path.abspath(__file__)
+    with open(os.path.join(UNIT_DIR, "claude-early-window@.service"), "w") as f:
+        f.write(_SERVICE_UNIT.format(script_dir=SCRIPT_DIR, script=script,
+                                     home=HOME))
+    with open(os.path.join(UNIT_DIR, "claude-early-window@.timer"), "w") as f:
+        f.write(_TIMER_UNIT.format(interval=INTERVAL_MIN))
+
+    # Offset each account's first firing. OnUnitActiveSec measures from the last
+    # activation, so shifting the first one shifts that account's whole grid for
+    # good — without this, timers started together stay in lockstep forever and
+    # every account spawns a Claude process in the same second. The guard in
+    # Account.guard_sec only offsets *anchored* pings, which do not happen until
+    # a window boundary comes round.
+    for account in accounts:
+        drop_in = os.path.join(UNIT_DIR, account.timer_unit + ".d")
+        if account.index:
+            if not os.path.isdir(drop_in):
+                os.makedirs(drop_in)
+            with open(os.path.join(drop_in, "stagger.conf"), "w") as f:
+                # Two systemd subtleties, both of which bite silently:
+                #
+                #   * OnActiveSec is a list, not a scalar. Assigning it in a
+                #     drop-in *adds* to what the template set, so the account
+                #     would fire at both times and collide anyway.
+                #   * Assigning the empty string to any monotonic timer option
+                #     resets *all* of them — so clearing OnActiveSec also
+                #     discards the template's OnUnitActiveSec, and the timer
+                #     fires once and then never again. It has to be restated.
+                f.write("[Timer]\nOnActiveSec=\nOnActiveSec={}s\n"
+                        "OnUnitActiveSec={}min\n".format(
+                            60 + account.index * PING_STAGGER_SEC, INTERVAL_MIN))
+        elif os.path.isdir(drop_in):
+            shutil.rmtree(drop_in)          # account order may have changed
+
+    _systemctl("daemon-reload")
+    for account in accounts:
+        _systemctl("enable", account.timer_unit)
+        _systemctl("restart", account.timer_unit)
+        print("Timer running for account {} — every {} minutes{}".format(
+            account.display, INTERVAL_MIN,
+            "" if not account.index else ", offset {}s so the accounts do not "
+            "ping at the same moment".format(account.index * PING_STAGGER_SEC)))
+
+    if "Linger=yes" not in (_run(["loginctl", "show-user", USER]).stdout or ""):
+        print()
+        print("To keep the timers running while you are logged out:")
+        print("  sudo loginctl enable-linger {}".format(USER))
+
+
+def vscode_settings_candidates():
+    """Settings files that may hold a wrapper setting an earlier version added."""
+    paths = [os.path.join(HOME, ".vscode-server", "data", "Machine",
+                          "settings.json")]
+    paths += [os.path.join(HOME, ".config", flavour, "User", "settings.json")
+              for flavour in ("Code", "Code - OSS", "VSCodium")]
+    return [p for p in paths if os.path.exists(p)]
+
+
+def uninstall(accounts):
+    """
+    Remove everything this tool installed, and nothing else.
+
+    Two rules. The user's own `~/.claude`, `~/.claude.json` and conversations are
+    never touched — they were never ours. And the ping directories are left in
+    place rather than deleted: they hold logins the user performed, and someone
+    may have worked in one despite the advice, so unlinking is ours to do and
+    deleting is not.
+    """
+    removed = []
+
+    for account in accounts:
+        _systemctl("disable", "--now", account.timer_unit)
+        _systemctl("stop", account.anchor_unit + ".timer")
+        _systemctl("stop", account.anchor_unit + ".service")
+        _systemctl("reset-failed", account.service_unit,
+                   account.anchor_unit + ".timer")
+        removed.append("timer for account " + account.name)
+
+    for name in ("claude-early-window@.service", "claude-early-window@.timer",
+                 "claude-early-window.service", "claude-early-window.timer"):
+        path = os.path.join(UNIT_DIR, name)
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append(name)
+    for account in accounts:
+        drop_in = os.path.join(UNIT_DIR, account.timer_unit + ".d")
+        if os.path.isdir(drop_in):
+            shutil.rmtree(drop_in)
+    _systemctl("daemon-reload")
+
+    # Anything an earlier version of this tool put in the user's way.
+    for name in ("claude", "claude-vscode-wrapper"):
+        path = os.path.join(WRAPPER_DIR, name)
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append("bin/" + name)
+
+    # A setting pointing at a wrapper we are deleting would break the editor's
+    # Claude Code entirely — it spawns through that path. Removing the file
+    # without removing the setting is not a partial uninstall, it is a fault.
+    for path in vscode_settings_candidates():
+        body = _read_json(path)
+        if body.pop("claudeCode.claudeProcessWrapper", None) is not None:
+            if body:
+                tmp = path + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(body, f, indent=2, sort_keys=True)
+                os.replace(tmp, path)
+            else:
+                os.remove(path)          # we created it, and it held only this
+            removed.append("the VS Code claudeProcessWrapper setting")
+
+    for account in accounts:
+        for name in ("projects", "file-history", "session-env", "todos",
+                     "plans", "shell-snapshots", "ide"):
+            link = os.path.join(account.config_dir, name)
+            # Only ever a symlink: removing one cannot reach what it points at,
+            # and a real directory here holds conversations.
+            if os.path.islink(link):
+                os.remove(link)
+                removed.append("shared link {}/{}".format(account.name, name))
+
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+#
+# Flat verbs with the account as a positional argument, in the shape of
+# systemctl and git rather than `docker <noun> <verb>`. Noun-verb grouping earns
+# its keep when there is a real matrix of resources; here there is one resource —
+# accounts — and a handful of global actions, so grouping would only invent
+# structure and lengthen every command. Docker itself keeps `ps`, `run` and
+# `images` flat for exactly that reason.
+#
+# Conventions, all of them load-bearing for something other tools will call:
+#
+#   * stdout carries data, stderr carries commentary, so `pick` stays pipeable.
+#   * machine-readable output only ever on request (--json), never by default.
+#   * exit codes: 0 fine, 1 something is wrong, 2 the command was misused.
+#   * the bare command reports status. Sending a ping costs real quota and
+#     changes when a window starts, so it must always be asked for by name.
+
+DESCRIPTION = "Keep Claude Code usage windows rolling, across one or more accounts."
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=COMMAND, description=DESCRIPTION,
+        # The usage line is written out rather than generated. argparse's own
+        # version, `claude-window [-h] <command> ...`, describes the top-level
+        # grammar — but it reads as the invocation template, so it puts -h
+        # *before* the command while every other line of help puts it after.
+        # One screen telling you two different things is worse than either.
+        usage="%(prog)s [<command>] [options]\n"
+              "       %(prog)s help [<command>]",
+        epilog="With no command at all, reports status.\n"
+               "Run `{0} help realign`, or any other command, to see what it "
+               "does and takes.".format(COMMAND),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    # `prog` must be given explicitly. Without it argparse derives each
+    # subparser's program name from the parent's *usage* string, so a custom one
+    # — especially a multi-line one — is inherited verbatim as a prefix and every
+    # subcommand's help comes out mangled.
+    sub = parser.add_subparsers(dest="command", metavar="<command>",
+                                prog=COMMAND)
+
+    def add(name, help_text, account="no"):
+        child = sub.add_parser(name, help=help_text, description=help_text)
+        if account == "optional":
+            child.add_argument("account", nargs="?", metavar="ACCOUNT",
+                               help="which account (default: the first)")
+        elif account == "required":
+            child.add_argument("account", metavar="ACCOUNT",
+                               help="an account name from `{} accounts`".format(
+                                   COMMAND))
+        return child
+
+    status = add("status", "What every account is doing, and which to use now.")
+    status.add_argument("--json", action="store_true",
+                        help="report it as JSON instead, for scripting")
+
+    add("which", "Say which account to use right now, and why.")
+
+    add("ping", "Send one ping. Spends a little quota, and starts a new window "
+                "if the last one has ended. This is what the timer runs.",
+        account="optional")
+
+    log = sub.add_parser("log", help="Show a ping log.",
+                         description="Show a ping log. With no account named, "
+                                     "every account's is shown together, "
+                                     "oldest first.")
+    log.add_argument("account", nargs="?", metavar="ACCOUNT",
+                     help="which account (default: all of them, interleaved)")
+    log.add_argument("-f", "--follow", action="store_true",
+                     help="keep watching for new lines")
+    log.add_argument("-n", "--lines", type=int, default=40,
+                     metavar="N", help="how many lines to show (default 40)")
+
+    realign = add("realign", "Show how far the windows are from evenly spaced.")
+    realign.add_argument("--confirm", action="store_true",
+                         help="apply the correction rather than describing it")
+
+    add("doctor", "Check a deployed setup and say what is wrong.")
+    add("setup", "Create the ping directories, sign them in, and start their "
+                 "timers. Re-runnable.")
+    add("check", "Validate the account configuration without changing anything.")
+    add("accounts", "List the configured accounts.")
+
+    add("install-command", "Rewrite the {} launcher in bin/.".format(COMMAND))
+    add("uninstall", "Remove the timers and anything this tool added. Leaves "
+                     "your own ~/.claude and every conversation alone.")
+
+    add("init", "Build one account's checkpoint. Setup does this for you.",
+        account="optional")
+
+    # Claude Code runs this itself as the ping's status line; it is not something
+    # a person ever types. Omitting help= entirely is what keeps it out of the
+    # command list — argparse only lists subparsers that were given one, and
+    # help=SUPPRESS would print the literal string instead.
+    capture = sub.add_parser("capture-statusline")
+    capture.add_argument("account", nargs="?", metavar="ACCOUNT")
+
+    return parser
+
+
+def known_commands(parser):
+    names = set()
+    for action in parser._actions:
+        names.update(getattr(action, "choices", None) or {})
+    return names
+
+
+def normalise_help(argv, commands):
+    """
+    Accept the ways people actually ask for help on one command.
+
+    The usage line reads `claude-window [-h] <command> ...`, so `-h which` is a
+    perfectly reasonable thing to type. argparse answers it by printing the
+    general help and silently discarding the word, which from the other side
+    looks like nothing happened at all — the user asked a fair question and got
+    no answer and no error.
+
+    `help which` is the git habit and just as fair. Both are rewritten into the
+    form argparse understands, rather than corrected at the person typing.
+    """
+    if not argv or argv[0] not in ("-h", "--help", "help"):
+        return argv
+    for word in argv[1:]:
+        if word in commands:
+            return [word, "--help"]
+    return ["--help"]
+
+
+def _selected(accounts, name):
+    return find_account(accounts, name) if name else accounts[0]
+
+
+def show_log(accounts, name, lines, follow):
+    """Show one account's log, or every account's interleaved."""
+    chosen = [_selected(accounts, name)] if name else accounts
+    if len(chosen) == 1 and follow:
+        account = chosen[0]
+        if not os.path.exists(account.log_file):
+            sys.stderr.write("No log yet for account {}.\n".format(account.name))
+            return 1
+        try:
+            subprocess.call(["tail", "-n", str(lines), "-f", account.log_file])
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+    if follow:
+        sys.stderr.write("Following needs one account: try `claude-window log "
+                         "{} -f`.\n".format(chosen[0].name))
+        return 2
+
+    # Merged view: the logs are per-account (rotation rewrites the whole file, so
+    # one shared log could not be written safely by two processes), but reading
+    # them back together is exactly what you want when comparing accounts.
+    entries = []
+    for account in chosen:
+        try:
+            with open(account.log_file) as f:
+                for line in f:
+                    entries.append((line[:20], account.name, line.rstrip("\n")))
+        except (IOError, OSError):
+            continue
+    if not entries:
+        sys.stderr.write("No logs yet — run `claude-window ping` first.\n")
+        return 1
+    entries.sort()
+    width = max(len(a.name) for a in chosen)
+    for _, name_, line in entries[-lines:]:
+        print("{:<{}}  {}".format(name_, width, line) if len(chosen) > 1 else line)
+    return 0
+
+
+def status_json(accounts):
+    now = time.time()
+    states = {a.name: read_state(a) for a in accounts}
+    chosen, reason = choose_account(accounts, states, now)
+    document = {
+        "generated_at": now,
+        "use": {"account": chosen.name, "reason": reason,
+                "config_dir": chosen.config_dir},
+        "accounts": [],
+    }
+    for account in accounts:
+        state = states[account.name]
+        expiry = next_expiry(state, now)
+        document["accounts"].append({
+            "name": account.name,
+            "label": account.label,
+            "config_dir": account.config_dir,
+            "last_run": state.get("last_run"),
+            "available_at": state.get("available_at"),
+            "consecutive_failures": state.get("consecutive_failures", 0),
+            "expires_at": None if expiry == float("inf") else expiry,
+            "rate_limits": state.get("rate_limits", {}),
+            "hold": state.get("hold"),
+            "boundary": state.get("boundary"),
+            "boundary_label": state.get("boundary_label"),
+            "limits_source": state.get("limits_source"),
+            "checkpoint": _read_text(account.session_id_file).strip() or None,
+        })
+    json.dump(document, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+def cli(argv=None):
+    """
+    Returns a process exit code: 0 fine, 1 something is wrong, 2 misused.
+
+    With no command at all this reports status. It deliberately does *not* ping:
+    a ping spends quota and decides when a window starts, so it has to be asked
+    for by name.
+    """
+    parser = build_parser()
+    if argv is None:
+        argv = sys.argv[1:]
+    args = parser.parse_args(normalise_help(argv, known_commands(parser)))
+    command = args.command or "status"
+
+    # Must come first and stay silent: this runs inside Claude Code's UI loop,
+    # which displays anything reaching stdout as the status line.
+    if command == "capture-statusline":
+        try:
+            capture_statusline(_selected(load_accounts(), args.account))
+        except Exception:
+            pass
+        return 0
+
+    # Setup writes the account list, so it must not require a valid one first.
+    if command == "setup":
+        return setup()
+
+    try:
+        accounts = load_accounts()
+        # Before anything reads state: an upgrade must not look like a fresh
+        # install, or it would throw away a checkpoint that still works.
+        moved = migrate_legacy_state(accounts[0])
+        if moved:
+            sys.stderr.write(
+                "Moved {} from the previous single-account layout into "
+                "{}\n".format(", ".join(moved), accounts[0].state_dir))
+
+        if command == "status":
+            # getattr, because the bare invocation has no status subparser and
+            # therefore none of its options.
+            if getattr(args, "json", False):
+                return status_json(accounts)
+            code = status(accounts)
+            if args.command is None:
+                # Someone who typed the bare command has been shown one view of
+                # a tool with fifteen, and nothing on screen suggests the other
+                # fourteen exist. Naming a few beats pointing at `help`, which
+                # is only useful to someone who already suspects there is more.
+                print()
+                print("Other commands: which, doctor, log, realign, setup — "
+                      "run `{} help` for all of them.".format(COMMAND))
+            return code
+        if command == "which":
+            return which(accounts)
+        if command == "log":
+            return show_log(accounts, args.account, args.lines, args.follow)
+        if command == "realign":
+            return realign(accounts, confirm=args.confirm)
+        if command == "doctor":
+            return doctor(accounts)
+        if command == "check":
+            return report_findings(validate_accounts(accounts))
+        if command == "accounts":
+            for account in accounts:
+                print(account.name)
+            return 0
+        if command == "uninstall":
+            for item in uninstall(accounts):
+                print("  removed {}".format(item))
+            print()
+            print("Your ~/.claude, ~/.claude.json and every conversation are "
+                  "untouched.")
+            disposable = [a for a in accounts
+                          if os.path.realpath(a.config_dir)
+                          != os.path.realpath(USER_CONFIG_DIR)]
+            if disposable:
+                print("The ping directories are left in place; delete them "
+                      "yourself if you want them gone:")
+                for account in disposable:
+                    print("  rm -rf {}".format(account.config_dir))
+            # Never, under any circumstances, suggest deleting the directory the
+            # user works in. An older layout put an account there, and that is
+            # exactly when this advice would be followed and be catastrophic.
+            kept = [a for a in accounts if a not in disposable]
+            if kept:
+                print("Account {} lives in your own {}, which is yours and is "
+                      "left completely alone.".format(
+                          ", ".join(a.name for a in kept), USER_CONFIG_DIR))
+            return 0
+        if command == "install-command":
+            path = write_entry_point()
+            print("Wrote {}".format(path))
+            print("Put it on your PATH:  export PATH=\"{}:$PATH\"".format(
+                WRAPPER_DIR))
+            return 0
+        if command == "init":
+            init(_selected(accounts, args.account))
+            return 0
+        if command == "ping":
+            ping(_selected(accounts, args.account), accounts)
+            publish_schedule(accounts)
+            return 0
+    except ConfigError as e:
+        sys.stderr.write("Configuration error: {}\n".format(e))
+        return 2
+
+    sys.stderr.write("Unknown command: {}\n".format(command))
+    return 2
+
 
 if __name__ == "__main__":
-    args = set(sys.argv[1:])
-    # Must be first: Claude Code invokes this inside its UI loop and expects a
-    # status line on stdout, nothing else.
-    if "--capture-statusline" in args:
-        capture_statusline()
-    elif "--init" in args:
-        init()
-    elif "--status" in args:
-        status()
-    elif not args:
-        main()
-    else:
-        # Never fall through to a real ping on a typo or on --help: sending one
-        # is a side effect the user did not ask for.
-        print(__doc__.strip())
-        sys.exit(0 if args <= {"--help", "-h"} else 2)
+    sys.exit(cli())

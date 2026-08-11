@@ -1,0 +1,16 @@
+{
+  "_comment": [
+    "Copy this to accounts.json to use more than one Claude subscription.",
+    "Each account needs its OWN config directory: that directory is the only",
+    "thing that makes one Claude login distinct from another, so two entries",
+    "sharing one would silently be the same account twice.",
+    "Leave the first account on ~/.claude — anything that bypasses the wrapper",
+    "(a script, an IDE, a cron job) lands there, so it must be a real login.",
+    "Log in to each with:  CLAUDE_CONFIG_DIR=~/.claude-2 claude   then /login",
+    "Logging in sends no message, so it never starts a usage window."
+  ],
+  "accounts": [
+    { "name": "1", "config_dir": "~/.claude",   "label": "personal" },
+    { "name": "2", "config_dir": "~/.claude-2", "label": "second" }
+  ]
+}
