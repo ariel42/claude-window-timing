@@ -180,7 +180,7 @@ Other machines need nothing at all. If you want the advice there too, copy `sche
 |---|---|
 | `claude_early_window.py` | The whole tool. |
 | `install.sh` / `uninstall.sh` | Prerequisite checks, then the wizard; and the teardown. |
-| `test_early_window.py` | 400 checks. `python3 test_early_window.py`. |
+| `test_early_window.py` | Over 400 checks. `python3 test_early_window.py`. |
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 
