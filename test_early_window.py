@@ -1569,6 +1569,45 @@ def test_an_unusable_account_is_still_pinged():
           sorted(stoppers), ["install_units", "uninstall"])
 
 
+def test_the_log_reads_in_the_order_it_was_written():
+    """
+    The merged log is a record of what happened, so its order has to be the
+    order it happened in. A run writes several lines in the same second, and
+    sorting whole lines alphabetises those — which puts "run finished" above the
+    "Exited with code" that came before it, and reads like a different story.
+    """
+    section("The merged log keeps each run's own order")
+    root = tempfile.mkdtemp()
+    ew.STATE_ROOT = os.path.join(root, "state")
+    first, second = ew.Account("1", "/tmp/cfg-1", 0), ew.Account("2", "/tmp/cfg-2", 1)
+    for account, body in (
+            (first, ["[2026-08-13 00:01:43] Turn confirmed: cache_read=6636",
+                     "[2026-08-13 00:01:43] Usage: 5-hour 0%",
+                     "[2026-08-13 00:01:43] Exited with code: 0",
+                     "[2026-08-13 00:01:43] Early-window run finished.",
+                     ""]),
+            (second, ["[2026-08-13 00:02:00] Starting early-window run"])):
+        account.ensure_state_dir()
+        with open(account.log_file, "w") as f:
+            f.write("\n".join(body) + "\n")
+
+    buf = io.StringIO()
+    saved, sys.stdout = sys.stdout, buf
+    try:
+        ew.show_log([first, second], None, 40, False)
+    finally:
+        sys.stdout = saved
+    shown = [line.split("] ", 1)[1] for line in buf.getvalue().splitlines()]
+
+    check("each run's lines stay in the order they were written",
+          shown[:4], ["Turn confirmed: cache_read=6636", "Usage: 5-hour 0%",
+                      "Exited with code: 0", "Early-window run finished."])
+    check("and later accounts still interleave by time",
+          shown[-1], "Starting early-window run")
+    check("blank separators are not carried into the merged view",
+          [line for line in buf.getvalue().splitlines() if not line.strip()], [])
+
+
 # ---------------------------------------------------------------------------
 # Setup and diagnosis
 # ---------------------------------------------------------------------------
@@ -2569,6 +2608,7 @@ def main():
                  test_correction_policy,
                  test_a_hold_suppresses_the_ping_and_nothing_else,
                  test_an_unusable_account_is_still_pinged,
+                 test_the_log_reads_in_the_order_it_was_written,
                  test_setup_lays_accounts_out_sensibly,
                  test_upgrading_keeps_the_existing_checkpoint,
                  test_a_timer_that_will_never_fire_again_is_noticed,

@@ -3272,16 +3272,23 @@ def show_log(accounts, name, lines, follow):
     for account in chosen:
         try:
             with open(account.log_file) as f:
-                for line in f:
-                    entries.append((line[:20], account.name, line.rstrip("\n")))
+                for position, line in enumerate(f):
+                    if not line.strip():
+                        continue        # run separators; nothing to interleave
+                    entries.append((line[:20], account.name, position,
+                                    line.rstrip("\n")))
         except (IOError, OSError):
             continue
     if not entries:
         sys.stderr.write("No logs yet — run `claude-window ping` first.\n")
         return 1
-    entries.sort()
+    # Timestamp first, then each file's own order. Sorting whole lines would
+    # alphabetise everything that shares a second — and a run writes several
+    # lines a second, so "Early-window run finished" would print before the
+    # "Exited with code" it followed.
+    entries.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
     width = max(len(a.name) for a in chosen)
-    for _, name_, line in entries[-lines:]:
+    for _, name_, _, line in entries[-lines:]:
         print("{:<{}}  {}".format(name_, width, line) if len(chosen) > 1 else line)
     return 0
 
