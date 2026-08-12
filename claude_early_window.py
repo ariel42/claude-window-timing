@@ -411,14 +411,35 @@ def migrate_legacy_state(account):
 # Which account to use right now
 # ---------------------------------------------------------------------------
 #
-# Two questions, both answered by observation rather than by rule:
+# Two questions, in this order:
 #
 #   Can this account serve a request at all?   -> availability
 #   How soon does its current window expire?   -> urgency
 #
-# Availability is one idea with no special cases. A weekly limit spent, a lapsed
-# subscription, a revoked login and a dead network are the same state: not usable
-# now, usable again at some point. Nothing downstream asks which it was.
+# Urgency decides only between accounts that pass the first test, because a
+# window you cannot spend is not worth spending: naming the account that expires
+# soonest is exactly the wrong answer when Claude is going to refuse it.
+#
+# Availability is read off evidence, and four kinds of evidence can say no:
+#
+#   * a ping was refused, and the refusal said when to try again;
+#   * a limit is *reported* as fully spent — the 5-hour one or the weekly one;
+#   * the last few pings produced no answer at all;
+#   * the account's own files rule out any request succeeding — not signed in,
+#     no paid subscription, a sign-in that has already expired.
+#
+# The second is the subtle one, and it is why a ping getting through is not
+# proof of anything. A ping replays a cached conversation, and cache reads are
+# not deducted from the rate limit, so a ping can sail through an account whose
+# limit is spent and whose next *real* request would be refused. Believing the
+# ping over the reported percentage would recommend precisely the account that
+# cannot be used. When several of these apply the account is back only when the
+# last of them clears, so they are combined by taking the latest.
+#
+# What separates them is how they end, and that ordering is the whole ranking: a
+# spent limit names the moment it returns, a silent ping does not, and a lapsed
+# subscription does not return at all until the user does something. Prefer, in
+# order: usable now, back at a known time, cannot tell, needs you.
 #
 # Given a choice of usable accounts, spend the most perishable one first. Quota
 # does not carry over — whatever is left when a window ends is simply gone — so
@@ -429,6 +450,25 @@ def migrate_legacy_state(account):
 # Pings that fail for reasons that say nothing about the account (no network, a
 # crashed CLI) should not condemn it. Enough of them in a row should.
 UNHEALTHY_AFTER = 3
+
+# A limit reported at or above this is spent. Claude reports whole percents and
+# refuses real work at 100, while the ping — a cache read — may still be served.
+LIMIT_SPENT_PCT = 100
+
+# How old the readings can get before `which` says so. Three missed pings is past
+# coincidence: by then the answer is being computed from history, not from facts.
+STALE_AFTER_SEC = UNHEALTHY_AFTER * INTERVAL_MIN * 60
+
+# The two limits Claude reports, and what to call them. Availability consults
+# both; `status` and the log print both.
+_LIMIT_NAMES = (("five_hour", "5-hour"), ("seven_day", "weekly"))
+
+# Ranking tiers, best first.
+USABLE, WAITING, UNKNOWN, NEEDS_ACTION = range(4)
+
+# tier: one of the above. until: when it returns, when that is knowable.
+# note: why, in words a user can act on — never consulted for the ranking.
+Availability = collections.namedtuple("Availability", "tier until note")
 
 SCHEDULE_FILE = os.path.join(SCRIPT_DIR, "schedule.json")
 
@@ -450,23 +490,110 @@ def next_expiry(state, now):
     return resets
 
 
-def rank_account(account, state, now):
+def spent_limits(state, now):
+    """
+    Every reported limit that is fully spent, as (name, when it resets).
+
+    A reset already in the past is not evidence of anything: it describes a
+    window that has since rolled over, so the percentage recorded beside it
+    belongs to a limit that has already refilled.
+    """
+    limits = state.get("rate_limits") or {}
+    spent = []
+    for key, name in _LIMIT_NAMES:
+        window = limits.get(key) or {}
+        resets = window.get("resets_at")
+        if (resets and resets > now
+                and (window.get("used_percentage") or 0) >= LIMIT_SPENT_PCT):
+            spent.append((name, resets))
+    return spent
+
+
+def identity_blocker(account):
+    """
+    What this account's own files say makes every request fail, or "".
+
+    File reads only — the same two JSON files `doctor` reads, and no subprocess —
+    because this sits behind `which`, which has to answer instantly and must
+    never spend anything.
+
+    Absent evidence is not bad evidence. A machine holding only a copy of the
+    schedule has no config directory to read, and condemning an account there
+    would be worse than missing a fault: the fault is visible on the machine
+    that pings, and `doctor` is where it gets diagnosed.
+    """
+    if not os.path.isdir(account.config_dir):
+        return ""
+    identity = account_identity(account)
+    if not identity["has_token"] and not identity["account_uuid"]:
+        return "not signed in"
+    subscription = (identity["subscription"] or "").lower()
+    if subscription in ("free", "none"):
+        return "no paid subscription ({})".format(identity["subscription"])
+    expires = identity["refresh_expires_at"]
+    if expires and expires <= time.time():
+        return "its sign-in has expired"
+    return ""
+
+
+def account_availability(account, state, now):
+    """
+    Whether this account can be used right now — and if not, until when and why.
+
+    Deliberately pessimistic where the evidence disagrees: an account counts as
+    usable only when nothing known about it says otherwise.
+    """
+    # First, because it is the only thing here that is true *now* rather than as
+    # of the last ping — and because waiting will not fix it.
+    stuck = identity_blocker(account)
+    if stuck:
+        return Availability(NEEDS_ACTION, None, stuck)
+
+    blockers = []
+
+    # A refusal is Claude's own answer about this account, and it carries the
+    # moment it stops applying. It never says which limit refused, and nothing
+    # here needs to know.
+    available_at = state.get("available_at")
+    if available_at and available_at > now:
+        blockers.append((available_at, "Claude refused the last ping"))
+
+    for name, resets in spent_limits(state, now):
+        blockers.append((resets, "its {} limit is spent".format(name)))
+
+    if blockers:
+        until, note = max(blockers)         # back only when the last one clears
+        return Availability(WAITING, until, note)
+
+    if state.get("consecutive_failures", 0) >= UNHEALTHY_AFTER:
+        return Availability(UNKNOWN, None, "its pings keep failing — cannot tell")
+
+    return Availability(USABLE, None, "")
+
+
+def availabilities(accounts, states, now):
+    return {a.name: account_availability(a, states[a.name], now) for a in accounts}
+
+
+def rank_account(account, state, now, availability=None):
     """
     Sort key for choosing an account: lower is better.
 
-    Availability first, urgency second. An account we cannot judge — one whose
-    last few pings failed — sorts last rather than being recommended into a
-    login that is probably broken.
+    Availability first, urgency second, and inside each tier the tie-break is
+    whatever a user would ask next — soonest back, most recently alive, and
+    failing all else the order they configured the accounts in.
     """
-    if state.get("consecutive_failures", 0) >= UNHEALTHY_AFTER:
-        return (2, 0.0, account.index)
-    available_at = state.get("available_at")
-    if available_at is not None and available_at > now:
-        return (1, available_at, account.index)     # unusable; soonest back first
-    return (0, next_expiry(state, now), account.index)   # usable; most perishable
+    avail = availability or account_availability(account, state, now)
+    if avail.tier == USABLE:
+        return (USABLE, next_expiry(state, now), account.index)  # most perishable
+    if avail.tier == WAITING:
+        return (WAITING, avail.until, account.index)             # soonest back
+    if avail.tier == UNKNOWN:
+        return (UNKNOWN, -(state.get("last_run") or 0.0), account.index)
+    return (NEEDS_ACTION, 0.0, account.index)
 
 
-def choose_account(accounts, states=None, now=None):
+def choose_account(accounts, states=None, now=None, avail=None):
     """
     The account to use right now, and why, as (account, reason).
 
@@ -475,24 +602,67 @@ def choose_account(accounts, states=None, now=None):
     """
     now = time.time() if now is None else now
     states = states or {a.name: read_state(a) for a in accounts}
+    avail = avail or availabilities(accounts, states, now)
 
-    ranked = sorted(accounts, key=lambda a: rank_account(a, states[a.name], now))
-    best = ranked[0]
-    state = states[best.name]
-    key = rank_account(best, state, now)
+    best = min(accounts,
+               key=lambda a: rank_account(a, states[a.name], now, avail[a.name]))
+    state, chosen = states[best.name], avail[best.name]
+    only = len(accounts) == 1
 
-    if key[0] == 2:
-        return best, "nothing is known to be usable; this one last worked most recently"
-    if key[0] == 1:
-        return best, "every account is out of quota — this one returns first, {}".format(
-            fmt_time(key[1]))
+    if chosen.tier == NEEDS_ACTION:
+        return best, "{}; run `{} doctor`".format(chosen.note, COMMAND)
+    if chosen.tier == UNKNOWN:
+        return best, chosen.note
+    if chosen.tier == WAITING:
+        return best, "{}; back {} (in {})".format(
+            chosen.note, fmt_time(chosen.until), fmt_delta(chosen.until - now))
+
     expiry = next_expiry(state, now)
     if expiry == float("inf"):
         return best, "no window information yet — run a ping first"
-    if len(accounts) == 1:
+    if only:
         return best, "the only account; its window ends {}".format(fmt_time(expiry))
+    # "ends first" is a claim about the accounts it was chosen over, so it has to
+    # be false when there was nothing to choose between: another account's window
+    # may well end sooner and simply be unusable.
+    if sum(1 for a in accounts if avail[a.name].tier == USABLE) == 1:
+        return best, "the only account usable right now; its window ends {} (in {})".format(
+            fmt_time(expiry), fmt_delta(expiry - now))
     return best, "its window ends first, {} (in {})".format(
         fmt_time(expiry), fmt_delta(expiry - now))
+
+
+def headline(chosen, avail, count):
+    """
+    The first line `which` and `status` print: what to do, before the why.
+
+    Separate from the reason because "Use account 2" is a lie when nothing can
+    be used, and a recommendation nobody can act on should not be phrased as an
+    instruction.
+    """
+    if avail.tier == USABLE:
+        return "Use account {}".format(chosen.display)
+    if avail.tier == UNKNOWN:
+        return "Nothing is known to be usable — try account {}".format(
+            chosen.display)
+    if avail.tier == NEEDS_ACTION:
+        return ("Account {} cannot be used".format(chosen.display) if count == 1
+                else "No account can be used — start with {}".format(
+                    chosen.display))
+    return ("Account {} is not usable yet".format(chosen.display) if count == 1
+            else "No account is usable yet — {} is next".format(chosen.display))
+
+
+def describe_availability(state, avail, now):
+    """One line per account, for the list `which` prints under its answer."""
+    if avail.tier == USABLE:
+        expiry = next_expiry(state, now)
+        if expiry == float("inf"):
+            return "no window information yet"
+        return "usable — window ends in {}".format(fmt_delta(expiry - now))
+    if avail.tier == WAITING:
+        return "unusable until {} — {}".format(fmt_time(avail.until), avail.note)
+    return "unusable — {}".format(avail.note)
 
 
 def publish_schedule(accounts):
@@ -512,6 +682,10 @@ def publish_schedule(accounts):
         state = read_state(account)
         expiry = next_expiry(state, now)
         five = ((state.get("rate_limits") or {}).get("five_hour") or {})
+        # The verdict travels with the numbers. Only this machine can see a
+        # lapsed subscription or a spent weekly limit, so a laptop working from
+        # a copy would otherwise have to re-derive what it cannot observe.
+        usable = account_availability(account, state, now)
         entry.append({
             "name": account.name,
             "label": account.label,
@@ -519,6 +693,9 @@ def publish_schedule(accounts):
             "window_phase": (expiry % window) if expiry != float("inf") else None,
             "expires_at": expiry if expiry != float("inf") else None,
             "available_at": state.get("available_at"),
+            "usable_now": usable.tier == USABLE,
+            "unusable_until": usable.until,
+            "unusable_because": usable.note or None,
             "used_percentage": five.get("used_percentage"),
             "last_run": state.get("last_run"),
         })
@@ -1207,9 +1384,6 @@ def read_statusline_limits(account):
         if isinstance(limits, dict) and limits:
             latest = limits
     return latest
-
-
-_LIMIT_NAMES = (("five_hour", "5-hour"), ("seven_day", "weekly"))
 
 
 def fmt_pct(used):
@@ -2045,8 +2219,9 @@ def status(accounts):
     print("=" * 34)
     print()
 
-    chosen, reason = choose_account(accounts, states, now)
-    print("Use account {} right now".format(chosen.display))
+    avail = availabilities(accounts, states, now)
+    chosen, reason = choose_account(accounts, states, now, avail)
+    print(headline(chosen, avail[chosen.name], len(accounts)))
     print("  {}".format(reason))
 
     for account in accounts:
@@ -2066,9 +2241,7 @@ def status(accounts):
                 fmt_time(state["last_run"]), fmt_delta(now - state["last_run"])))
         failures = state.get("consecutive_failures", 0)
         if failures:
-            print("  Failed pings  : {} in a row{}".format(
-                failures, "  — not being recommended"
-                if failures >= UNHEALTHY_AFTER else ""))
+            print("  Failed pings  : {} in a row".format(failures))
 
         limits = state.get("rate_limits", {})
         for key, name in _LIMIT_NAMES:
@@ -2081,10 +2254,12 @@ def status(accounts):
                 fmt_time(window["resets_at"]),
                 fmt_delta(window["resets_at"] - now)))
 
-        available_at = state.get("available_at")
-        if available_at and available_at > now:
-            print("  Usable again  : {} (in {})".format(
-                fmt_time(available_at), fmt_delta(available_at - now)))
+        usable = avail[account.name]
+        if usable.tier == WAITING:
+            print("  Usable again  : {} (in {}) — {}".format(
+                fmt_time(usable.until), fmt_delta(usable.until - now), usable.note))
+        elif usable.tier != USABLE:
+            print("  Usable        : no — {}".format(usable.note))
 
         boundary = state.get("boundary")
         if boundary:
@@ -2362,29 +2537,37 @@ def which(accounts):
     """Say which account to use, for a machine that runs no wrapper at all."""
     now = time.time()
     states = {a.name: read_state(a) for a in accounts}
-    chosen, reason = choose_account(accounts, states, now)
+    avail = availabilities(accounts, states, now)
+    chosen, reason = choose_account(accounts, states, now, avail)
 
-    print("Use account {}".format(chosen.display))
+    print(headline(chosen, avail[chosen.name], len(accounts)))
     print("  {}".format(reason))
-    print("  That is the window to spend; how you use the account is up to you.")
+    # Only when there is actually a window to point at. Before the first ping
+    # there is nothing to spend, and saying otherwise reads as a false promise.
+    if (avail[chosen.name].tier == USABLE
+            and next_expiry(states[chosen.name], now) != float("inf")):
+        print("  That is the window to spend; how you use the account is up "
+              "to you.")
 
     if len(accounts) > 1:
         print()
-        for account in sorted(accounts,
-                              key=lambda a: rank_account(a, states[a.name], now)):
-            state = states[account.name]
-            expiry = next_expiry(state, now)
-            available = state.get("available_at")
-            if state.get("consecutive_failures", 0) >= UNHEALTHY_AFTER:
-                note = "pings failing — cannot tell"
-            elif available is not None and available > now:
-                note = "out of quota until {}".format(fmt_time(available))
-            elif expiry == float("inf"):
-                note = "no window information yet"
-            else:
-                note = "window ends in {}".format(fmt_delta(expiry - now))
-            print("  {:<12} {}{}".format(
-                account.display, note, "   <- use this" if account is chosen else ""))
+        width = max(len(a.display) for a in accounts)
+        for account in sorted(accounts, key=lambda a: rank_account(
+                a, states[a.name], now, avail[a.name])):
+            print("  {:<{}}  {}{}".format(
+                account.display, width,
+                describe_availability(states[account.name], avail[account.name], now),
+                ("   <- use this" if avail[chosen.name].tier == USABLE
+                 else "   <- first back") if account is chosen else ""))
+
+    # Everything above was computed from the last ping. Say so when that was long
+    # enough ago to be a different story — an answer this confident should not
+    # come from readings nobody has refreshed since the timer stopped.
+    freshest = max([states[a.name].get("last_run") or 0 for a in accounts])
+    if freshest and now - freshest > STALE_AFTER_SEC:
+        print()
+        print("  These readings are {} old. If that is not expected, check the "
+              "timers: {} doctor".format(fmt_delta(now - freshest), COMMAND))
     return 0
 
 
@@ -3013,7 +3196,8 @@ def show_log(accounts, name, lines, follow):
 def status_json(accounts):
     now = time.time()
     states = {a.name: read_state(a) for a in accounts}
-    chosen, reason = choose_account(accounts, states, now)
+    avail = availabilities(accounts, states, now)
+    chosen, reason = choose_account(accounts, states, now, avail)
     document = {
         "generated_at": now,
         "use": {"account": chosen.name, "reason": reason,
@@ -3023,10 +3207,14 @@ def status_json(accounts):
     for account in accounts:
         state = states[account.name]
         expiry = next_expiry(state, now)
+        usable = avail[account.name]
         document["accounts"].append({
             "name": account.name,
             "label": account.label,
             "config_dir": account.config_dir,
+            "usable_now": usable.tier == USABLE,
+            "unusable_until": usable.until,
+            "unusable_because": usable.note or None,
             "last_run": state.get("last_run"),
             "available_at": state.get("available_at"),
             "consecutive_failures": state.get("consecutive_failures", 0),

@@ -958,10 +958,18 @@ def test_choosing_between_accounts():
     a = ew.Account("a", "/tmp/cfg-a", 0)
     b = ew.Account("b", "/tmp/cfg-b", 1)
 
-    def state(expires_in=None, available_in=None, failures=0):
+    def state(expires_in=None, available_in=None, failures=0,
+              five_pct=None, weekly=None, weekly_pct=None):
         s = {"consecutive_failures": failures}
+        limits = {}
         if expires_in is not None:
-            s["rate_limits"] = {"five_hour": {"resets_at": now + expires_in}}
+            limits["five_hour"] = {"resets_at": now + expires_in,
+                                   "used_percentage": five_pct}
+        if weekly is not None:
+            limits["seven_day"] = {"resets_at": now + weekly,
+                                   "used_percentage": weekly_pct}
+        if limits:
+            s["rate_limits"] = limits
         if available_in is not None:
             s["available_at"] = now + available_in
         return s
@@ -998,6 +1006,107 @@ def test_choosing_between_accounts():
     check("the rule holds with no way to override it, because none is needed",
           chosen(state(expires_in=9000, available_in=-1),
                  state(expires_in=60, available_in=-1)), "b")
+
+    # The case a successful ping cannot detect. Pings are cache reads and are not
+    # deducted from the rate limit, so one can get through an account whose limit
+    # is spent — leaving `available_at` saying "fine" about an account that will
+    # refuse the first real request.
+    check("a spent 5-hour limit is skipped even though the last ping succeeded",
+          chosen(state(expires_in=60, available_in=-1, five_pct=100),
+                 state(expires_in=9000, available_in=-1)), "b")
+    check("a spent weekly limit is skipped for as long as it lasts",
+          chosen(state(expires_in=60, available_in=-1,
+                       weekly=3 * 86400, weekly_pct=100),
+                 state(expires_in=9000, available_in=-1)), "b")
+    check("a limit that is merely nearly spent is still usable",
+          chosen(state(expires_in=60, available_in=-1, five_pct=99),
+                 state(expires_in=9000, available_in=-1)), "a")
+
+    # A percentage is only ever about the window it was measured in. Once that
+    # window has ended the account has refilled, whatever the last reading said —
+    # so a missed ping cannot leave an account looking permanently exhausted.
+    check("a 100% reading whose window has already reset is not held against it",
+          ew.account_availability(
+              a, state(expires_in=-600, available_in=-1, five_pct=100), now).tier,
+          ew.USABLE)
+
+    # Two blocked accounts: back only when the *last* blocker clears, so the one
+    # named is the one that actually returns first.
+    check("with everything blocked, the soonest to return is named",
+          chosen(state(expires_in=600, five_pct=100, weekly=6 * 86400,
+                       weekly_pct=100),
+                 state(expires_in=3600, five_pct=100)), "b")
+
+    unusable = ew.account_availability(
+        a, state(expires_in=600, five_pct=100, weekly=6 * 86400, weekly_pct=100),
+        now)
+    check("and it says which limit is holding it", unusable.note,
+          "its weekly limit is spent")
+    check("and when it comes back", round(unusable.until - now), 6 * 86400)
+
+
+def test_an_unusable_login_is_never_recommended():
+    section("Accounts that cannot serve a request at all are skipped")
+    now = time.time()
+    root = tempfile.mkdtemp()
+    ew.STATE_ROOT = os.path.join(root, "state")
+    a = ew.Account("a", os.path.join(root, "cfg-a"), 0)
+    b = ew.Account("b", os.path.join(root, "cfg-b"), 1)
+
+    def sign_in(account, subscription="max", expires_in_days=90, token="t"):
+        if not os.path.isdir(account.config_dir):
+            os.makedirs(account.config_dir, 0o700)
+        with open(account.config_json, "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": account.name,
+                                        "emailAddress": account.name + "@x"}}, f)
+        with open(os.path.join(account.config_dir, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {
+                "accessToken": token, "subscriptionType": subscription,
+                "refreshTokenExpiresAt": int(
+                    (now + expires_in_days * 86400) * 1000)}}, f)
+
+    # `a` always looks the most attractive on window arithmetic alone: it is the
+    # one about to expire. Everything below is about not recommending it anyway.
+    fresh = {"rate_limits": {"five_hour": {"resets_at": now + 600}}}
+    later = {"rate_limits": {"five_hour": {"resets_at": now + 9000}}}
+
+    def chosen():
+        return ew.choose_account([a, b], {"a": fresh, "b": later}, now)[0].name
+
+    sign_in(b)
+    check("a directory that does not exist yet is no evidence of a fault",
+          chosen(), "a")
+
+    os.makedirs(a.config_dir, 0o700)
+    check("but an account directory with no login in it is skipped",
+          chosen(), "b")
+    check("and says so", ew.identity_blocker(a), "not signed in")
+
+    sign_in(a, subscription="free")
+    check("a free plan cannot supply a window, so it is skipped", chosen(), "b")
+    check("and says so", ew.identity_blocker(a), "no paid subscription (free)")
+
+    sign_in(a, expires_in_days=-1)
+    check("an expired sign-in is skipped", chosen(), "b")
+    check("and says so", ew.identity_blocker(a), "its sign-in has expired")
+
+    sign_in(a)
+    check("a working login is recommended again with nothing else to do",
+          chosen(), "a")
+
+    # Worse than out of quota: quota returns on its own, this does not. Both are
+    # unusable, so the ordering only shows in which one gets named.
+    sign_in(a, subscription="free")
+    check("a lapsed subscription ranks below an account merely out of quota",
+          ew.choose_account([a, b], {"a": fresh,
+                                     "b": dict(later, available_at=now + 3600)},
+                            now)[0].name, "b")
+
+    # A machine with a copied schedule.json and no config directories at all must
+    # still answer, because that is the whole point of publishing the schedule.
+    elsewhere = ew.Account("a", os.path.join(root, "nowhere"), 0)
+    check("no local config directory means no verdict, not a bad one",
+          ew.account_availability(elsewhere, fresh, now).tier, ew.USABLE)
 
 
 def test_schedule_is_publishable_for_other_machines():
@@ -2197,6 +2306,7 @@ def main():
                  test_validation_catches_the_expensive_mistakes,
                  test_stale_reset_rolls_forward,
                  test_choosing_between_accounts,
+                 test_an_unusable_login_is_never_recommended,
                  test_schedule_is_publishable_for_other_machines,
                  test_spacing_optimiser,
                  test_phase_is_lost_only_when_pings_cannot_get_through,
