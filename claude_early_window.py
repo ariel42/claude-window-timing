@@ -2806,6 +2806,7 @@ def setup(argv_accounts=None):
             return 0
 
     # ── Checkpoints ─────────────────────────────────────────────────────────
+    built = []
     for account in accounts:
         if os.path.exists(account.session_id_file) and \
            os.path.exists(account.checkpoint_backup):
@@ -2814,6 +2815,7 @@ def setup(argv_accounts=None):
         print("Creating account {}'s background conversation...".format(
             account.display))
         init(account)
+        built.append(account)
 
     # ── Timers and wrappers ─────────────────────────────────────────────────
     print()
@@ -2833,11 +2835,16 @@ def setup(argv_accounts=None):
         print("the service works out where each window sits and spaces them out")
         print("for you, holding an account back when that is what it takes.")
         print()
-        print("For the quickest result, avoid using the accounts other than")
-        print("{} for the next few hours. If you do use them, nothing breaks —"
-              .format(accounts[0].display))
-        print("the service re-plans from wherever things actually end up.")
-        print()
+        # Only worth saying while the spacing is still being established. On a
+        # re-run of a working setup the windows are already where they should
+        # be, and telling someone not to use their accounts for no reason is
+        # how a tool gets uninstalled.
+        if built:
+            print("For the quickest result, avoid using the accounts other than")
+            print("{} for the next few hours. If you do use them, nothing "
+                  "breaks —".format(accounts[0].display))
+            print("the service re-plans from wherever things actually end up.")
+            print()
         print("  {} status     what each account is doing".format(COMMAND))
         print("  {} which      which one to use right now".format(COMMAND))
     return 0
