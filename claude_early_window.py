@@ -3018,7 +3018,7 @@ def vscode_settings_candidates():
     return [p for p in paths if os.path.exists(p)]
 
 
-def uninstall(accounts):
+def uninstall(accounts, purge=False):
     """
     Remove everything this tool installed, and nothing else.
 
@@ -3027,6 +3027,12 @@ def uninstall(accounts):
     place rather than deleted: they hold logins the user performed, and someone
     may have worked in one despite the advice, so unlinking is ours to do and
     deleting is not.
+
+    `purge` additionally removes what this tool *generated* inside its own
+    directory — state, logs, the published schedule, the account list and the
+    launcher — so that what is left is the checkout as git has it. It stops at
+    exactly the same line: nothing outside this directory except the units, and
+    never a directory holding a login.
     """
     removed = []
 
@@ -3081,6 +3087,22 @@ def uninstall(accounts):
             if os.path.islink(link):
                 os.remove(link)
                 removed.append("shared link {}/{}".format(account.name, name))
+
+    if purge:
+        # Generated files only, each one re-created by the next install. The
+        # ping directories are deliberately not in this list: they hold logins,
+        # and a flag called --purge is not consent to sign anybody out.
+        for path in (STATE_ROOT, SCHEDULE_FILE, ACCOUNTS_FILE,
+                     os.path.join(WRAPPER_DIR, COMMAND), WRAPPER_DIR):
+            if os.path.isdir(path):
+                if path == WRAPPER_DIR and os.listdir(path):
+                    continue            # something else lives there; leave it
+                shutil.rmtree(path)
+            elif os.path.exists(path):
+                os.remove(path)
+            else:
+                continue
+            removed.append(os.path.relpath(path, SCRIPT_DIR))
 
     return removed
 
@@ -3171,8 +3193,13 @@ def build_parser():
     add("accounts", "List the configured accounts.")
 
     add("install-command", "Rewrite the {} launcher in bin/.".format(COMMAND))
-    add("uninstall", "Remove the timers and anything this tool added. Leaves "
+    uninstall_ = add("uninstall",
+                     "Remove the timers and anything this tool added. Leaves "
                      "your own ~/.claude and every conversation alone.")
+    uninstall_.add_argument("--purge", action="store_true",
+                            help="also delete this directory's generated files "
+                                 "(state, logs, accounts.json, schedule.json, "
+                                 "bin/) — never a ping directory")
 
     add("init", "Build one account's checkpoint. Setup does this for you.",
         account="optional")
@@ -3364,9 +3391,16 @@ def cli(argv=None):
                 print(account.name)
             return 0
         if command == "uninstall":
-            for item in uninstall(accounts):
+            for item in uninstall(accounts, purge=args.purge):
                 print("  removed {}".format(item))
             print()
+            if not args.purge:
+                print("Kept: this directory's state/, accounts.json, "
+                      "schedule.json and bin/ — re-installing picks them up "
+                      "where they left off.")
+                print("Remove them too with:  {} uninstall --purge".format(
+                    COMMAND))
+                print()
             print("Your ~/.claude, ~/.claude.json and every conversation are "
                   "untouched.")
             disposable = [a for a in accounts

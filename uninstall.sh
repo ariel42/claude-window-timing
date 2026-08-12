@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # uninstall.sh — remove the claude-early-window systemd *user* units.
-# Runtime files (checkpoints, state, logs) under state/ are left in place.
+# Runtime files (checkpoints, state, logs) under state/ are left in place, unless
+# --purge is given. Ping directories are never deleted: they hold your logins.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,7 +12,7 @@ echo "Claude Code Early Window — Uninstall"
 echo "======================================"
 
 # Everything that needs judgement lives in the Python, where it is tested.
-python3 "$SCRIPT_DIR/claude_early_window.py" uninstall || {
+python3 "$SCRIPT_DIR/claude_early_window.py" uninstall "$@" || {
     echo "Could not read the account configuration; removing units by name." >&2
     systemctl --user list-units --all --plain --no-legend 'claude-early-window@*.timer' \
         2>/dev/null | sed -n 's/^\(claude-early-window@[^.]*\.timer\).*/\1/p' \
@@ -23,5 +24,3 @@ python3 "$SCRIPT_DIR/claude_early_window.py" uninstall || {
 
 echo ""
 echo "Uninstalled successfully."
-echo ""
-echo "Runtime files were left in place. To remove them:  rm -r $SCRIPT_DIR/state"

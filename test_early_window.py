@@ -1769,10 +1769,14 @@ FAKE_CLAUDE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def _clean_install(answers, accounts=2, claude_control=None,
-                   home=None, repo=None):
+                   home=None, repo=None, after=None):
     """
     Run the wizard in a fresh home directory. Returns (exit code, home, repo,
     recorded systemd calls).
+
+    `after` runs once setup is finished but before the sandbox is taken down, so
+    a test can drive a second command — uninstall, say — against the same
+    redirected paths the install just used.
 
     The stand-in Claude is steered by a control file rather than environment
     variables, because build_claude_env() strips anything it does not
@@ -1824,10 +1828,13 @@ def _clean_install(answers, accounts=2, claude_control=None,
         os.rename(os.path.join(repo, "fake_claude.json"),
                   os.path.join(repo, ".fake_claude.json"))
 
-    # Sign both accounts in, as far as anything here can tell.
+    # Sign both accounts in, as far as anything here can tell. Tolerant of
+    # directories that already exist, because a second install over the same
+    # home is exactly what the uninstall/reinstall test does.
     for index in range(accounts):
         config = os.path.join(home, ".claude-{}".format(index + 1))
-        os.makedirs(config, 0o700)
+        if not os.path.isdir(config):
+            os.makedirs(config, 0o700)
         with open(os.path.join(config, ".credentials.json"), "w") as f:
             json.dump({"claudeAiOauth": {
                 "accessToken": "t", "subscriptionType": "pro",
@@ -1840,10 +1847,13 @@ def _clean_install(answers, accounts=2, claude_control=None,
                        "projects": {repo: {"hasTrustDialogAccepted": True}}}, f)
 
     try:
-        code = ew.setup()
-    except SystemExit as exc:
-        # init() exits rather than freezing a refusal into the checkpoint.
-        code = exc.code if exc.code is not None else 0
+        try:
+            code = ew.setup()
+        except SystemExit as exc:
+            # init() exits rather than freezing a refusal into the checkpoint.
+            code = exc.code if exc.code is not None else 0
+        if after is not None:
+            after(home, repo, calls)
     finally:
         (ew.HOME, ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE,
          ew.CLAUDE_PATH, ew.UNIT_DIR, ew.WRAPPER_DIR,
@@ -2001,6 +2011,98 @@ def test_a_clean_install_from_nothing():
     for gone in ("claude", "claude-vscode-wrapper"):
         check_true("no {} wrapper is installed — nothing is intercepted".format(gone),
                    not os.path.exists(os.path.join(repo, "bin", gone)))
+
+
+def test_install_uninstall_purge_and_install_again():
+    """
+    The lifecycle a stranger actually performs, in order, on one machine.
+
+    Worth driving end to end rather than asserting on uninstall() alone: the two
+    halves have to agree about every generated path, and the way that breaks is
+    that an install leaves something behind which the uninstall has never heard
+    of — so the next install inherits a file from the last one and nobody can
+    tell. Purge is the strong form of that claim, so it is what gets tested.
+    """
+    section("Install, uninstall, purge, install again")
+    root = tempfile.mkdtemp()
+    home, repo = os.path.join(root, "home"), os.path.join(root, "repo")
+    units = os.path.join(home, ".config", "systemd", "user")
+    answers = "2\ny\n\ny\n"
+
+    def generated(where=repo):
+        return sorted(n for n in os.listdir(where) if not n.startswith("."))
+
+    def credentials():
+        return {n: open(os.path.join(home, ".claude-" + n,
+                                     ".credentials.json"), "rb").read()
+                for n in ("1", "2")}
+
+    code, _, _, _ = _clean_install(answers, home=home, repo=repo)
+    check("the first install succeeds", code, 0)
+    first_checkpoint = open(os.path.join(repo, "state", "1",
+                                         "session_id.txt")).read().strip()
+    signed_in = {}
+
+    # -- uninstall, the ordinary way: the timers stop, the work is kept --------
+    removed = []
+
+    def plain_uninstall(home_, repo_, calls):
+        removed.extend(ew.uninstall(ew.load_accounts()))
+
+    code, _, _, calls = _clean_install(answers, home=home, repo=repo,
+                                       after=plain_uninstall)
+    check("re-running the installer over an existing install succeeds", code, 0)
+    check("and does not rebuild the checkpoint it already had",
+          open(os.path.join(repo, "state", "1", "session_id.txt")).read().strip(),
+          first_checkpoint)
+    check_true("uninstall disables every timer",
+               all(any(c[:3] == ["systemctl", "disable", "--now"]
+                       and c[3] == "claude-early-window@{}.timer".format(n)
+                       for c in calls) for n in ("1", "2")))
+    check("no unit file is left behind",
+          [n for n in os.listdir(units) if n.startswith("claude-early-window")],
+          [])
+    check_true("the checkpoint survives an ordinary uninstall",
+               os.path.exists(os.path.join(repo, "state", "1", "session_id.txt")))
+
+    # -- and again with --purge: nothing of ours is left in the directory ------
+    def purging_uninstall(home_, repo_, calls):
+        signed_in.update(credentials())     # as they are the instant before
+        removed[:] = ew.uninstall(ew.load_accounts(), purge=True)
+
+    code, _, _, _ = _clean_install(answers, home=home, repo=repo,
+                                   after=purging_uninstall)
+    check("the install before the purge succeeds", code, 0)
+    check("purge leaves no generated file in the directory", generated(), [])
+    for name in ("state", "accounts.json", "bin"):
+        check_true("purge reports removing {}".format(name), name in removed)
+    check("no unit file survives the purge either",
+          [n for n in os.listdir(units) if n.startswith("claude-early-window")],
+          [])
+
+    # The line purge does not cross. These directories hold logins the user
+    # performed by hand; deleting them would sign two accounts out to save a
+    # `rm`, and nobody asked for that.
+    check_true("both ping directories are still there",
+               os.path.isdir(os.path.join(home, ".claude-1"))
+               and os.path.isdir(os.path.join(home, ".claude-2")))
+    check("and are still signed in, byte for byte",
+          credentials(), signed_in)
+
+    # -- installing again onto the purged directory ---------------------------
+    code, _, _, calls = _clean_install(answers, home=home, repo=repo)
+    check("installing again after a purge succeeds", code, 0)
+    fresh = open(os.path.join(repo, "state", "1",
+                              "session_id.txt")).read().strip()
+    check_true("and builds a new checkpoint rather than resurrecting the old one",
+               fresh and fresh != first_checkpoint)
+    check_true("the launcher is back",
+               os.access(os.path.join(repo, "bin", ew.COMMAND), os.X_OK))
+    check_true("the units are back",
+               os.path.exists(os.path.join(units,
+                                           "claude-early-window@.service")))
+    check("and every timer is enabled again",
+          len([c for c in calls if c[:2] == ["systemctl", "enable"]]), 2)
 
 
 def test_three_accounts_install_and_space_correctly():
@@ -2472,6 +2574,7 @@ def main():
                  test_a_timer_that_will_never_fire_again_is_noticed,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
+                 test_install_uninstall_purge_and_install_again,
                  test_three_accounts_install_and_space_correctly,
                  test_removing_an_account_stops_its_timer,
                  test_a_clean_install_refuses_a_refused_first_message,
