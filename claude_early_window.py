@@ -719,6 +719,12 @@ def publish_schedule(accounts):
 # shape is worth real money. It also halves the worst-case wait for a fresh
 # window, from 5 hours to 5/N.
 #
+# N is not the number of accounts configured. It is the number that will start a
+# window at their next boundary, recomputed from observation on every ping —
+# see participation(). An account that supplies nothing for the next few days
+# still costs a slot if it is counted, and the slot is a stretch of the day with
+# no window arriving in it.
+#
 # One constraint governs everything here:
 #
 #     A window starts on the first ping *after* the previous one ends, so a
@@ -751,25 +757,59 @@ def window_phase(state, now):
     return expiry % (WINDOW_HOURS * 3600)
 
 
-def is_participating(state, now):
+def participation(account, state, now):
     """
-    Can this account still hold its place in the rotation?
+    Does this account hold a place in the rotation, and if not, why not?
 
-    An account keeps its phase only while its pings keep succeeding across window
-    boundaries. A brief exhaustion of the 5-hour quota does not break it — the
-    window still ends on time and the boundary ping starts the next one. But if
-    the account cannot serve a request until *after* its own window ends, that
-    boundary passes with nothing getting through and the phase is simply gone.
+    This is what decides N in the 5/N spacing, and the question it asks is
+    narrower than "is this account any good": **will it start a window at its own
+    next boundary?** One test answers it —
 
-    Stated that way it needs no knowledge of which limit is responsible, which is
-    the point: a spent weekly limit, a lapsed subscription and a revoked login
-    all fail this test for the same reason and recover the same way.
+        it must be able to serve a request no later than the moment its current
+        window ends.
+
+    Everything follows from that, with no knowledge of which limit is
+    responsible. Draining the 5-hour quota does *not* cost an account its place:
+    it becomes usable again at exactly the boundary, the ping 30 seconds later
+    gets through, and the next window starts on time. A spent weekly limit, a
+    lapsed subscription and a revoked login all do cost it, for one reason — the
+    boundary passes with nothing getting through, so no new window begins, and a
+    slot reserved for a window that never starts is a hole in the rotation.
+
+    Counting a dead account is not neutral. Three accounts with one dead are
+    spaced 1h40m apart instead of 2h30m, so the two that still supply windows are
+    bunched into a third of the day for no reason at all.
+
+    Returns (participating, reason) — the reason exists because "why is account 3
+    not in the plan" is the first thing anyone asks of the spacing report.
     """
     boundary = next_expiry(state, now)
     if boundary == float("inf"):
-        return False
-    available_at = state.get("available_at")
-    return not (available_at and available_at > boundary)
+        return False, "it has not reported a window yet"
+
+    avail = account_availability(account, state, now)
+    if avail.tier == NEEDS_ACTION:
+        # Nothing it does on its own brings this back, so no future boundary of
+        # its own is worth reserving a slot for.
+        return False, avail.note
+    if avail.tier == WAITING and avail.until > boundary:
+        return False, "{}, which outlasts its current window".format(avail.note)
+
+    # Proof of life, and the reason a phase can be believed at all. A phase says
+    # where this account's boundary falls; that claim is only as good as the last
+    # ping that got an answer, because once a boundary has passed with nothing
+    # getting through, the next window began at some unobserved moment and the
+    # recorded phase is fiction. `available_at` is written on every ping that
+    # succeeded, so a value older than a whole window means exactly that.
+    proven = state.get("available_at")
+    if not proven or proven <= now - WINDOW_HOURS * 3600:
+        return False, "no ping has got through for a whole window"
+
+    return True, ""
+
+
+def is_participating(account, state, now):
+    return participation(account, state, now)[0]
 
 
 def plan_alignment(phases, window=None):
@@ -853,7 +893,7 @@ def alignment_plan(accounts, states, now, record=True):
     """
     window = WINDOW_HOURS * 3600
     participants = sorted(a.name for a in accounts
-                          if is_participating(states[a.name], now))
+                          if is_participating(a, states[a.name], now))
 
     alignment = read_alignment()
     previous = alignment.get("participants")
@@ -894,11 +934,35 @@ def describe_alignment(accounts, states, now, suggest_realign=True,
     lines = []
     window = WINDOW_HOURS * 3600
     if len(participants) < 2:
-        lines.append("Only one account is holding a window — nothing to space.")
+        # A brand-new install is not a fault, and must not read like one: no
+        # account has a window yet because nothing has been pinged yet.
+        if not participants and all(next_expiry(states[a.name], now) == float("inf")
+                                    for a in accounts):
+            lines.append("No account has been pinged yet — the spacing is "
+                         "worked out from the first ping onwards.")
+            return lines, delays, total, settled
+
+        lines.append("{} — nothing to space.".format(
+            "No account is holding a window" if not participants
+            else "Only one account is holding a window"))
+        for account in accounts:
+            holding, why = participation(account, states[account.name], now)
+            if not holding:
+                lines.append("  account {:<10} is not: {}".format(
+                    account.display, why))
         return lines, delays, total, settled
 
-    lines.append("Windows should sit {} apart.".format(
-        fmt_delta(window / float(len(participants)))))
+    # The target is 5/N over the accounts that will actually start a window, not
+    # over the accounts that exist. Say so when those differ, because otherwise
+    # the spacing looks wrong to anyone counting their subscriptions.
+    if len(participants) < len(accounts):
+        lines.append("Windows should sit {} apart — {} of {} accounts are "
+                     "holding a window.".format(
+                         fmt_delta(window / float(len(participants))),
+                         len(participants), len(accounts)))
+    else:
+        lines.append("Windows should sit {} apart.".format(
+            fmt_delta(window / float(len(participants)))))
 
     # A hold that has been booked but not yet served leaves the phases exactly
     # where they were, so the arithmetic still reports the full error. Saying
@@ -906,8 +970,10 @@ def describe_alignment(accounts, states, now, suggest_realign=True,
     booked = False
     for account in accounts:
         if account.name not in delays:
-            lines.append("  account {:<10} not holding a window right now".format(
-                account.display))
+            lines.append("  account {:<10} not holding a window right now — "
+                         "{}".format(account.display,
+                                     participation(account, states[account.name],
+                                                   now)[1]))
             continue
         delay = delays[account.name]
         boundary = next_expiry(states[account.name], now)

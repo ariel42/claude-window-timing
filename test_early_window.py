@@ -15,6 +15,7 @@ accounts actually works end to end. It costs two tiny pings and is opt-in:
     EARLY_WINDOW_LIVE_TESTS=1 python3 test_early_window.py
 """
 
+import ast
 import io
 import json
 import os
@@ -1217,27 +1218,81 @@ def test_spacing_optimiser():
 
 
 def test_phase_is_lost_only_when_pings_cannot_get_through():
+    """
+    Who counts as N in the 5/N spacing.
+
+    One question decides it: will this account start a window at its own next
+    boundary? Getting it wrong is expensive in a way that never announces itself
+    — a dead account holding a slot bunches the live ones into part of the day,
+    and everything still looks like it is working.
+    """
     section("An account keeps its place only while its pings land")
     now = time.time()
+    root = tempfile.mkdtemp()
+    ew.STATE_ROOT = os.path.join(root, "state")
+    account = ew.Account("a", os.path.join(root, "cfg-a"), 0)
 
-    def state(expires_in, available_in=None):
-        s = {"rate_limits": {"five_hour": {"resets_at": now + expires_in}}}
+    def state(expires_in, available_in=None, five_pct=None,
+              weekly=None, weekly_pct=None):
+        limits = {"five_hour": {"resets_at": now + expires_in,
+                                "used_percentage": five_pct}}
+        if weekly is not None:
+            limits["seven_day"] = {"resets_at": now + weekly,
+                                   "used_percentage": weekly_pct}
+        s = {"rate_limits": limits}
         if available_in is not None:
             s["available_at"] = now + available_in
         return s
 
-    check_true("a healthy account participates",
-               ew.is_participating(state(3600, -1), now))
+    def holds(s):
+        return ew.is_participating(account, s, now)
+
+    check_true("a healthy account participates", holds(state(3600, -1)))
+
     # Draining the 5-hour quota does not break the phase: the window still ends
-    # on time and the boundary ping starts the next one.
+    # on time and the boundary ping starts the next one. This is the case that
+    # must *not* be excluded — the account is unusable now and still supplies a
+    # window at exactly the moment the spacing is reserving a slot for.
     check_true("being out of quota until the boundary still participates",
-               ew.is_participating(state(3600, 3500), now))
+               holds(state(3600, 3500)))
+    check_true("and the same when it is the reported percentage that says so",
+               holds(state(3600, -1, five_pct=100)))
+
     # A refusal that outlasts the boundary does break it — the window ends with
     # nothing getting through, so no new one begins.
     check_true("being unusable past the boundary loses the phase",
-               not ew.is_participating(state(3600, 7200), now))
+               not holds(state(3600, 7200)))
+    check_true("a spent weekly limit loses it, refusal or no refusal",
+               not holds(state(3600, -1, weekly=3 * 86400, weekly_pct=100)))
+    check("and says why",
+          ew.participation(account, state(3600, -1, weekly=3 * 86400,
+                                          weekly_pct=100), now)[1],
+          "its weekly limit is spent, which outlasts its current window")
+
     check_true("an account with no window information does not participate",
-               not ew.is_participating({}, now))
+               not holds({}))
+
+    # Silence is not a phase. Once a whole window has passed with no ping getting
+    # through, the next window started at a moment nobody observed, so the
+    # recorded phase is a guess — and spacing the others around a guess costs
+    # real dead time.
+    check_true("an account silent for a whole window loses its place",
+               not holds(state(3600, -(ew.WINDOW_HOURS * 3600 + 60))))
+    check_true("but one that answered within the window keeps it",
+               holds(state(3600, -(ew.WINDOW_HOURS * 3600 - 60))))
+
+    # The reason no waiting fixes. Its files say no request can succeed, so no
+    # boundary of its own is worth reserving a slot for.
+    os.makedirs(account.config_dir, 0o700)
+    with open(account.config_json, "w") as f:
+        json.dump({"oauthAccount": {"accountUuid": "a"}}, f)
+    with open(os.path.join(account.config_dir, ".credentials.json"), "w") as f:
+        json.dump({"claudeAiOauth": {"accessToken": "t",
+                                     "subscriptionType": "free"}}, f)
+    check_true("an account with no paid subscription is out of the rotation",
+               not holds(state(3600, -1)))
+    check("and says why", ew.participation(account, state(3600, -1), now)[1],
+          "no paid subscription (free)")
 
 
 def test_correction_policy():
@@ -1358,6 +1413,25 @@ def test_correction_policy():
           ew.apply_alignment(a, [a, b], blocked, blocked[a.name], now,
                              now + 3 * 86400), 0.0)
 
+    # And the point of leaving it out: N is the accounts that will actually
+    # start a window, so the ones that still supply windows get the whole
+    # 5 hours between them rather than being bunched into 5/3 of it.
+    c = ew.Account(TEST_PREFIX + "-c", "/tmp/cfg-c", 2)
+    c.ensure_state_dir()
+    three = dict(states(1.0 * HOUR))
+    three[c.name] = {"rate_limits": {"five_hour": {"resets_at": now + 900},
+                                     "seven_day": {"resets_at": now + 4 * 86400,
+                                                   "used_percentage": 100}},
+                     "available_at": now - 1}
+    ew.write_alignment({})
+    said = " ".join(ew.describe_alignment([a, b, c], three, now)[0])
+    check_true("with one of three accounts out, the target is 5/2 not 5/3",
+               "2h30m00s apart" in said)
+    check_true("and it says how many accounts are actually holding one",
+               "2 of 3 accounts" in said)
+    check_true("and names the reason the third is not",
+               "weekly limit is spent" in said)
+
 
 def test_a_hold_suppresses_the_ping_and_nothing_else():
     section("A hold skips the ping, and only for timing")
@@ -1413,6 +1487,86 @@ def test_a_hold_suppresses_the_ping_and_nothing_else():
         # A hold schedules a real transient timer that would start the ping
         # service for this account name. Leave nothing armed.
         ew.cancel_anchor(account)
+
+
+def test_an_unusable_account_is_still_pinged():
+    """
+    The recovery path, and the one thing that must never follow from "unusable".
+
+    Everything else in the tool reacts to an account being out of action: it is
+    not recommended, and it is dropped from the spacing. If the pings stopped
+    too, none of that could ever be undone — a spent weekly limit, a renewed
+    subscription or a re-login would be invisible, because the only thing that
+    ever proves an account is back is an ordinary ping getting through. So the
+    ping keeps going, on the ordinary schedule, whatever the account looks like.
+    """
+    section("An account that cannot be used is still pinged")
+    root = tempfile.mkdtemp()
+    ew.STATE_ROOT = os.path.join(root, "state")
+    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
+    now = time.time()
+    account = temp_account()
+    with open(account.session_id_file, "w") as f:
+        f.write("sid")
+    with open(account.checkpoint_backup, "w") as f:
+        f.write("{}\n")
+
+    # Everything that makes an account unusable, at once: no paid plan, a spent
+    # weekly limit days out, a refusal on record, and a run of failed pings.
+    os.makedirs(account.config_dir, 0o700)
+    with open(account.config_json, "w") as f:
+        json.dump({"oauthAccount": {"accountUuid": "u"}}, f)
+    with open(os.path.join(account.config_dir, ".credentials.json"), "w") as f:
+        json.dump({"claudeAiOauth": {"accessToken": "t",
+                                     "subscriptionType": "free"}}, f)
+    unusable = {"available_at": now + 4 * 86400,
+                "consecutive_failures": ew.UNHEALTHY_AFTER + 2,
+                "rate_limits": {
+                    "five_hour": {"resets_at": now + 600, "used_percentage": 100},
+                    "seven_day": {"resets_at": now + 4 * 86400,
+                                  "used_percentage": 100}}}
+
+    avail = ew.account_availability(account, unusable, now)
+    check_true("the account is genuinely unusable by every test",
+               avail.tier != ew.USABLE
+               and not ew.is_participating(account, unusable, now))
+
+    calls = []
+    original = ew.run_interactive
+    ew.run_interactive = lambda *a, **k: calls.append(a) or {
+        "completed": True, "limited": False, "text": ""}
+    try:
+        ew.write_state(account, unusable)
+        ew.ping(account, [account])
+        check("it is pinged anyway", len(calls), 1)
+        # And the ping is what puts it straight back: a turn that completed is
+        # proof of usability, recorded as such with no further ceremony.
+        recovered = ew.read_state(account)
+        check_true("a ping that gets through clears the block on the spot",
+                   recovered["available_at"] <= time.time()
+                   and recovered["consecutive_failures"] == 0)
+    finally:
+        ew.run_interactive = original
+        ew.cancel_anchor(account)
+
+    # The other half of the same promise, and the one that cannot be tested by
+    # running anything: no code path anywhere stops a timer because an account
+    # stopped being usable. Timers are only ever disabled by the two functions
+    # that tear down accounts the user removed or uninstalled.
+    source = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "claude_early_window.py")).read()
+    stoppers = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for inner in ast.walk(node):
+            if (isinstance(inner, ast.Call)
+                    and getattr(inner.func, "id", "") == "_systemctl"
+                    and any(getattr(a, "s", None) == "disable"
+                            for a in inner.args)):
+                stoppers.add(node.name)
+    check("only the teardown paths ever disable a timer",
+          sorted(stoppers), ["install_units", "uninstall"])
 
 
 # ---------------------------------------------------------------------------
@@ -2312,6 +2466,7 @@ def main():
                  test_phase_is_lost_only_when_pings_cannot_get_through,
                  test_correction_policy,
                  test_a_hold_suppresses_the_ping_and_nothing_else,
+                 test_an_unusable_account_is_still_pinged,
                  test_setup_lays_accounts_out_sensibly,
                  test_upgrading_keeps_the_existing_checkpoint,
                  test_a_timer_that_will_never_fire_again_is_noticed,
