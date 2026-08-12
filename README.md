@@ -2,9 +2,9 @@
 
 **Your Claude Code usage window starts when you send your first message — so if you start work at 9am, you wait until 2pm for a fresh one. This starts it for you at dawn.**
 
-A small background service that keeps your 5-hour windows rolling around the clock. You sit down to an almost-untouched window, and the next one arrives sooner. With more than one Claude subscription, it spaces their windows evenly through the day so a fresh one is never far away.
+A small background service that keeps your 5-hour windows rolling around the clock. You sit down to an almost-untouched window, and the next one arrives sooner. With more than one Claude subscription, it spaces their windows evenly through the day so a fresh one is never far away, and tells you which account to spend next.
 
-No dependencies, no daemon, no network calls of its own. About 3,000 lines of Python standard library and a systemd timer.
+It does this without touching your Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. About 3,000 lines of Python standard library and a systemd timer — no dependencies, no daemon, and no network calls of its own.
 
 ---
 
@@ -12,9 +12,11 @@ No dependencies, no daemon, no network calls of its own. About 3,000 lines of Py
 
 Claude Code gives you a **5-hour usage window**. The clock does not start at a fixed time of day — it starts the moment you send your first message.
 
-Begin work at 9:00 with no earlier usage, and your window runs 9:00–14:00. Burn through it by 11:30 and you wait two and a half hours doing nothing. The window started late because *you* did, and the rest of your day inherits that.
+Begin work at 9:00 with no earlier usage, and your window runs 9:00–14:00. Burn through it by 11:30 and you wait two and a half hours doing nothing. The window started late because *you* did, and the rest of your day inherits that: every window that day is anchored to the moment you happened to sit down.
 
-Plenty of people work around this by hand: fire a throwaway "hi" at Claude early in the morning so the window starts then, not when they actually sit down.
+The cost is not theoretical. It is the difference between a limit you hit at 16:00 and one you hit at 13:00, every day, for the same money.
+
+Plenty of people work around it by hand: fire a throwaway "hi" at Claude early in the morning so the window starts then, not when they actually sit down. That works, and it is exactly as reliable as remembering to do it before coffee.
 
 ## What this does
 
@@ -33,6 +35,26 @@ Same morning, with it running:
 
 Same capacity, less waiting. Where the window happens to sit when you arrive is luck — sometimes it just reset, sometimes it is about to. Averaged over many days that is **about 2.5 hours of waiting instead of a flat 5**.
 
+## What makes it different
+
+There are three familiar ways to attack this, and this tool is none of them.
+
+**A cron job that sends a message.** The obvious version, and the one most people reach for. It knows nothing about where your window boundary actually is, so it drifts: miss one ping — a suspended laptop, a dropped network, a limit you spent yourself — and the next window starts late, and *every* window after it inherits that late start, with nothing to pull it back. The natural way to write one is `claude --print`, which under a subscription login has a [reported problem where it can be billed as API usage](https://github.com/anthropics/claude-code/issues/43333). And nothing about it is arranged around the prompt cache, so it pays for pings that could have been free.
+
+**A usage monitor.** Tells you how much of your window is left, which is worth knowing and completely orthogonal: it observes the window, it does not start one earlier.
+
+**A wrapper, proxy or router that switches accounts for you.** These sit in front of the CLI and multiplex your requests. They work, at the price of putting a third party in the path of every request you make, and of a config directory that is no longer just yours.
+
+What this one does instead:
+
+- **It aims at the window boundary, not at the clock.** Claude Code reports exactly when your current window ends. The tool reads that, books a ping for 30 seconds after it, and so starts the next window the instant the last one closes. One correction repairs a schedule that a missed ping knocked out of step — this is the part that makes it hold up over weeks instead of days. ([Staying on schedule](#staying-on-schedule).)
+- **The pings are engineered to be free.** Every ping replays one identical saved conversation so Claude serves it from cache, and 30 minutes sits comfortably inside the ~1-hour cache lifetime while dividing 5 hours evenly. Both facts are load-bearing; [neither is a coincidence](#why-30-minutes).
+- **It runs several subscriptions as one supply.** Windows spaced 5/N hours apart, kept spaced automatically, and a straight answer to "which account should I use right now" that skips any account that cannot serve a request. ([More than one subscription](#more-than-one-subscription).)
+- **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. It never reads or writes `~/.claude` or `~/.claude.json`, and a test fails if any code goes near them.
+- **It refuses to bill you by surprise.** Pings run in interactive mode rather than `--print`, and `ANTHROPIC_API_KEY` is stripped from the environment so a ping can never land on a pay-as-you-go account.
+- **It says when it is broken.** Most failures here are silent — a timer that will never fire again, a login that expired, two accounts that are secretly the same account. `claude-window doctor` names them.
+- **It is small enough to read.** Standard library only, one file, no service to trust and nothing running unless a timer fires. Every design decision that could fail quietly is written down at the point in the source where it applies.
+
 ## More than one subscription
 
 If one subscription is not enough, the usual answer is a second. Two accounts give you twice the quota — but left alone their windows drift into whatever arrangement chance produces, and that arrangement matters more than it looks.
@@ -48,13 +70,35 @@ No arrangement creates capacity. Whatever your windows are doing, you get the sa
 
 That holds for everyone, not just heavy users: your own throughput caps how much extra quota is worth to you, so a steadier supply is never worse than a lumpy one of the same size.
 
+### Which account to use now
+
+```bash
+claude-window which
+```
+
+```
+Use account 1 (personal)
+  the only account usable right now; its window ends 2026-08-13 03:52:35 (in 4h00m00s)
+  That is the window to spend; how you use the account is up to you.
+
+  1 (personal)  usable — window ends in 4h00m00s   <- use this
+  2 (work)      unusable until 2026-08-13 01:22:35 — its 5-hour limit is spent
+  3 (spare)     unusable until 2026-08-14 23:52:35 — its weekly limit is spent
+```
+
+Two questions, in that order. **Can this account serve a request at all?** and only then **how soon does its window expire?** Spending the most perishable window first is the right rule — quota does not carry over — but it is exactly the wrong answer for an account Claude is about to refuse.
+
+So an account is skipped, and told to wait, when any of this is true: its 5-hour limit is reported spent, its weekly limit is reported spent, a ping came back refused, its sign-in has expired, or it is on no paid plan. Accounts that cannot serve are ranked by when they come back, and one that needs *you* — a lapsed subscription, a login that ran out — ranks below one that will recover on its own.
+
+One subtlety is worth stating, because it is the case a simpler tool gets wrong: a ping getting through is not proof that an account is usable. Pings are cache reads and are exempt from the rate limit, so one can sail through an account whose limit is spent and whose next real request would be refused. The reported percentages are believed over the ping.
+
 ## What it does *not* do
 
 Worth being plain about, because it is unusual for a tool like this:
 
 **It does not touch how you use Claude Code.** It creates its own directories — `~/.claude-1`, `~/.claude-2` — signs each in, and pings them. It never reads or writes `~/.claude` or `~/.claude.json`. Your conversations, your trust decisions, your MCP servers and your settings are untouched, and there is a test that fails if any code goes near them.
 
-**It does not choose an account for you.** `claude-window which` will tell you which window is most perishable. Acting on it is yours.
+**It does not switch accounts for you.** `claude-window which` tells you which window is most perishable and which accounts cannot be used at all. Acting on it is yours.
 
 **It does not need you to use Claude Code on the machine running it.** A usage window belongs to the *account*, server-side — not to a directory or a computer. A window started by a ping on your home server is the same window you get on your laptop. Run the service in one place and every machine benefits.
 
@@ -82,7 +126,7 @@ claude-window status
 ```
 
 ```
-Use account 2 (work) right now
+Use account 2 (work)
   its window ends first, 2026-08-11 13:00:00 (in 1h21m29s)
 
 Account 1 (personal)
@@ -95,7 +139,7 @@ Account 1 (personal)
 Spacing
   Windows should sit 2h30m00s apart.
     account 1 (personal) next window starts 2026-08-11 15:30:00
-    account 2 (work) next window starts 2026-08-11 13:00:00
+    account 2 (work)   next window starts 2026-08-11 13:00:00
   Spacing is correct.
 ```
 
@@ -143,17 +187,40 @@ claude-window realign --confirm  # do it
 
 A tool other people install should not make an account unavailable for two hours on its own initiative.
 
+### Who counts as N
+
+The target is 5/N, and N is not how many subscriptions you own. It is how many will **start a window at their next boundary** — recomputed from observation on every ping. One test decides it: *can this account serve a request no later than the moment its current window ends?*
+
+- **Out of 5-hour quota — still counts.** It becomes usable again at exactly its boundary, the ping 30 seconds later gets through, and its next window starts on time. Nothing was lost, so nothing needs re-spacing.
+- **Weekly limit spent, subscription lapsed, sign-in expired, or silent for a whole window — does not count.** Its boundary passes with nothing getting through, so no window begins, and a slot held for a window that never starts is a hole in the rotation.
+
+The difference is not cosmetic. Three accounts with one out of action, counted as three, are spaced 1h40m apart — which bunches the two that still supply windows into a third of the day and leaves the rest of it empty. Counted properly they sit 2h30m apart and cover it:
+
+```
+Spacing
+  Windows should sit 2h30m00s apart — 2 of 3 accounts are holding a window.
+    account 1 (personal) next window starts 2026-08-13 01:52:35
+    account 2 (work)   next window starts 2026-08-13 04:22:35
+    account 3 (spare)  not holding a window right now — its weekly limit is spent,
+                       which outlasts its current window
+  Spacing is correct.
+```
+
+**An account that is out of the rotation is still pinged**, on the same 30-minute schedule, and that is deliberate: an ordinary ping getting through is the only thing that ever notices an account coming back — a weekly limit resetting, a renewed subscription, a fresh login, a plan upgrade. It rejoins on the spot, and nothing is ever required of you. Because a change in the set moves the target for everyone, the set then has to hold steady for a full window before the tool acts on it — otherwise a limit spent on Friday afternoon would buy a re-space and Saturday morning would buy it back.
+
 ### Both limits have a say
 
 Claude has a 5-hour limit *and* a separate weekly one. A ping must satisfy **both**, so the tool aims at whichever frees up last.
 
-Beyond that it never asks *which* limit is in the way. An account is either usable now or it is not, and a spent weekly limit, a lapsed subscription, a revoked sign-in and a dead network are the same state. They also recover the same way: the ordinary pings never stop, so the first one that succeeds puts the account straight back into rotation. **Nothing is ever required of you** — including when you upgrade a plan, which is noticed within half an hour like anything else.
+Beyond that, the *scheduler* never asks which limit is in the way. For deciding when the next window can start, an account is either able to serve a ping or it is not, and a spent weekly limit, a lapsed subscription, a revoked sign-in and a dead network are the same state. They also recover the same way: the ordinary pings never stop, so the first one that succeeds puts the account straight back into rotation. **Nothing is ever required of you** — including when you upgrade a plan, which is noticed within half an hour like anything else.
+
+(The one place the distinction *is* drawn is the advice above about which account to use, where "back in 40 minutes" and "needs you to renew a subscription" are worth telling apart.)
 
 ## Several machines
 
 A usage window belongs to the **account**, so run the service on **one** always-on machine and every other machine benefits for free. A second copy would only double the consumption for no gain.
 
-Other machines need nothing at all. If you want the advice there too, copy `schedule.json` and use `claude-window which`; it carries each window's *phase*, which does not move between windows, so even a stale copy answers correctly with no network call.
+Other machines need nothing at all. If you want the advice there too, copy `schedule.json` and use `claude-window which`; it carries each window's *phase*, which does not move between windows, so even a stale copy answers correctly with no network call — along with each account's availability, which is the part only the pinging machine can see.
 
 ## Commands
 
@@ -162,17 +229,19 @@ Other machines need nothing at all. If you want the advice there too, copy `sche
 | `./install.sh` | The setup wizard. Safe to re-run. |
 | `claude-window` | Status. Typing it can never spend quota. |
 | `claude-window status [--json]` | What every account is doing, and which to use now. |
-| `claude-window which` | Just the recommendation. |
+| `claude-window which` | Just the recommendation, and what is unusable. |
 | `claude-window doctor` | Check the setup and say what is wrong. |
 | `claude-window realign [--confirm]` | Show, then optionally apply, a spacing correction. |
 | `claude-window log [2] [-f]` | A ping log, or every account's interleaved. |
 | `claude-window accounts` | List the configured accounts. |
 | `claude-window check` | Validate the accounts without changing anything. |
 | `claude-window ping [2]` | Send one ping. This is what the timer runs. |
-| `claude-window uninstall` | Remove the timers and anything the tool added. |
-| `./uninstall.sh` | The same, from the shell. |
+| `claude-window uninstall [--purge]` | Remove the timers; with `--purge`, the generated files too. |
+| `./uninstall.sh [--purge]` | The same, from the shell. |
 
 `claude-window help <command>` explains any of them. Nothing here changes which account you use.
+
+Uninstalling stops the timers and removes every unit, and by default leaves this directory's state, checkpoints and logs alone so that re-installing carries on where it left off. `--purge` removes those too, leaving the checkout as git has it. Neither form ever deletes a ping directory: those hold logins you performed, and signing you out is not an uninstaller's business.
 
 ## Files
 
@@ -186,7 +255,7 @@ Other machines need nothing at all. If you want the advice there too, copy `sche
 
 Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool; `~/.claude` and `~/.claude.json` are never touched.
 
-The tests cover the decisions that fail silently — which reset time to believe, how to space windows for the least dead time, whether a ping can start a window at the wrong moment, and whether anything writes where it should not. They spend no usage: a fake CLI stands in for Claude, so a full install can be exercised end to end with no account at all.
+The tests cover the decisions that fail silently — which reset time to believe, how to space windows for the least dead time, whether a ping can start a window at the wrong moment, which accounts are safe to recommend, and whether anything writes where it should not. A full install, uninstall, purge and re-install runs end to end in a sandboxed home directory. They spend no usage: a fake CLI stands in for Claude, so all of that can be exercised with no account at all.
 
 ## Billing: subscription vs. API
 
