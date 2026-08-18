@@ -2258,9 +2258,10 @@ def test_a_clean_install_from_nothing():
 
     check_true("the launcher is installed and executable",
                os.access(os.path.join(repo, "bin", ew.COMMAND), os.X_OK))
-    for gone in ("claude", "claude-vscode-wrapper"):
-        check_true("no {} wrapper is installed — nothing is intercepted".format(gone),
-                   not os.path.exists(os.path.join(repo, "bin", gone)))
+    # Nothing named `claude` may ever appear on the PATH this puts there: the
+    # promise is that the tool sits beside Claude Code, not in front of it.
+    check("and it is the only thing bin/ holds — nothing is intercepted",
+          sorted(os.listdir(os.path.join(repo, "bin"))), [ew.COMMAND])
 
 
 def test_install_uninstall_purge_and_install_again():
@@ -2689,13 +2690,13 @@ def test_uninstall_removes_the_units_and_nothing_else():
         accounts = [ew.Account("1", os.path.join(home, ".claude-1"), 0),
                     ew.Account("2", os.path.join(home, ".claude-2"), 1)]
 
-        # A deployment to tear down, including leftovers from the old design.
+        # A deployment to tear down, including the single-account units an
+        # install from before accounts.json would have left.
         for name in ("claude-early-window@.service", "claude-early-window@.timer",
                      "claude-early-window.service"):
             open(os.path.join(units, name), "w").close()
         os.makedirs(os.path.join(units, "claude-early-window@2.timer.d"))
-        for name in ("claude", "claude-vscode-wrapper", ew.COMMAND):
-            open(os.path.join(ew.BIN_DIR, name), "w").close()
+        open(os.path.join(ew.BIN_DIR, ew.COMMAND), "w").close()
 
         # The user's own things, which must survive untouched.
         mine = os.path.join(home, ".claude", "projects", "mine")
@@ -2705,14 +2706,17 @@ def test_uninstall_removes_the_units_and_nothing_else():
         with open(os.path.join(home, ".claude.json"), "w") as f:
             f.write('{"oauthAccount": {"emailAddress": "me@example.com"}}')
 
+        # The ping directories, each with a login and a conversation of its
+        # own. Both have to come through untouched: the login because signing
+        # somebody out is not an uninstaller's business, the conversation
+        # because it is the checkpoint a re-install carries on from.
         for account in accounts:
-            os.makedirs(account.config_dir, 0o700)
+            os.makedirs(os.path.join(account.config_dir, "projects", "p"))
             with open(os.path.join(account.config_dir, ".credentials.json"), "w") as f:
                 f.write("{}")
-        # A leftover share link from the previous design, pointing at the user's
-        # conversations. Removing the link must not reach what it points at.
-        os.symlink(os.path.join(home, ".claude", "projects"),
-                   os.path.join(accounts[1].config_dir, "projects"))
+            with open(os.path.join(account.config_dir, "projects", "p",
+                                   "c.jsonl"), "w") as f:
+                f.write('{"type":"assistant"}\n')
 
         removed = ew.uninstall(accounts)
 
@@ -2729,29 +2733,14 @@ def test_uninstall_removes_the_units_and_nothing_else():
                      "claude-early-window.service"):
             check_true("{} is removed".format(name),
                        not os.path.exists(os.path.join(units, name)))
-        for name in ("claude", "claude-vscode-wrapper"):
-            check_true("the {} wrapper is removed".format(name),
-                       not os.path.exists(os.path.join(ew.BIN_DIR, name)))
-        check_true("the launcher itself is kept",
-                   os.path.exists(os.path.join(ew.BIN_DIR, ew.COMMAND)))
-        # A setting pointing at a wrapper we delete breaks the editor's Claude
-        # Code outright: it spawns through that path.
-        vs = os.path.join(home, ".vscode-server", "data", "Machine")
-        os.makedirs(vs)
-        with open(os.path.join(vs, "settings.json"), "w") as f:
-            json.dump({"claudeCode.claudeProcessWrapper": "/gone/wrapper",
-                       "editor.fontSize": 13}, f)
-        ew.uninstall(accounts)
-        left = ew._read_json(os.path.join(vs, "settings.json"))
-        check_true("the dangling VS Code setting is removed",
-                   "claudeCode.claudeProcessWrapper" not in left)
-        check("and the user's own settings are kept", left.get("editor.fontSize"), 13)
+        # Without --purge the launcher stays, so re-installing needs nothing
+        # put back on the PATH.
+        check("bin/ still holds the launcher and nothing else",
+              sorted(os.listdir(ew.BIN_DIR)), [ew.COMMAND])
+        check_true("running it twice is not an error",
+                   isinstance(ew.uninstall(accounts), list))
 
-        check_true("the leftover share link is unlinked",
-                   not os.path.lexists(os.path.join(accounts[1].config_dir,
-                                                    "projects")))
-
-        # The three things that must never be harmed.
+        # The things that must never be harmed.
         check_true("the user's conversation survives",
                    os.path.exists(os.path.join(mine, "a.jsonl")))
         check_true("the user's config survives",
@@ -2760,6 +2749,10 @@ def test_uninstall_removes_the_units_and_nothing_else():
             check_true("account {}'s login is left in place".format(account.name),
                        os.path.exists(os.path.join(account.config_dir,
                                                    ".credentials.json")))
+            check_true("account {}'s conversations are left in place".format(
+                           account.name),
+                       os.path.exists(os.path.join(account.config_dir,
+                                                   "projects", "p", "c.jsonl")))
         check_true("it reports what it did", len(removed) > 4)
 
         # An older layout put an account in the user's own directory. Advising

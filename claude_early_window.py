@@ -1169,10 +1169,11 @@ Finding = collections.namedtuple("Finding", "level message hint")
 
 REFRESH_WARNING_DAYS = 7
 
-# Markers left by file-sync tools in the directories they manage. Sharing session
-# directories relies on symlinks, and sync tools handle those inconsistently —
-# some replace them with copies, at which point conversations stop being shared
-# and nothing announces it.
+# Markers left by file-sync tools in the directories they manage. A ping
+# directory holds a login, and Claude Code rewrites its token in place on every
+# refresh — so two machines syncing one directory take turns invalidating each
+# other's token, and the symptom is an account that mysteriously logs itself
+# out.
 _SYNC_MARKERS = (".stfolder", ".stignore", ".dropbox", ".dropbox.cache",
                  ".syncthing", ".nextcloudsync.log", ".csync_journal.db")
 
@@ -1288,9 +1289,9 @@ def validate_accounts(accounts):
                 "warning",
                 "Account {}'s config directory is inside a synced folder "
                 "({})".format(account.name, marker),
-                "Sync tools handle symlinks inconsistently. If shared "
-                "conversations stop working, check that with: {} "
-                "doctor".format(COMMAND)))
+                "It holds a login, and a token refreshed on one machine will "
+                "be overwritten by the copy from another. Move it outside the "
+                "synced folder, or exclude it."))
 
     # The mistake that leaves everything apparently working and worth nothing.
     by_uuid = {}
@@ -3138,24 +3139,14 @@ def install_units(accounts):
         print("  sudo loginctl enable-linger {}".format(USER))
 
 
-def vscode_settings_candidates():
-    """Settings files that may hold a wrapper setting an earlier version added."""
-    paths = [os.path.join(HOME, ".vscode-server", "data", "Machine",
-                          "settings.json")]
-    paths += [os.path.join(HOME, ".config", flavour, "User", "settings.json")
-              for flavour in ("Code", "Code - OSS", "VSCodium")]
-    return [p for p in paths if os.path.exists(p)]
-
-
 def uninstall(accounts, purge=False):
     """
     Remove everything this tool installed, and nothing else.
 
     Two rules. The user's own `~/.claude`, `~/.claude.json` and conversations are
     never touched — they were never ours. And the ping directories are left in
-    place rather than deleted: they hold logins the user performed, and someone
-    may have worked in one despite the advice, so unlinking is ours to do and
-    deleting is not.
+    place rather than deleted: they hold logins the user performed, so signing
+    somebody out is not an uninstaller's business.
 
     `purge` additionally removes what this tool *generated* inside its own
     directory — state, logs, the published schedule, the account list and the
@@ -3184,38 +3175,6 @@ def uninstall(accounts, purge=False):
         if os.path.isdir(drop_in):
             shutil.rmtree(drop_in)
     _systemctl("daemon-reload")
-
-    # Anything an earlier version of this tool put in the user's way.
-    for name in ("claude", "claude-vscode-wrapper"):
-        path = os.path.join(BIN_DIR, name)
-        if os.path.exists(path):
-            os.remove(path)
-            removed.append("bin/" + name)
-
-    # A setting pointing at a wrapper we are deleting would break the editor's
-    # Claude Code entirely — it spawns through that path. Removing the file
-    # without removing the setting is not a partial uninstall, it is a fault.
-    for path in vscode_settings_candidates():
-        body = _read_json(path)
-        if body.pop("claudeCode.claudeProcessWrapper", None) is not None:
-            if body:
-                tmp = path + ".tmp"
-                with open(tmp, "w") as f:
-                    json.dump(body, f, indent=2, sort_keys=True)
-                os.replace(tmp, path)
-            else:
-                os.remove(path)          # we created it, and it held only this
-            removed.append("the VS Code claudeProcessWrapper setting")
-
-    for account in accounts:
-        for name in ("projects", "file-history", "session-env", "todos",
-                     "plans", "shell-snapshots", "ide"):
-            link = os.path.join(account.config_dir, name)
-            # Only ever a symlink: removing one cannot reach what it points at,
-            # and a real directory here holds conversations.
-            if os.path.islink(link):
-                os.remove(link)
-                removed.append("shared link {}/{}".format(account.name, name))
 
     if purge:
         # Generated files only, each one re-created by the next install. The
