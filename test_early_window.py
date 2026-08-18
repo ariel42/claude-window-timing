@@ -549,6 +549,52 @@ def test_account_paths():
           ew.RESET_GUARD_SEC + ew.PING_STAGGER_SEC)
 
 
+def test_the_accounts_file_itself():
+    """
+    parse_accounts is well covered; the file around it is a separate set of
+    ways to be wrong, and each one has to name the file rather than surface as
+    a traceback from json.
+    """
+    section("Reading accounts.json, before anything is parsed")
+    root = tempfile.mkdtemp()
+    missing = os.path.join(root, "nothing.json")
+    check("no file at all means one default account, not an error",
+          [a.name for a in ew.load_accounts(missing)], ["1"])
+    check("and it is a ping directory, never the user's own",
+          ew.load_accounts(missing)[0].config_dir, ew.ping_config_dir("1"))
+
+    broken = os.path.join(root, "broken.json")
+    with open(broken, "w") as f:
+        f.write('{"accounts": [')
+    try:
+        ew.load_accounts(broken)
+        check("invalid JSON is a configuration error", "no error", "ConfigError")
+    except ew.ConfigError as e:
+        check_true("invalid JSON names the file and what json said",
+                   broken in str(e) and "not valid JSON" in str(e))
+
+    unreadable = os.path.join(root, "unreadable.json")
+    with open(unreadable, "w") as f:
+        f.write("{}")
+    os.chmod(unreadable, 0o000)
+    try:
+        ew.load_accounts(unreadable)
+        skipped = os.geteuid() == 0      # root reads it regardless
+        check_true("an unreadable file is a configuration error", skipped)
+    except ew.ConfigError as e:
+        check_true("an unreadable file says so, naming the file",
+                   unreadable in str(e) and "cannot read" in str(e))
+    finally:
+        os.chmod(unreadable, 0o600)
+
+    try:
+        ew.parse_accounts({"accounts": ["not an object"]})
+        check("a non-object entry is rejected", "no error", "ConfigError")
+    except ew.ConfigError as e:
+        check_true("a non-object entry says which one",
+                   "#1" in str(e) and "must be an object" in str(e))
+
+
 def test_accounts_file():
     section("accounts.json is validated before anything acts on it")
     tmp = tempfile.mkdtemp()
@@ -1315,6 +1361,30 @@ def test_a_second_machine_answers_from_the_schedule():
         check_true("status points at the command that can answer",
                    "which` answers from it" in buf.getvalue())
 
+        # -- what a damaged or older file does --------------------------------
+        check("a file that is not there reads as nothing to go on",
+              ew.read_schedule(os.path.join(laptop, "absent.json")), {})
+        with open(published, "w") as f:
+            f.write("{ not json")
+        check("an unreadable file is ignored rather than half-believed",
+              ew.schedule_view(ew.default_accounts()), None)
+        with open(published, "w") as f:
+            json.dump({"written_at": now, "accounts": []}, f)
+        check("a file listing no accounts is nothing to go on",
+              ew.schedule_view(ew.default_accounts()), None)
+        with open(published, "w") as f:
+            json.dump({"written_at": now, "accounts": [
+                "junk", {"label": "no name"},
+                {"name": "9", "expires_at": now + 600, "usable_now": False,
+                 "unusable_until": now + 60, "unusable_because": "resting"}]}, f)
+        view = ew.schedule_view(ew.default_accounts())
+        check("entries with no name are skipped, not fatal",
+              [a.name for a in view[0]], ["9"])
+        # `tier` is newer than the rest of the file's shape; a copy written
+        # before it existed still has to produce an answer.
+        check("a file with no tier falls back on usable_now",
+              view[2]["9"].tier, ew.WAITING)
+
         # -- the pinging machine trusts itself, never the file ---------------
         mine = ew.Account("1", os.path.join(laptop, "cfg-1"), 0)
         mine.ensure_state_dir()
@@ -1385,6 +1455,167 @@ def test_a_login_that_stopped_working_is_reported():
 # it still lines the accounts up, it just pays hours instead of minutes.
 
 HOUR = 3600.0
+
+
+def test_what_it_says_in_every_state_it_can_be_in():
+    """
+    `which` and `status` are the whole product for most of a day, and each of
+    their sentences belongs to a state the user is in. The dangerous ones are
+    where nothing can be used: "Use account 2" is a lie then, and a
+    recommendation nobody can act on reads as an instruction anyway.
+
+    So every headline, every one-line verdict, and the display lines `status`
+    only prints when something is unusual, are pinned to the state that
+    produces them.
+    """
+    section("What it says in each state it can be in")
+    now = time.time()
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    one = ew.Account("1", os.path.join(ew.STATE_ROOT, "cfg-1"), 0)
+    two = ew.Account("2", os.path.join(ew.STATE_ROOT, "cfg-2"), 1, "work")
+    for account in (one, two):
+        account.ensure_state_dir()
+    # No config directory: "cannot tell" is not "broken", so the verdicts below
+    # come from the readings alone, which is what each of them is about.
+
+    fresh = {"rate_limits": {"five_hour": {"resets_at": now + 3600}},
+             "last_run": now}
+
+    def headline_for(state, count=1, account=one):
+        avail = ew.account_availability(account, state, now)
+        return ew.headline(account, avail, count), ew.describe_availability(
+            state, avail, now)
+
+    # Usable, and the only account there is: no comparison to imply.
+    reason = ew.choose_account([one], {one.name: fresh}, now)[1]
+    check_true("with one account it does not claim to have chosen",
+               "the only account" in reason and "ends first" not in reason)
+
+    # Usable, but nothing has ever been read.
+    line, verdict = headline_for({})
+    check("a fresh install is still told what to use", line, "Use account 1")
+    check("with no window to promise", verdict, "no window information yet")
+    check_true("and the recommendation says as much",
+               "run a ping first" in ew.choose_account([one], {one.name: {}},
+                                                       now)[1])
+
+    # Waiting: a limit that names its own end.
+    waiting = dict(fresh, rate_limits={"five_hour": {"resets_at": now + 1800,
+                                                     "used_percentage": 100}})
+    line, verdict = headline_for(waiting)
+    check("one account, unusable for now, is not phrased as an instruction",
+          line, "Account 1 is not usable yet")
+    check_true("and the verdict says until when and why",
+               verdict.startswith("unusable until") and "5-hour" in verdict)
+    line, _ = headline_for(waiting, count=2)
+    check("with more than one, it names the one coming back first",
+          line, "No account is usable yet — 1 is next")
+
+    # Unknown: pings that keep failing say nothing about the account.
+    unknown = dict(fresh, consecutive_failures=ew.UNHEALTHY_AFTER)
+    line, verdict = headline_for(unknown, count=2)
+    check("nothing known to work is offered as a guess, not a verdict",
+          line, "Nothing is known to be usable — try account 1")
+    check("and the verdict admits it", verdict,
+          "unusable — its pings keep failing — cannot tell")
+
+    # The spacing report when there is nothing to space. Account 2's weekly
+    # limit outlasts its own window, so it will not start one.
+    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
+    ew.write_alignment({})
+    blocked = {one.name: dict(fresh, available_at=now - 1),
+               two.name: {"available_at": now - 1,
+                          "rate_limits": {
+                              "five_hour": {"resets_at": now + 600},
+                              "seven_day": {"resets_at": now + 4 * 86400,
+                                            "used_percentage": 100}}}}
+    said = " ".join(ew.describe_alignment([one, two], blocked, now)[0])
+    check_true("one account holding a window is not a fault to report",
+               "Only one account is holding a window" in said
+               and "nothing to space" in said)
+    check_true("and it says which account is not holding one, and why",
+               "account 2 (work)" in said and "weekly limit is spent" in said)
+
+    # Needs action: only the user can clear it, so it outranks everything.
+    os.makedirs(one.config_dir, 0o700)
+    with open(one.config_json, "w") as f:
+        json.dump({"oauthAccount": {"accountUuid": "u1"}}, f)
+    with open(os.path.join(one.config_dir, ".credentials.json"), "w") as f:
+        json.dump({"claudeAiOauth": {"accessToken": "t",
+                                     "subscriptionType": "free"}}, f)
+    line, verdict = headline_for(fresh)
+    check("an account only the user can fix says so", line,
+          "Account 1 cannot be used")
+    check_true("naming the reason", "no paid subscription" in verdict)
+    line, _ = headline_for(fresh, count=2)
+    check("and with several, where to start", line,
+          "No account can be used — start with 1")
+    check_true("the recommendation points at the command that explains it",
+               "doctor" in ew.choose_account([one], {one.name: fresh}, now)[1])
+
+
+def test_the_status_display_shows_the_unusual_parts():
+    """
+    Most of `status` only appears when something is worth saying — a run of
+    failed pings, a limit that is spent, a hold, a boundary already passed.
+    Those lines are the ones nobody sees until the day they matter.
+    """
+    section("status shows the parts that only appear when they matter")
+    now = time.time()
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
+    saved = (ew._systemctl, ew._run, ew.SCHEDULE_FILE)
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+    ew._systemctl = lambda *a: Ok()
+    ew._run = lambda cmd: Ok()
+    ew.SCHEDULE_FILE = os.path.join(ew.STATE_ROOT, "schedule.json")
+    try:
+        account = ew.Account("1", os.path.join(ew.STATE_ROOT, "cfg-1"), 0, "personal")
+        account.ensure_state_dir()
+        with open(account.session_id_file, "w") as f:
+            f.write("abc-123\n")
+        open(account.checkpoint_backup, "w").close()
+        ew.write_state(account, {
+            "last_run": now - 120,
+            "consecutive_failures": 2,
+            "boundary": now - 60,             # passed, waiting on the next ping
+            "boundary_label": "weekly limit",
+            "limits_source": "refusal-text",
+            "available_at": now + 900,
+            "hold": {"from": now - 10, "until": now + 3600, "reason": "spacing"},
+            "rate_limits": {
+                "five_hour": {"resets_at": now + 900, "used_percentage": 100},
+                "seven_day": {"resets_at": now + 86400, "used_percentage": 41}}})
+
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            code = ew.status([account])
+        finally:
+            sys.stdout = out
+        said = buf.getvalue()
+
+        check("it succeeds", code, 0)
+        check_true("the checkpoint is named, so a missing one is obvious",
+                   "Checkpoint    : abc-123" in said)
+        check_true("a run of failed pings is surfaced",
+                   "Failed pings  : 2 in a row" in said)
+        check_true("both limits are shown with what is left of them",
+                   "5-hour window : 100% used" in said
+                   and "Weekly limit  : 41% used" in said)
+        check_true("an account that cannot be used says when it can",
+                   "Usable again  :" in said and "5-hour limit is spent" in said)
+        check_true("a boundary already gone says it is waiting, not that it is due",
+                   "passed, awaiting next ping" in said)
+        check_true("and says which limit set it, and where that came from",
+                   "set by the weekly limit" in said
+                   and "[via refusal-text]" in said)
+        check_true("a hold in force is stated with its reason",
+                   "Holding       : until" in said and "spacing" in said)
+    finally:
+        ew._systemctl, ew._run, ew.SCHEDULE_FILE = saved
 
 
 def test_spacing_optimiser():
@@ -1586,20 +1817,6 @@ def test_correction_policy():
                "2h30m00s in total" in said and "realign --confirm" in said)
     check_true("and nothing was booked", "hold" not in st[b.name])
 
-    # Told once is enough: a hold already booked leaves the phases where they
-    # were, so recomputing would find the same error every half hour and go on
-    # asking for a confirmation that has already been given.
-    ew.write_alignment({"participants": [a.name, b.name], "ever": [a.name, b.name],
-                        "participants_since": now - 2 * W})
-    st[b.name]["hold"] = {"from": now + 600, "until": now + 600 + 2.5 * HOUR,
-                          "reason": "realigning, on your say-so"}
-    before = len(open(b.log_file).read())
-    extra = ew.apply_alignment(b, [a, b], st, st[b.name], now, now + 600)
-    check_true("a booked correction is not proposed all over again",
-               "realign --confirm" not in open(b.log_file).read()[before:])
-    check("and the anchor is told to wait for the end of the hold, not the "
-          "boundary", round(extra / 60), 150)
-
     # Hysteresis: an account dropping out and coming back changes the ideal
     # spacing for everyone twice over, so the set has to hold steady before
     # that moves the target. `ever` is what says it has been here before.
@@ -1723,6 +1940,279 @@ def test_correction_policy():
                "2 of 3 accounts" in said)
     check_true("and names the reason the third is not",
                "weekly limit is spent" in said)
+
+
+def test_realign_is_the_only_way_a_long_hold_happens():
+    """
+    `realign --confirm` is the one command that deliberately leaves an account
+    with no window running, for hours. Nothing else in the tool will do that,
+    which is exactly why what it does has to be pinned down: that it says the
+    price before it asks, that it does nothing at all without --confirm, and
+    that having been told once it stops asking.
+    """
+    section("realign: the correction you have to ask for")
+    now = time.time()
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
+    W = ew.WINDOW_HOURS * HOUR
+    a = ew.Account(TEST_PREFIX + "-a", "/tmp/cfg-a", 0)
+    b = ew.Account(TEST_PREFIX + "-b", "/tmp/cfg-b", 1)
+    a.ensure_state_dir(); b.ensure_state_dir()
+
+    anchors = []
+    saved_anchor = ew.schedule_anchor
+    ew.schedule_anchor = lambda account, target: anchors.append(
+        (account.name, target)) or True
+    try:
+        def arrange(offset):
+            for account, at in ((a, now + 600), (b, now + 600 + offset)):
+                ew.write_state(account, {"available_at": now - 1,
+                                         "rate_limits": {"five_hour":
+                                                         {"resets_at": at}}})
+            ew.write_alignment({"participants": [a.name, b.name],
+                                "ever": [a.name, b.name],
+                                "participants_since": now - 2 * W})
+
+        def run(**kw):
+            buf = io.StringIO()
+            out, sys.stdout = sys.stdout, buf
+            try:
+                ew.realign([a, b], **kw)
+            finally:
+                sys.stdout = out
+            return buf.getvalue()
+
+        # Already spaced: there is nothing to offer, and no price to quote.
+        arrange(2.5 * HOUR)
+        said = run()
+        check_true("correct spacing is reported and nothing is offered",
+                   "Spacing is correct" in said and "--confirm" not in said)
+
+        # Out of step: the cost comes before the offer, every time.
+        arrange(0.0)
+        said = run()
+        check_true("the cost is stated in hours of dead window",
+                   "costs 2h30m00s in total with no window running" in said)
+        check_true("and it asks rather than acts", "Re-run with --confirm" in said)
+        check("nothing was booked without --confirm",
+              [ew.read_state(x).get("hold") for x in (a, b)], [None, None])
+        check("and no anchor was moved", anchors, [])
+
+        # Asked for: exactly one account is held, and only as far as it must be.
+        said = run(confirm=True)
+        holds = {x.name: ew.read_state(x).get("hold") for x in (a, b)}
+        held = [n for n, h in holds.items() if h]
+        check("one account is held, not both", len(held), 1)
+        check("held by the spacing, no more",
+              round((holds[held[0]]["until"] - holds[held[0]]["from"]) / 60), 150)
+        check_true("the reason recorded says whose decision it was",
+                   "your say-so" in holds[held[0]]["reason"])
+        check_true("and it says when the window will now start",
+                   "next window will start" in said)
+        # The window cannot begin until the hold ends, so the anchor has to be
+        # placed there and not on the untouched boundary.
+        check("an anchor is booked for the end of the hold, plus the guard",
+              [round(t - holds[held[0]]["until"]) for n, t in anchors
+               if n == held[0]], [ew.find_account([a, b], held[0]).guard_sec])
+
+        # Having been told once, the tool stops asking. This is the half of it
+        # that used to go wrong: `status` said "already booked" while every
+        # ping went on telling the user to confirm what they just confirmed.
+        state = ew.read_state(ew.find_account([a, b], held[0]))
+        states = {x.name: ew.read_state(x) for x in (a, b)}
+        account = ew.find_account([a, b], held[0])
+        before = os.path.getsize(account.log_file) if os.path.exists(
+            account.log_file) else 0
+        extra = ew.apply_alignment(account, [a, b], states, state, time.time(),
+                                   ew.next_expiry(state, time.time()))
+        after = _read_from(account.log_file, before)
+        check_true("a booked hold is not re-proposed on the next ping",
+                   "realign --confirm" not in after)
+        check("and the anchor still lands at the end of the hold",
+              round(ew.next_expiry(state, time.time()) + extra
+                    - state["hold"]["until"]), 0)
+        check_true("the hold itself is left exactly as it was",
+                   ew.read_state(account).get("hold") == holds[held[0]]
+                   or state["hold"] == holds[held[0]])
+    finally:
+        ew.schedule_anchor = saved_anchor
+
+
+def _read_from(path, offset):
+    """Whatever was appended to a log after `offset` bytes."""
+    try:
+        with open(path) as f:
+            f.seek(offset)
+            return f.read()
+    except (IOError, OSError):
+        return ""
+
+
+def test_the_json_report_is_a_contract():
+    """
+    `status --json` is documented as the scripting interface, so its shape is a
+    promise to somebody else's code. Checked for the keys that promise names,
+    for the tiers travelling as words rather than as this module's integers,
+    and for the one thing that would make it unusable: commentary on stdout.
+    """
+    section("status --json is a contract")
+    now = time.time()
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    a = ew.Account("1", os.path.join(ew.STATE_ROOT, "cfg-1"), 0, "personal")
+    b = ew.Account("2", os.path.join(ew.STATE_ROOT, "cfg-2"), 1, "work")
+    a.ensure_state_dir(); b.ensure_state_dir()
+    ew.write_state(a, {"last_run": now - 60, "available_at": now - 60,
+                       "boundary": now + 600, "boundary_label": "5-hour window",
+                       "limits_source": "statusline",
+                       "rate_limits": {"five_hour": {"resets_at": now + 600,
+                                                     "used_percentage": 12}}})
+    ew.write_state(b, {"last_run": now - 60,
+                       "rate_limits": {"five_hour": {"resets_at": now + 9000,
+                                                     "used_percentage": 100}}})
+
+    buf = io.StringIO()
+    out, sys.stdout = sys.stdout, buf
+    try:
+        code = ew.status_json([a, b])
+    finally:
+        sys.stdout = out
+    check("it succeeds", code, 0)
+
+    document = json.loads(buf.getvalue())      # fails loudly if anything else printed
+    check("the top level says what it is and what to do",
+          sorted(document), ["accounts", "generated_at", "use"])
+    check("the recommendation names an account and its directory",
+          sorted(document["use"]), ["account", "config_dir", "reason"])
+    check("it recommends the account that can actually be used",
+          document["use"]["account"], "1")
+
+    entries = {e["name"]: e for e in document["accounts"]}
+    check("every account is reported", sorted(entries), ["1", "2"])
+    for name in ("1", "2"):
+        check("account {} carries the documented keys".format(name),
+              sorted(entries[name]),
+              ["available_at", "boundary", "boundary_label", "checkpoint",
+               "config_dir", "consecutive_failures", "expires_at", "hold",
+               "label", "last_run", "limits_source", "name", "rate_limits",
+               "tier", "unusable_because", "unusable_until", "usable_now"])
+    # The integers are an implementation detail; a caller should never see one.
+    check("tiers travel as words", [entries[n]["tier"] for n in ("1", "2")],
+          ["usable", "waiting"])
+    check("and agree with the boolean beside them",
+          [entries[n]["usable_now"] for n in ("1", "2")], [True, False])
+    check_true("an account that cannot be used says why in words",
+               "limit is spent" in (entries["2"]["unusable_because"] or ""))
+    check("a missing checkpoint is null, not an empty string",
+          entries["1"]["checkpoint"], None)
+
+
+def test_what_a_ping_records_from_how_it_went():
+    """
+    Everything downstream — when the next window can start, whether the account
+    is worth recommending, whether it counts towards the spacing — is read back
+    out of what one ping wrote down. There are three ways a ping can go and
+    each records something different, so each is walked here with the
+    conversation itself stubbed out.
+
+    The distinction that matters most is the last two. A refusal is Claude
+    answering: it says when the account is back, and it is not evidence of
+    anything being broken. Silence is not an answer at all, says nothing about
+    the account, and only counts against it if it keeps happening.
+    """
+    section("What a ping writes down, for each way it can go")
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
+    saved = (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
+             ew.restore_checkpoint, ew._systemctl, ew._run)
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+    ew.schedule_anchor = lambda account, target: True
+    ew.restore_checkpoint = lambda account, session: None
+    ew._systemctl = lambda *a: Ok()
+    ew._run = lambda cmd: Ok()
+    try:
+        account = temp_account(TEST_PREFIX)
+        ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
+        # Signed in on a paid plan, so what the tiers below say comes from the
+        # pings and not from the account's own files having something to add.
+        os.makedirs(account.config_dir, 0o700)
+        with open(account.config_json, "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": "u"}}, f)
+        with open(os.path.join(account.config_dir, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "t",
+                                         "subscriptionType": "max"}}, f)
+        with open(account.session_id_file, "w") as f:
+            f.write("sess\n")
+        open(account.checkpoint_backup, "w").close()
+
+        def ping_with(result, limits):
+            ew.run_interactive = lambda *a, **k: result
+            ew.read_statusline_limits = lambda a, records=None: limits
+            ew.ping(account)
+            return ew.read_state(account)
+
+        now = time.time()
+        # 1. It got through. The statusLine is exact, so it is believed, and
+        #    the account has just proved it can serve a request.
+        state = ping_with({"completed": True, "limited": False, "text": "ok"},
+                          {"five_hour": {"resets_at": now + 600,
+                                         "used_percentage": 7}})
+        check("a successful ping records the reset it was told",
+              state["rate_limits"]["five_hour"]["resets_at"], now + 600)
+        check("names the statusLine as where that came from",
+              state["limits_source"], "statusline")
+        check("and the boundary it implies", round(state["boundary"] - now), 600)
+        check_true("availability is proved by the ping itself, dated now",
+                   abs(state["available_at"] - time.time()) < 5)
+        check("with the failure counter cleared",
+              state["consecutive_failures"], 0)
+
+        # 2. It was refused. No statusLine figures at all, so the refusal text
+        #    is the only source — and the account is unusable until it resets.
+        refusal = "You've hit your session limit · resets 9:30pm (%s)" % (
+            ew._local_tz_name() or "UTC")
+        state = ping_with({"completed": True, "limited": True, "text": refusal},
+                          {})
+        if ew._local_tz_name():
+            check("a refusal with no statusLine falls back on its own text",
+                  state["limits_source"], "refusal-text")
+            check("and the account is unusable until exactly then",
+                  state["available_at"], state["boundary"])
+        check("a refusal is an answer, so nothing counts as a failure",
+              state["consecutive_failures"], 0)
+
+        # 3. No answer at all. That is a local problem until it repeats, so
+        #    nothing about the account's availability may be touched.
+        was = state.get("available_at")
+        state = ping_with({"completed": False, "limited": False, "text": ""}, {})
+        check("silence counts once against the account",
+              state["consecutive_failures"], 1)
+        check("and says nothing about when it is usable",
+              state.get("available_at"), was)
+        state = ping_with({"completed": False, "limited": False, "text": ""}, {})
+        check("and again, because it is the repetition that matters",
+              state["consecutive_failures"], 2)
+        state = ping_with({"completed": False, "limited": False, "text": ""}, {})
+        check("until enough of them have piled up to mean something",
+              state["consecutive_failures"], ew.UNHEALTHY_AFTER)
+
+        # Even then, silence does not overwrite an answer Claude gave. The
+        # refusal above said when this account is back, and "cannot tell"
+        # is a worse answer than that, not a newer one.
+        check("a known return time still outranks a run of silence",
+              ew.account_availability(account, state, time.time()).tier,
+              ew.WAITING)
+        forgotten = dict(state)
+        forgotten.pop("available_at")
+        check("with nothing known at all, silence is all there is to report",
+              ew.account_availability(account, forgotten, time.time()).tier,
+              ew.UNKNOWN)
+        check_true("and the log said the turn was never confirmed",
+                   "did not confirm a completed turn" in open(account.log_file).read())
+    finally:
+        (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
+         ew.restore_checkpoint, ew._systemctl, ew._run) = saved
 
 
 def test_a_hold_suppresses_the_ping_and_nothing_else():
@@ -1941,6 +2431,118 @@ def test_setup_lays_accounts_out_sensibly():
         ew.ACCOUNTS_FILE = saved
 
 
+def test_setup_and_init_refuse_the_obviously_wrong():
+    """
+    The wizard's guard rails, and the one `init` has. Both are things a person
+    does by hand, in a hurry, once — which is exactly when a typo costs a
+    rebuilt checkpoint and a restarted window phase.
+    """
+    section("Setup and init say no before they do harm")
+    root = tempfile.mkdtemp()
+    saved = (ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE, sys.stdin)
+    ew.SCRIPT_DIR = root
+    ew.STATE_ROOT = os.path.join(root, "state")
+    ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
+    try:
+        def wizard(answers):
+            buf = io.StringIO()
+            out, sys.stdout = sys.stdout, buf
+            sys.stdin = io.StringIO(answers)
+            try:
+                return ew.setup(), buf.getvalue()
+            finally:
+                sys.stdout = out
+
+        code, said = wizard("three\n")
+        check("a count that is not a number is refused", code, 2)
+        check_true("saying what was wrong with it", "not a number" in said)
+
+        code, said = wizard("0\n")
+        check("zero accounts is refused", code, 2)
+        check_true("with the reason", "at least one account" in said)
+
+        # Four Pro subscriptions cost about a Max plan and cannot be pooled,
+        # so this is worth saying once — but it is advice, not a veto.
+        code, said = wizard("5\nn\n")
+        check("more than four asks before going ahead", code, 0)
+        check_true("and explains why it is asking",
+                   "about the same as one Max plan" in said)
+        check_true("nothing was written when the answer was no",
+                   not os.path.exists(ew.ACCOUNTS_FILE))
+
+        # init must never rebuild a checkpoint that already works: doing so
+        # spends a ping and restarts the window phase it took days to settle.
+        account = ew.Account("1", os.path.join(root, "cfg"), 0)
+        account.ensure_state_dir()
+        with open(account.session_id_file, "w") as f:
+            f.write("kept-session\n")
+        with open(account.checkpoint_backup, "w") as f:
+            f.write("{}\n")
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            ew.init(account)
+        finally:
+            sys.stdout = out
+        said = buf.getvalue()
+        check_true("an existing checkpoint is reported, not replaced",
+                   "already exists" in said and "kept-session" in said)
+        check("and it is still the same one",
+              open(account.session_id_file).read().strip(), "kept-session")
+        check_true("with the way to rebuild it deliberately",
+                   "delete" in said and account.state_dir in said)
+    finally:
+        ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE, sys.stdin = saved
+
+
+def test_the_first_run_screen_says_the_things_that_stop_people():
+    """
+    The sign-in instructions are the most-read screen in the tool and the only
+    one a stranger sees before deciding whether to trust it. Two sentences on
+    it are load-bearing, and both exist because of a specific hesitation:
+    signing in sends no message, so there is no bad moment to do it; and each
+    directory needs its own login, so doing it cannot disturb the Claude Code
+    they already use.
+
+    The wizard harness elsewhere signs the accounts in first, so this screen
+    never appears there. It appears here.
+    """
+    section("The first-run screen, for an account not yet signed in")
+    root = tempfile.mkdtemp()
+    saved = (ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE, ew.HOME, sys.stdin)
+    ew.SCRIPT_DIR = root
+    ew.STATE_ROOT = os.path.join(root, "state")
+    ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
+    ew.HOME = os.path.join(root, "home")
+    os.makedirs(ew.HOME)
+    try:
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        sys.stdin = io.StringIO("2\ny\n\n")
+        try:
+            code = ew.setup()
+        finally:
+            sys.stdout = out
+        said = buf.getvalue()
+
+        check("setup stops rather than building on a bad footing", code, 1)
+        check_true("and says so, instead of reporting success",
+                   "Setup stopped" in said and "run it again" in said)
+        check_true("the directories are named in full, one per account",
+                   said.count("CLAUDE_CONFIG_DIR=") >= 2
+                   and ew.ping_config_dir("2") in said)
+        check_true("with the command spelled out to the end",
+                   "then /login" in said)
+        check_true("it says signing in starts no window, so there is no bad time",
+                   "starts no usage" in said and "no wrong time" in said)
+        check_true("and that a login here cannot disturb the one they use",
+                   "log you out over there" in said)
+        check_true("it never suggests the user's own directory",
+                   os.path.join(ew.HOME, ".claude") + " " not in said)
+    finally:
+        ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE, ew.HOME, sys.stdin = saved
+
+
 def test_upgrading_keeps_the_existing_checkpoint():
     """
     The units run the checked-out script in place, so `git pull` swaps the code
@@ -2056,6 +2658,90 @@ def test_doctor_notices_a_deployment_going_wrong():
     check_true("an account with no login is reported",
                any("not signed in" in m for m in messages))
 
+    ew.write_state(account, {"last_run": time.time() - 10 * ew.INTERVAL_MIN * 60})
+
+    # -- the findings that only doctor produces, one at a time ---------------
+    saved_systemctl, saved_user = ew._systemctl, ew.USER_CONFIG_JSON
+    replies = {}
+
+    class Reply(object):
+        def __init__(self, out, code=0):
+            self.stdout, self.returncode = out, code
+
+    def fake_systemctl(*args):
+        for key, reply in replies.items():
+            if key in " ".join(args):
+                return reply
+        return Reply("")
+
+    ew._systemctl = fake_systemctl
+    try:
+        def doctor_says(accounts=None):
+            buf = io.StringIO()
+            out, sys.stdout = sys.stdout, buf
+            try:
+                ew.doctor(accounts or [account])
+            finally:
+                sys.stdout = out
+            return buf.getvalue()
+
+        replies = {"is-enabled": Reply("disabled")}
+        said = doctor_says()
+        check_true("a timer that is not enabled is an error with the fix",
+                   "timer for account 1 is not enabled" in said
+                   and "systemctl --user enable --now" in said)
+
+        # Enabled, active, and yet never firing again: a drop-in that clears
+        # systemd's monotonic list does exactly this, and nothing announces it.
+        replies = {"is-enabled": Reply("enabled"),
+                   "NextElapseUSecMonotonic": Reply("n/a"),
+                   "NextElapseUSecRealtime": Reply("")}
+        said = doctor_says()
+        check_true("a timer with nothing scheduled is caught, not trusted",
+                   "will never fire again" in said
+                   and "Re-run ./install.sh" in said)
+
+        # A clock that disagrees with the server undermines every decision here.
+        ew.write_state(account, {"last_run": time.time(),
+                                 "rate_limits": {"five_hour":
+                                                 {"resets_at": time.time()
+                                                  + 40 * 3600}}})
+        said = doctor_says()
+        check_true("a reset time that cannot be true is called implausible",
+                   "reported reset time is implausible" in said
+                   and "machine clock" in said)
+
+        # The failure this design has that no other check would notice: every
+        # account being pinged is healthy, and none of them is the one the user
+        # actually works as.
+        home = tempfile.mkdtemp()
+        ew.USER_CONFIG_JSON = os.path.join(home, ".claude.json")
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": "theirs",
+                                        "emailAddress": "me@example.com"}}, f)
+        with open(account.config_json, "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": "pinged",
+                                        "emailAddress": "ping@example.com"}}, f)
+        said = doctor_says()
+        check_true("being signed in as an account nobody pings is reported",
+                   "me@example.com" in said and "not one of the accounts being "
+                   "pinged" in said)
+        check_true("and the hint says both ways out of it",
+                   "sign in as one of" in said and "accounts.json" in said)
+
+        # ... and is silent when they are the same account, which is the
+        # normal case and must never nag.
+        with open(account.config_json, "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": "theirs",
+                                        "emailAddress": "me@example.com"}}, f)
+        check("nothing is said when it is the same account",
+              ew._user_account_findings([account]), [])
+        os.remove(ew.USER_CONFIG_JSON)
+        check("nor when the user has never signed in there at all",
+              ew._user_account_findings([account]), [])
+    finally:
+        ew._systemctl, ew.USER_CONFIG_JSON = saved_systemctl, saved_user
+        os.remove(account.config_json)      # back to an account with no login
     ew.write_state(account, {"last_run": time.time() - 10 * ew.INTERVAL_MIN * 60})
 
     # doctor() is mostly glue, and glue is exactly where a wrong unpacking or a
@@ -2639,6 +3325,171 @@ def test_every_command_describes_what_it_actually_does():
                ew.COMMAND in (actions["install-command"].description or ""))
 
 
+def test_every_command_routes_to_the_thing_it_names():
+    """
+    Every command is tested elsewhere by calling its function directly, which
+    leaves the dispatch itself — the part every user actually goes through —
+    resting on nothing. A single mistyped branch would route `doctor` at
+    `status` and no test would notice.
+
+    The other half is the promise on the front page: typing the command, or any
+    of the ones that only look, can never spend quota. So a ping is stubbed and
+    the test fails if anything reaches it that was not asked to.
+    """
+    section("Each command reaches its own implementation, and only it")
+    root = tempfile.mkdtemp()
+    saved = (ew.STATE_ROOT, ew.ACCOUNTS_FILE, ew.SCHEDULE_FILE, ew.BIN_DIR,
+             ew._systemctl, ew._run, ew.ping, ew.init, ew.setup, ew.uninstall,
+             ew.doctor, ew.CLAUDE_PATH)
+    ew.STATE_ROOT = os.path.join(root, "state")
+    ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
+    ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
+    ew.BIN_DIR = os.path.join(root, "bin")
+    ew.CLAUDE_PATH = FAKE_CLAUDE
+
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+
+    reached = []
+
+    def spy(name, code=0):
+        def handler(*args, **kwargs):
+            reached.append(name)
+            return code
+        return handler
+
+    ew._systemctl = lambda *a: Ok()
+    ew._run = lambda cmd: Ok()
+    ew.ping = spy("ping")
+    ew.init = spy("init")
+    ew.setup = spy("setup")
+    ew.uninstall = lambda accounts, purge=False: reached.append(
+        "uninstall --purge" if purge else "uninstall") or []
+    ew.doctor = spy("doctor", 1)
+    try:
+        with open(ew.ACCOUNTS_FILE, "w") as f:
+            json.dump({"accounts": [
+                {"name": "1", "config_dir": os.path.join(root, "cfg-1")},
+                {"name": "2", "config_dir": os.path.join(root, "cfg-2")}]}, f)
+        for name in ("1", "2"):
+            account = ew.Account(name, os.path.join(root, "cfg-" + name), 0)
+            account.ensure_state_dir()
+            ew.write_state(account, {"last_run": time.time(),
+                                     "available_at": time.time(),
+                                     "rate_limits": {"five_hour": {
+                                         "resets_at": time.time() + 3600,
+                                         "used_percentage": 5}}})
+            with open(account.log_file, "w") as f:
+                f.write("[2026-08-11 10:00:00] account %s\n" % name)
+
+        def run(argv):
+            buf, err = io.StringIO(), io.StringIO()
+            out, sys.stdout = sys.stdout, buf
+            errs, sys.stderr = sys.stderr, err
+            try:
+                code = ew.cli(argv)
+            finally:
+                sys.stdout, sys.stderr = out, errs
+            return code, buf.getvalue(), err.getvalue()
+
+        # -- the ones that only look: they run for real, and must not ping ----
+        code, said, _ = run([])
+        check("the bare command reports status", code, 0)
+        check_true("and names the other commands, which nothing else does",
+                   "Other commands:" in said)
+
+        code, said, _ = run(["status"])
+        check("status succeeds", code, 0)
+        check_true("without the discovery hint the bare form adds",
+                   "Other commands:" not in said)
+
+        check("status --json is JSON and nothing else",
+              sorted(json.loads(run(["status", "--json"])[1])),
+              ["accounts", "generated_at", "use"])
+
+        code, said, _ = run(["which"])
+        check("which succeeds", code, 0)
+        check_true("and answers the question it is named after", "Use account" in said)
+
+        code, said, _ = run(["accounts"])
+        check("accounts lists them one per line", said.split(), ["1", "2"])
+
+        code, said, _ = run(["log"])
+        check("log succeeds", code, 0)
+        check_true("and merges every account's", "account 1" in said
+                   and "account 2" in said)
+
+        code, said, _ = run(["log", "2"])
+        check_true("one account's log is only that account's",
+                   "account 2" in said and "account 1" not in said)
+
+        check("realign succeeds", run(["realign"])[0], 0)
+
+        # `check` is the one looking command with a verdict to report, so its
+        # exit code has to follow the accounts rather than the run.
+        code, said, _ = run(["check"])
+        check("check fails while the accounts are not signed in", code, 1)
+        check_true("and says which, and where to sign it in",
+                   "Account 1" in said and "cfg-1" in said)
+        for name in ("1", "2"):
+            config = os.path.join(root, "cfg-" + name)
+            os.makedirs(config, 0o700)
+            with open(os.path.join(config, ".claude.json"), "w") as f:
+                json.dump({"oauthAccount": {"accountUuid": "u" + name,
+                                            "emailAddress": name + "@x"}}, f)
+            with open(os.path.join(config, ".credentials.json"), "w") as f:
+                json.dump({"claudeAiOauth": {
+                    "accessToken": "t", "subscriptionType": "max",
+                    "refreshTokenExpiresAt":
+                        int((time.time() + 90 * 86400) * 1000)}}, f)
+        code, said, _ = run(["check"])
+        check("and succeeds once they are", code, 0)
+        check_true("saying so plainly", "Everything checks out" in said)
+
+        code, said, _ = run(["install-command"])
+        check("install-command succeeds", code, 0)
+        check_true("and writes the launcher",
+                   os.access(os.path.join(ew.BIN_DIR, ew.COMMAND), os.X_OK))
+
+        check("nothing so far has sent a ping", reached, [])
+
+        # -- the ones that act: stubbed, and checked for arriving at all -----
+        check("doctor's exit code is its own", run(["doctor"])[0], 1)
+        run(["ping"]); run(["ping", "2"]); run(["init"]); run(["setup"])
+        run(["uninstall"]); run(["uninstall", "--purge"])
+        check("each acting command reached its own implementation",
+              reached, ["doctor", "ping", "ping", "init", "setup",
+                        "uninstall", "uninstall --purge"])
+
+        # -- and the ways of getting it wrong --------------------------------
+        code, _, err = run(["ping", "nope"])
+        check("an unknown account is a usage error, not a crash", code, 2)
+        check_true("and the message lists the accounts that do exist",
+                   "1, 2" in err)
+
+        # Before anything has run, `log` has nothing to show and has to say
+        # which command produces some, not print an empty screen.
+        for name in ("1", "2"):
+            os.remove(ew.Account(name, os.path.join(root, "cfg-" + name),
+                                 0).log_file)
+        code, _, err = run(["log"])
+        check("an empty log is reported rather than shown", code, 1)
+        check_true("pointing at the command that fills it", "ping" in err)
+        code, _, err = run(["log", "1"])
+        check("and for one named account too", code, 1)
+        check_true("with the same advice, not an empty screen", "ping" in err)
+
+        code, _, err = run(["log", "-f"])
+        check("following every account at once is refused", code, 2)
+        check_true("with the command that would work", "log 1 -f" in err
+                   or "claude-window log" in err)
+    finally:
+        (ew.STATE_ROOT, ew.ACCOUNTS_FILE, ew.SCHEDULE_FILE, ew.BIN_DIR,
+         ew._systemctl, ew._run, ew.ping, ew.init, ew.setup, ew.uninstall,
+         ew.doctor, ew.CLAUDE_PATH) = saved
+
+
 def test_looking_at_the_schedule_does_not_change_it():
     """
     Noting a change in the participating set starts the settling clock, so a
@@ -2879,9 +3730,11 @@ def main():
                  test_usage_line, test_init_refuses_to_checkpoint_a_refusal,
                  test_pty_drain_tolerates_a_departed_child,
                  test_run_interactive_survives_an_immediate_exit,
-                 test_account_paths, test_accounts_file, test_claude_env,
+                 test_account_paths, test_the_accounts_file_itself,
+                 test_accounts_file, test_claude_env,
                  test_the_command_surface,
                  test_every_command_describes_what_it_actually_does,
+                 test_every_command_routes_to_the_thing_it_names,
                  test_looking_at_the_schedule_does_not_change_it,
                  test_the_shell_scripts_call_commands_that_exist,
                  test_doctor_spots_residue_from_an_earlier_install,
@@ -2894,13 +3747,20 @@ def main():
                  test_schedule_is_publishable_for_other_machines,
                  test_a_second_machine_answers_from_the_schedule,
                  test_a_login_that_stopped_working_is_reported,
+                 test_what_it_says_in_every_state_it_can_be_in,
+                 test_the_status_display_shows_the_unusual_parts,
                  test_spacing_optimiser,
                  test_phase_is_lost_only_when_pings_cannot_get_through,
                  test_correction_policy,
+                 test_realign_is_the_only_way_a_long_hold_happens,
+                 test_the_json_report_is_a_contract,
+                 test_what_a_ping_records_from_how_it_went,
                  test_a_hold_suppresses_the_ping_and_nothing_else,
                  test_an_unusable_account_is_still_pinged,
                  test_the_log_reads_in_the_order_it_was_written,
                  test_setup_lays_accounts_out_sensibly,
+                 test_setup_and_init_refuse_the_obviously_wrong,
+                 test_the_first_run_screen_says_the_things_that_stop_people,
                  test_upgrading_keeps_the_existing_checkpoint,
                  test_a_timer_that_will_never_fire_again_is_noticed,
                  test_nothing_touches_the_users_own_directory,
