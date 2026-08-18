@@ -7,9 +7,12 @@ JSONL it writes on exit, the statusLine payloads it emits while running, and
 whatever appears on the terminal. Everything else about the real CLI is
 irrelevant to us, so this reproduces exactly those three and nothing more.
 
-That makes it possible to run the whole install — wizard, checkpoints, sharing,
-units, wrappers — in a pristine directory with no Claude account, no network and
-no usage spent, which is the one path that cannot otherwise be tested end to end.
+That makes it possible to run the whole install — wizard, checkpoints, units,
+launcher — in a pristine directory with no Claude account, no network and no
+usage spent, which is the one path that cannot otherwise be tested end to end.
+
+`auth status --json` is answered too, because `doctor` asks the CLI that
+question rather than reading the credentials itself.
 
 Behaviour is steered by a `.fake_claude.json` file in the working directory,
 *not* by environment variables: the tool builds a deliberately minimal
@@ -22,8 +25,10 @@ it arrived. Every key is optional.
      "five_hour_pct": <int>,          usage percentages to report
      "weekly_pct": <int>,
      "silent": true,                  never answer, to exercise the timeout
-     "hang_prompt": true}             block on a first-run prompt, as a fresh
+     "hang_prompt": true,             block on a first-run prompt, as a fresh
                                       account did before --no-chrome
+     "auth": {...}}                   what `auth status --json` should report;
+                                      false makes it print nothing parseable
 """
 
 import json
@@ -88,8 +93,29 @@ def append(path, entry):
         f.write(json.dumps(entry) + "\n")
 
 
+def auth_status():
+    """
+    Answer `auth status --json` the way the real CLI does.
+
+    Defaults to a healthy Pro login, so a test only has to say what is *wrong*.
+    A control value of false stands for a CLI that answers with something this
+    cannot parse, which must count as "cannot tell" rather than as a fault.
+    """
+    settings = control()
+    if "auth" in settings and not settings["auth"]:
+        sys.stdout.write("not json\n")
+        return 0
+    report = settings.get("auth")
+    if report is None:
+        report = {"loggedIn": True, "subscriptionType": "pro"}
+    sys.stdout.write(json.dumps(report) + "\n")
+    return 0
+
+
 def main():
     args = sys.argv[1:]
+    if args[:2] == ["auth", "status"]:
+        return auth_status()
     session_id, resumed, settings = None, False, {}
     for index, arg in enumerate(args):
         if arg == "--session-id" and index + 1 < len(args):

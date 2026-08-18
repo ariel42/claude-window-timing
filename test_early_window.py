@@ -1246,6 +1246,56 @@ def test_a_second_machine_answers_from_the_schedule():
         ew.STATE_ROOT, ew.SCHEDULE_FILE = saved
 
 
+def test_a_login_that_stopped_working_is_reported():
+    """
+    `doctor` asks the CLI whether a login still works, rather than deciding for
+    itself from the credentials file. Both directions matter: a real fault has
+    to be named, and "cannot tell" must never be reported as a fault — a
+    diagnostic that invents problems gets ignored, taking the real ones with it.
+    """
+    section("Whether a login still works is asked, not guessed")
+    saved = (ew.SCRIPT_DIR, ew.CLAUDE_PATH, ew.STATE_ROOT)
+    try:
+        root = tempfile.mkdtemp()
+        ew.SCRIPT_DIR = root             # where the stand-in reads its control file
+        ew.CLAUDE_PATH = FAKE_CLAUDE
+        ew.STATE_ROOT = os.path.join(root, "state")
+        account = ew.Account("1", os.path.join(root, "cfg"), 0)
+
+        def answers(report):
+            control = os.path.join(root, ".fake_claude.json")
+            with open(control, "w") as f:
+                json.dump({"auth": report}, f)
+            return ew.account_auth_ok(account)
+
+        os.makedirs(account.config_dir, 0o700)
+        check("no credentials at all needs no subprocess to answer",
+              ew.account_auth_ok(account), (False, "not signed in"))
+
+        with open(os.path.join(account.config_dir, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "t"}}, f)
+
+        check("a working paid login is fine",
+              answers({"loggedIn": True, "subscriptionType": "max"}), (True, "max"))
+        check("a login the CLI no longer accepts is named",
+              answers({"loggedIn": False}), (False, "not signed in"))
+        # The credentials file can still hold a perfectly good token here: the
+        # subscription behind it is what lapsed, and only the CLI knows.
+        check("a lapsed subscription is a fault even with a token on disk",
+              answers({"loggedIn": True, "subscriptionType": "free"}),
+              (False, "no paid subscription (free)"))
+        check("a plan the CLI declines to name is not guessed at",
+              answers({"loggedIn": True}), (False, "no paid subscription (unknown)"))
+        check("an answer this cannot parse counts as cannot tell",
+              answers(False), (True, "no readable answer"))
+
+        ew.CLAUDE_PATH = os.path.join(root, "no-such-cli")
+        check("and so does having no CLI to ask",
+              ew.account_auth_ok(account), (True, "could not run the CLI"))
+    finally:
+        ew.SCRIPT_DIR, ew.CLAUDE_PATH, ew.STATE_ROOT = saved
+
+
 # ---------------------------------------------------------------------------
 # Keeping the windows evenly spaced
 # ---------------------------------------------------------------------------
@@ -2750,6 +2800,7 @@ def main():
                  test_an_unusable_login_is_never_recommended,
                  test_schedule_is_publishable_for_other_machines,
                  test_a_second_machine_answers_from_the_schedule,
+                 test_a_login_that_stopped_working_is_reported,
                  test_spacing_optimiser,
                  test_phase_is_lost_only_when_pings_cannot_get_through,
                  test_correction_policy,
