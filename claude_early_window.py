@@ -1459,25 +1459,28 @@ def statusline_settings(account):
     """
     Inline --settings JSON that points Claude's statusLine back at this script.
 
-    The account travels as an explicit argument rather than through the
-    environment. Claude Code spawns this command itself, so relying on inherited
-    environment would make a second account's readings land in the first
-    account's file — a failure that would look like nothing more than slightly
-    stale numbers.
+    What travels is the **file to write**, not the account to look up. Claude
+    Code spawns this command itself, so the child starts from nothing: no
+    inherited environment worth trusting, and — because it re-imports this
+    module — a fresh set of module-level paths pointing at whatever checkout
+    the script lives in. Handing it a name to resolve made the readings land
+    wherever *that* copy's accounts.json said account "2" lives, which is not
+    necessarily the account being pinged, or even the same install. Handing it
+    a path cannot go anywhere else.
     """
     command = " ".join(shlex.quote(part) for part in (
         sys.executable or "/usr/bin/python3",
         os.path.abspath(__file__),
-        "capture-statusline", account.name,
+        "capture-statusline", os.path.abspath(account.statusline_file),
     ))
     return json.dumps({
         "statusLine": {"type": "command", "command": command, "padding": 0}
     })
 
 
-def capture_statusline(account):
+def capture_statusline(path):
     """
-    Append the statusLine payload to the account's file, one JSON object per line.
+    Append the statusLine payload to `path`, one JSON object per line.
 
     Claude Code invokes this repeatedly during a session and only the later
     invocations carry rate_limits, so we append rather than overwrite and pick the
@@ -1487,8 +1490,10 @@ def capture_statusline(account):
     try:
         raw = sys.stdin.read()
         json.loads(raw)  # validate before storing
-        account.ensure_state_dir()
-        with open(account.statusline_file, "a") as f:
+        directory = os.path.dirname(path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory, 0o700)
+        with open(path, "a") as f:
             f.write(raw.replace("\n", " ") + "\n")
     except Exception:
         pass
@@ -3297,7 +3302,7 @@ def build_parser():
     # command list — argparse only lists subparsers that were given one, and
     # help=SUPPRESS would print the literal string instead.
     capture = sub.add_parser("capture-statusline")
-    capture.add_argument("account", nargs="?", metavar="ACCOUNT")
+    capture.add_argument("path", metavar="FILE")
 
     return parser
 
@@ -3438,7 +3443,7 @@ def cli(argv=None):
     # which displays anything reaching stdout as the status line.
     if command == "capture-statusline":
         try:
-            capture_statusline(_selected(load_accounts(), args.account))
+            capture_statusline(args.path)
         except Exception:
             pass
         return 0

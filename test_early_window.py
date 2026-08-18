@@ -637,14 +637,66 @@ def test_claude_env():
     check_true("CLAUDECODE is not inherited, so the child is not a nested session",
                "CLAUDECODE" not in env)
 
-    # Claude Code spawns the status line itself, so the account cannot travel
-    # through the environment — it has to be on the command line.
+    # Claude Code spawns the status line itself, so the destination cannot
+    # travel through the environment — it has to be on the command line, and
+    # as a path rather than a name the child would have to resolve for itself.
     settings = json.loads(ew.statusline_settings(account))
     command = settings["statusLine"]["command"]
-    check_true("the status line command names the account",
-               command.rstrip().endswith(" 2"))
+    check_true("the status line command names the file to write",
+               command.rstrip().endswith(account.statusline_file))
     check_true("the status line command is the capture entry point",
                "capture-statusline" in command)
+
+
+def test_the_status_line_writes_only_where_it_was_told():
+    """
+    The status line runs as a *subprocess* Claude Code spawns, so it re-imports
+    this module from scratch: fresh module-level paths, a fresh read of
+    accounts.json, none of the redirection a test has set up in its own
+    process. For as long as it was handed an account *name* to resolve, that
+    made it write wherever the on-disk configuration said that name lived — so
+    running this suite on the machine running the service filed the stand-in
+    CLI's invented reset times into the live install's readings, and the next
+    real ping believed them and moved the window.
+
+    Hence the two things checked here, both against a real subprocess: the
+    payload lands in the file named on the command line, and the checkout's own
+    state/ is not touched on the way.
+    """
+    section("The status line writes to the file it is given, and nowhere else")
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "claude_early_window.py")
+    live = os.path.join(here, "state")
+
+    def snapshot(root):
+        seen = {}
+        for base, _, names in os.walk(root):
+            for name in names:
+                full = os.path.join(base, name)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                seen[full] = (st.st_size, st.st_mtime)
+        return seen
+
+    before = snapshot(live)
+    target = os.path.join(tempfile.mkdtemp(), "nested", "statusline.jsonl")
+    payload = json.dumps({"cost": {"total_api_duration_ms": 7},
+                          "rate_limits": {"five_hour": {"used_percentage": 11}}})
+    result = subprocess.run([sys.executable, script, "capture-statusline", target],
+                            input=payload, universal_newlines=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    check("it exits cleanly", result.returncode, 0)
+    # Anything on stdout is rendered as the status line inside Claude's UI.
+    check("and says nothing at all", result.stdout, "")
+    check_true("the directory is created if it has to be", os.path.exists(target))
+    check("the payload is stored verbatim, one object per line",
+          json.load(open(target)) if os.path.exists(target) else None,
+          json.loads(payload))
+    check("no file under this checkout's state/ was created or changed",
+          snapshot(live), before)
 
 
 def _usage_line_for(command):
@@ -805,18 +857,30 @@ def test_two_accounts_stay_out_of_each_others_files():
                    "account 1" in open(first.log_file).read()
                    and "account 2" in open(second.log_file).read())
 
-        # Claude Code spawns the status line itself, so this is the one place the
-        # account has to survive a round trip through the command line.
+        # Claude Code spawns the status line itself, so this is the one place a
+        # destination has to survive a round trip through the command line. It
+        # is a path and not an account name on purpose: the child re-imports
+        # this module and would resolve a name against whatever accounts.json
+        # and state directory *its* copy of the script sees, which is how a
+        # test run once wrote its readings into a live install.
         payload = json.dumps({"cost": {"total_api_duration_ms": 42}})
         saved_stdin, sys.stdin = sys.stdin, io.StringIO(payload)
         try:
-            ew.cli(["capture-statusline", "2"])
+            ew.cli(["capture-statusline", second.statusline_file])
         finally:
             sys.stdin = saved_stdin
-        check("a captured status line lands in the named account's file",
+        check("a captured status line lands in the file it was given",
               len(ew.statusline_records(second)), 1)
         check("and nowhere near the other account's",
               ew.statusline_records(first), [])
+
+        settings = json.loads(ew.statusline_settings(second))
+        command = settings["statusLine"]["command"]
+        check_true("the command names that file outright",
+                   second.statusline_file in command)
+        check_true("and carries no bare account name to be resolved elsewhere",
+                   " {}".format(second.name) not in
+                   command[command.index("capture-statusline"):])
 
         # Typing the bare command must never spend quota: a ping changes when a
         # window starts, so it has to be asked for by name.
@@ -2793,6 +2857,7 @@ def main():
 
     for test in (test_refusal_text, test_next_window_start, test_guard_rails,
                  test_anchor_scheduling, test_statusline_parsing,
+                 test_the_status_line_writes_only_where_it_was_told,
                  test_resume_baseline_race, test_without_systemd, test_formatting,
                  test_usage_line, test_init_refuses_to_checkpoint_a_refusal,
                  test_pty_drain_tolerates_a_departed_child,
