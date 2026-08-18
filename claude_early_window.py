@@ -953,10 +953,12 @@ def alignment_plan(accounts, states, now, record=True):
     starts the settling clock, and a diagnostic should never quietly move the
     schedule it is reporting on.
 
-    `settled` is False while the set of participating accounts is still new: an account dropping out changes
-    the ideal spacing for everyone, and acting on that immediately would mean
-    paying for a re-space twice if it comes back shortly. So the set has to hold
-    steady for a full window before it moves the target.
+    `settled` is False while the set of participating accounts is still new:
+    an account dropping out changes the ideal spacing for everyone, and acting
+    on that immediately would mean paying for a re-space twice if it comes back
+    shortly. So the set has to hold steady for a full window before it moves the
+    target. An account nobody has ever seen is exempt — it cannot be the one
+    coming back — which is what keeps a fresh install from waiting on itself.
     """
     window = WINDOW_HOURS * 3600
     participants = sorted(a.name for a in accounts
@@ -964,14 +966,31 @@ def alignment_plan(accounts, states, now, record=True):
 
     alignment = read_alignment()
     previous = alignment.get("participants")
+    # An install that predates this key has still seen whatever it currently
+    # records as participating, and treating those as new would grant exactly
+    # the wrong account a free re-space the first time one drops out and
+    # returns.
+    ever = set(alignment.get("ever") or alignment.get("participants") or ())
     if previous != participants and record:
-        alignment["participants"] = participants
         # A *first* sighting is not a change. There is no earlier arrangement to
         # thrash against and nothing has been paid for one yet, so waiting would
         # only mean a freshly installed setup sitting visibly misaligned for a
         # whole window with nothing to show for the patience.
-        alignment["participants_since"] = now if previous is not None \
-            else now - window
+        #
+        # Nor is an account joining that has never been seen before. What this
+        # waits out is an account dropping out and coming back — a limit spent
+        # on Friday buying a re-space that Saturday buys back — and an account
+        # with no history cannot be doing that. Without this a two-account
+        # install would restart its own clock: the accounts are pinged a minute
+        # apart, so the set is observed as {1} and then {1,2}, and the second
+        # sighting would read as thrash on a setup minutes old.
+        joined = set(participants) - set(previous or ())
+        first_look = previous is None or (
+            joined and not set(previous) - set(participants)
+            and not joined & ever)
+        alignment["participants"] = participants
+        alignment["ever"] = sorted(ever | set(participants))
+        alignment["participants_since"] = now - window if first_look else now
         write_alignment(alignment)
     settled = now - alignment.get("participants_since", now) >= window
 
@@ -2822,7 +2841,7 @@ def setup(argv_accounts=None):
     count = argv_accounts
     if count is None:
         answer = _ask("How many Claude accounts do you want to use?",
-                      str(len(existing) if configured else 2))
+                      str(len(existing) if configured else 1))
         try:
             count = int(answer)
         except ValueError:
@@ -2926,21 +2945,28 @@ def setup(argv_accounts=None):
     print()
     if len(accounts) > 1:
         print("The first ping for each account runs within a minute. From there")
-        print("the service works out where each window sits and spaces them out")
-        print("for you, holding an account back when that is what it takes.")
+        print("the service works out where each window sits, and holds an")
+        print("account back when that is what it takes to space them evenly.")
         print()
         # Only worth saying while the spacing is still being established. On a
         # re-run of a working setup the windows are already where they should
         # be, and telling someone not to use their accounts for no reason is
         # how a tool gets uninstalled.
         if built:
+            print("Accounts starting together are the one case it will not fix")
+            print("on its own: lining them up costs hours with no window")
+            print("running, which is not something to do unasked. Once every")
+            print("account has pinged, `{} realign` prices it.".format(COMMAND))
+            print()
             print("For the quickest result, avoid using the accounts other than")
             print("{} for the next few hours. If you do use them, nothing "
                   "breaks —".format(accounts[0].display))
             print("the service re-plans from wherever things actually end up.")
             print()
-        print("  {} status     what each account is doing".format(COMMAND))
-        print("  {} which      which one to use right now".format(COMMAND))
+        print("  {} status      what each account is doing".format(COMMAND))
+        print("  {} which       which one to use right now".format(COMMAND))
+        print("  {} realign     what evening out the spacing would "
+              "cost".format(COMMAND))
     return 0
 
 

@@ -1454,14 +1454,52 @@ def test_correction_policy():
     check_true("it is recorded as a proposal instead", proposal is not None)
     check("with the real cost attached", round(proposal["total"] / 60), 150)
 
-    # Hysteresis: an account dropping in or out changes the ideal spacing for
-    # everyone, so the set has to hold steady before that moves the target.
-    ew.write_alignment({"participants": [b.name],
+    # Hysteresis: an account dropping out and coming back changes the ideal
+    # spacing for everyone twice over, so the set has to hold steady before
+    # that moves the target. `ever` is what says it has been here before.
+    ew.write_alignment({"participants": [b.name], "ever": [a.name, b.name],
                         "participants_since": now - 10 * W})
     st = states(2.5 * HOUR + 20 * 60)
-    ew.alignment_plan([a, b], st, now)   # the set just changed
-    check("a freshly changed set of accounts is not acted on",
+    ew.alignment_plan([a, b], st, now)   # an account came back
+    check("an account returning to the set is not acted on at once",
           ew.apply_alignment(a, [a, b], st, st[a.name], now, now + 600), 0.0)
+
+    # Losing one is the case that costs most to get wrong, and it is never a
+    # first sighting however new the accounts are.
+    ew.write_alignment({"participants": [a.name, b.name], "ever": [a.name, b.name],
+                        "participants_since": now - 10 * W})
+    st = states(2.5 * HOUR + 20 * 60)
+    ew.alignment_plan([a, b], {a.name: st[a.name],
+                               b.name: dict(st[b.name], available_at=None)}, now)
+    check("an account dropping out is not acted on at once",
+          ew.apply_alignment(a, [a, b], st, st[a.name], now, now + 600), 0.0)
+
+    # An install upgraded from before `ever` existed has no history recorded,
+    # but its current participants have obviously been seen — reading them as
+    # new would hand a free re-space to the one account that must not get one.
+    ew.write_alignment({"participants": [a.name, b.name],
+                        "participants_since": now - 10 * W})
+    ew.alignment_plan([a, b], {a.name: states(0)[a.name],
+                               b.name: dict(states(0)[b.name],
+                                            available_at=None)}, now)
+    st = states(2.5 * HOUR + 20 * 60)
+    ew.alignment_plan([a, b], st, now)   # b comes back
+    check("an upgraded install does not treat its own accounts as new",
+          ew.apply_alignment(a, [a, b], st, st[a.name], now, now + 600), 0.0)
+
+    # But an account nobody has ever seen cannot be thrashing. Without this a
+    # two-account install would restart its own clock on the second ping and
+    # sit misaligned for a whole window on a setup minutes old.
+    ew.write_alignment({"participants": [a.name], "ever": [a.name],
+                        "participants_since": now - 10 * W})
+    st = states(2.5 * HOUR + 20 * 60)
+    ew.alignment_plan([a, b], st, now)   # b is seen for the first time
+    check("an account seen for the first time is acted on straight away",
+          round(ew.apply_alignment(a, [a, b], st, st[a.name], now,
+                                   now + 600) / 60), 20)
+    check_true("and it is remembered, so a later return has to settle",
+               a.name in ew.read_alignment()["ever"]
+               and b.name in ew.read_alignment()["ever"])
 
     # But a brand-new install has no earlier arrangement to thrash against, and
     # has paid for nothing, so it should not sit visibly misaligned for a whole
