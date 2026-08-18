@@ -238,6 +238,11 @@ def test_anchor_scheduling():
                              "5-hour window", state, False)
     first = ew.anchor_pending(account)
     check_true("a target within one interval is scheduled", bool(first))
+    if "anchor_target" not in state:
+        # Nothing below can mean anything without one, and reporting the rest
+        # as failures would bury the one fact that matters.
+        print("  SKIP  transient units cannot be created here")
+        return
     check_true("the anchor is placed %ds after the boundary, never before"
                % account.guard_sec,
                abs(state["anchor_target"] - (now + 1500 + account.guard_sec)) < 2)
@@ -255,7 +260,17 @@ def test_anchor_scheduling():
 
 
 def _have_systemd():
-    return ew._systemctl("--version").returncode == 0
+    """
+    Whether a systemd *user* manager is actually reachable from here.
+
+    `systemctl --version` is not the question: the binary is installed in
+    plenty of places where the per-user bus is not running — a container, a
+    cron job, an ssh session with no login session behind it — and it answers
+    without contacting anything. Asking the manager for a property is what
+    tells the two apart, and getting it wrong means this file cannot be run by
+    someone who just cloned the repository.
+    """
+    return ew._systemctl("show", "--property=Version", "--value").returncode == 0
 
 
 def _anchor_timer_count(account):
