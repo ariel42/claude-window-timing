@@ -4,7 +4,7 @@
 
 A small background service that keeps your 5-hour windows rolling around the clock. You sit down to an almost-untouched window, and the next one arrives sooner. With more than one Claude subscription, it spaces their windows evenly through the day so a fresh one is never far away, and tells you which account to spend next.
 
-It does this without touching your Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. About 3,000 lines of Python standard library and a systemd timer — no dependencies, no daemon, and no network calls of its own.
+It does this without touching your Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. About 3,500 lines of Python standard library and a systemd timer — no dependencies, no daemon, and no network calls of its own.
 
 ---
 
@@ -126,15 +126,25 @@ claude-window status
 ```
 
 ```
+Claude Code Early Window — status
+==================================
+
 Use account 2 (work)
   its window ends first, 2026-08-11 13:00:00 (in 1h21m29s)
 
 Account 1 (personal)
   Config dir    : /home/you/.claude-1
+  Checkpoint    : 6f1c47a9-2d40-4e5b-9a7c-1b3e8d05f2aa
   Last ping     : 2026-08-11 11:37:26 (0h01m05s ago)
   5-hour window : 82% used, resets 2026-08-11 15:30:00 (in 3h51m29s)
   Weekly limit  : 17% used, resets 2026-08-17 10:00:00 (in 142h21m29s)
+  Next start-of-window opportunity: 2026-08-11 15:30:00 (in 3h51m29s)
+    set by the 5-hour window   [via statusline]
+  Anchor        : none scheduled
   Next ping     : Tue 2026-08-11 12:07:13 IDT
+
+Account 2 (work)
+  ... the same again
 
 Spacing
   Windows should sit 2h30m00s apart.
@@ -236,6 +246,8 @@ Other machines need nothing at all. If you want the advice there too, put a chec
 | `claude-window accounts` | List the configured accounts. |
 | `claude-window check` | Validate the accounts without changing anything. |
 | `claude-window ping [2]` | Send one ping. This is what the timer runs. |
+| `claude-window init [2]` | Build one account's checkpoint. Setup does this for you. |
+| `claude-window install-command` | Rewrite the `claude-window` launcher in `bin/`. |
 | `claude-window uninstall [--purge]` | Remove the timers; with `--purge`, the generated files too. |
 | `./uninstall.sh [--purge]` | The same, from the shell. |
 

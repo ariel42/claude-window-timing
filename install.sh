@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # install.sh — check the prerequisites, then hand over to the setup wizard.
 #
-# Everything interesting lives in claude_early_window.py: accounts, sharing,
-# checkpoints, systemd units and wrappers. Keeping the shell script to the
-# checks it is actually good at means one implementation of the setup logic,
-# and one that can be tested.
+# Everything interesting lives in claude_early_window.py: accounts, checkpoints,
+# systemd units and the launcher. Keeping the shell script to the checks it is
+# actually good at means one implementation of the setup logic, and one that can
+# be tested.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

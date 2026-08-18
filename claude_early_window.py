@@ -6,7 +6,7 @@ Claude Code CLI.
 
 Supports several Claude subscriptions at once. Accounts are configured in
 accounts.json (see accounts.example.json); with no such file the tool runs a
-single account against Claude Code's default ~/.claude.
+single account against its own ping directory, ~/.claude-1.
 
 Usage:
   ./install.sh                 # the setup wizard, safe to re-run
@@ -119,7 +119,7 @@ MAX_ANCHOR_STREAK = 3
 # thing that makes one Claude login distinct from another), a checkpoint
 # conversation, state, a log, and a pair of systemd units.
 #
-# One ping process drives one account, but `status` and `pick` have to reason
+# One ping process drives one account, but `status` and `which` have to reason
 # about all of them at once, so an account is passed around as an object rather
 # than kept in module-level globals. That is the whole reason for this class.
 
@@ -607,8 +607,9 @@ def choose_account(accounts, states=None, now=None, avail=None):
     anyone, it only says which one it would pick.
     """
     now = time.time() if now is None else now
-    states = states or {a.name: read_state(a) for a in accounts}
-    avail = avail or availabilities(accounts, states, now)
+    states = {a.name: read_state(a) for a in accounts} if states is None \
+        else states
+    avail = availabilities(accounts, states, now) if avail is None else avail
 
     best = min(accounts,
                key=lambda a: rank_account(a, states[a.name], now, avail[a.name]))
@@ -1227,7 +1228,7 @@ def _sync_marker(path):
     return ""
 
 
-def validate_accounts(accounts, check_sharing=None):
+def validate_accounts(accounts):
     """
     Everything worth saying about a configured set of accounts, worst first.
 
@@ -1332,9 +1333,9 @@ def _permissions(path):
         return None
 
 
-# Set on every ping so a wrapper can recognise one and step aside. The default
-# account always sets CLAUDE_CONFIG_DIR, but a marker is clearer than inferring
-# intent from a path, and anything wrapping `claude` can use it to step aside.
+# Set on every ping so anything watching `claude` invocations can tell a ping
+# from a person. Nothing here needs it — CLAUDE_CONFIG_DIR already pins the
+# account — but a marker is clearer than inferring intent from a path.
 PING_MARKER_ENV = "CLAUDE_EARLY_WINDOW_PING"
 
 
@@ -2155,7 +2156,7 @@ def init(account):
     if os.path.exists(account.session_id_file) and \
        os.path.exists(account.checkpoint_backup):
         print("Account {}: checkpoint already exists.".format(account.display))
-        print("  Session: {}".format(open(account.session_id_file).read().strip()))
+        print("  Session: {}".format(_read_text(account.session_id_file).strip()))
         print("  Backup:  {} ({} bytes)".format(
             account.checkpoint_backup, os.path.getsize(account.checkpoint_backup)))
         print("  To rebuild it, delete {} and re-run ./install.sh.".format(
@@ -2385,7 +2386,7 @@ def status(accounts):
         installed = (os.path.exists(account.session_id_file)
                      and os.path.exists(account.checkpoint_backup))
         print("  Checkpoint    : {}".format(
-            open(account.session_id_file).read().strip() if installed
+            _read_text(account.session_id_file).strip() if installed
             else "MISSING — run ./install.sh"))
 
         if state.get("last_run"):
@@ -2904,7 +2905,7 @@ def setup(argv_accounts=None):
         print()
         _ask("Press Enter once every account is signed in.")
 
-    # ── Sharing, then checking ──────────────────────────────────────────────
+    # ── Checking ────────────────────────────────────────────────────────────
     print()
     print()
     findings = validate_accounts(accounts)
@@ -2930,7 +2931,7 @@ def setup(argv_accounts=None):
         init(account)
         built.append(account)
 
-    # ── Timers and wrappers ─────────────────────────────────────────────────
+    # ── Timers, then the launcher ───────────────────────────────────────────
     print()
     install_units(accounts)
     print()
@@ -3247,7 +3248,7 @@ def uninstall(accounts, purge=False):
 #
 # Conventions, all of them load-bearing for something other tools will call:
 #
-#   * stdout carries data, stderr carries commentary, so `pick` stays pipeable.
+#   * stdout carries data, stderr carries commentary, so `which` stays pipeable.
 #   * machine-readable output only ever on request (--json), never by default.
 #   * exit codes: 0 fine, 1 something is wrong, 2 the command was misused.
 #   * the bare command reports status. Sending a ping costs real quota and
@@ -3503,10 +3504,10 @@ def cli(argv=None):
                 return status_json(accounts)
             code = status(accounts)
             if args.command is None:
-                # Someone who typed the bare command has been shown one view of
-                # a tool with fifteen, and nothing on screen suggests the other
-                # fourteen exist. Naming a few beats pointing at `help`, which
-                # is only useful to someone who already suspects there is more.
+                # Someone who typed the bare command has been shown one view
+                # of a tool with a dozen, and nothing on screen suggests the
+                # rest exist. Naming a few beats pointing at `help`, which is
+                # only useful to someone who already suspects there is more.
                 print()
                 print("Other commands: which, doctor, log, realign, setup — "
                       "run `{} help` for all of them.".format(COMMAND))

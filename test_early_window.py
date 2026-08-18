@@ -9,10 +9,11 @@ strands a conversation nobody can resume.
 
     python3 test_early_window.py
 
-One test does drive the real CLI, to confirm that sharing conversations between
-accounts actually works end to end. It costs two tiny pings and is opt-in:
-
-    EARLY_WINDOW_LIVE_TESTS=1 python3 test_early_window.py
+Nothing here needs a Claude account, a network, or systemd. Where a whole
+install has to be exercised, fake_claude.py stands in for the CLI and every
+systemd call is recorded rather than run — except the anchor test, which does
+create real transient units, under names no configured account can collide with
+and cleaned up in a finally.
 """
 
 import ast
@@ -874,8 +875,8 @@ def test_validation_catches_the_expensive_mistakes():
                 "refreshTokenExpiresAt": int(
                     (time.time() + refresh_in_days * 86400) * 1000)}}, f)
 
-    def levels(**kwargs):
-        return ew.validate_accounts([first, second], check_sharing=False)
+    def levels():
+        return ew.validate_accounts([first, second])
 
     sign_in(first, "aaa", "one@example.com")
     check_true("an account that was never signed in is an error",
@@ -923,8 +924,7 @@ def test_validation_catches_the_expensive_mistakes():
                any("synced folder" in f.message for f in levels()))
 
     check("errors are reported before warnings",
-          [f.level for f in ew.validate_accounts([first, second],
-                                                 check_sharing=False)][:1],
+          [f.level for f in ew.validate_accounts([first, second])][:1],
           ["warning"])
 
 
@@ -2750,27 +2750,30 @@ def test_uninstall_removes_the_units_and_nothing_else():
         # An older layout put an account in the user's own directory. Advising
         # `rm -rf` on it would be followed, and would destroy every
         # conversation they have.
-        saved_user = ew.USER_CONFIG_DIR
+        saved_user, saved_accounts = ew.USER_CONFIG_DIR, ew.ACCOUNTS_FILE
         ew.USER_CONFIG_DIR = os.path.join(home, ".claude")
+        ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
         try:
-            legacy = [ew.Account("1", os.path.join(home, ".claude"), 0),
-                      ew.Account("2", os.path.join(home, ".claude-2"), 1)]
+            with open(ew.ACCOUNTS_FILE, "w") as f:
+                json.dump({"accounts": [
+                    {"name": "1", "config_dir": os.path.join(home, ".claude")},
+                    {"name": "2", "config_dir": os.path.join(home, ".claude-2")},
+                ]}, f)
             buf = io.StringIO()
             out, sys.stdout = sys.stdout, buf
             try:
-                ew.cli(["uninstall"]) if False else None
-                for line in ["stand-in"]:
-                    pass
-                # Exercise the advice directly, since cli() would reload accounts.
-                disposable = [a for a in legacy
-                              if os.path.realpath(a.config_dir)
-                              != os.path.realpath(ew.USER_CONFIG_DIR)]
+                ew.cli(["uninstall"])
             finally:
                 sys.stdout = out
-            check("the user's own directory is never offered for deletion",
-                  [a.name for a in disposable], ["2"])
+            advice = buf.getvalue()
+            check_true("the user's own directory is never offered for deletion",
+                       "rm -rf " + ew.USER_CONFIG_DIR + "\n" not in advice)
+            check_true("the ping directory beside it still is",
+                       "rm -rf " + os.path.join(home, ".claude-2") in advice)
+            check_true("and it says why the other one was left alone",
+                       "which is yours" in advice)
         finally:
-            ew.USER_CONFIG_DIR = saved_user
+            ew.USER_CONFIG_DIR, ew.ACCOUNTS_FILE = saved_user, saved_accounts
     finally:
         ew.UNIT_DIR, ew.WRAPPER_DIR, ew._systemctl, ew._run, ew.HOME = saved
 
