@@ -261,16 +261,24 @@ def test_anchor_scheduling():
 
 def _have_systemd():
     """
-    Whether a systemd *user* manager is actually reachable from here.
+    Whether a transient unit can actually be created from here.
 
-    `systemctl --version` is not the question: the binary is installed in
-    plenty of places where the per-user bus is not running — a container, a
-    cron job, an ssh session with no login session behind it — and it answers
-    without contacting anything. Asking the manager for a property is what
-    tells the two apart, and getting it wrong means this file cannot be run by
-    someone who just cloned the repository.
+    Three separate things have to hold, and each of them fails somewhere real:
+
+      * `systemctl` exists at all;
+      * the per-user *bus* is reachable — the binary is installed in plenty of
+        places where it is not, such as a container, a cron job, or an ssh
+        session with no login session behind it, and `systemctl --version`
+        answers in all of them without contacting anything, so asking the
+        manager for a property is what tells the two apart;
+      * `systemd-run` exists, which install.sh already warns about on its own
+        because the tool degrades to a fixed cadence without it.
+
+    Getting this wrong means the suite cannot be run by somebody who has just
+    cloned the repository, which is the one instruction the README gives.
     """
-    return ew._systemctl("show", "--property=Version", "--value").returncode == 0
+    return (ew._systemctl("show", "--property=Version", "--value").returncode == 0
+            and ew._run(["systemd-run", "--version"]).returncode == 0)
 
 
 def _anchor_timer_count(account):
