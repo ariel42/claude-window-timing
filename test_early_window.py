@@ -21,6 +21,7 @@ import json
 import os
 import pty
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1136,6 +1137,113 @@ def test_schedule_is_publishable_for_other_machines():
                    0 <= entries[name]["window_phase"] < ew.WINDOW_HOURS * 3600)
     check("phases differ, which is what makes the choice meaningful",
           entries["1"]["window_phase"] != entries["2"]["window_phase"], True)
+
+
+def test_a_second_machine_answers_from_the_schedule():
+    """
+    The claim that makes a laptop useful with nothing installed: copy
+    schedule.json in beside the script and `which` answers from it.
+
+    Worth testing rather than assuming, because everything here is arithmetic on
+    a file that may be days old — and because the failure would be silent, an
+    answer that looks exactly as confident as a live one.
+    """
+    section("A machine that pings nothing answers from a copied schedule")
+    now = time.time()
+    saved = (ew.STATE_ROOT, ew.SCHEDULE_FILE)
+    try:
+        pinger = tempfile.mkdtemp()
+        ew.STATE_ROOT = os.path.join(pinger, "state")
+        ew.SCHEDULE_FILE = os.path.join(pinger, "schedule.json")
+        a = ew.Account("1", os.path.join(pinger, "cfg-1"), 0, "personal")
+        b = ew.Account("2", os.path.join(pinger, "cfg-2"), 1, "work")
+        for account, expires in ((a, now + 600), (b, now + 2.5 * HOUR + 600)):
+            account.ensure_state_dir()
+            ew.write_state(account, {
+                "last_run": now - 60, "available_at": now - 60,
+                "rate_limits": {"five_hour": {"resets_at": expires,
+                                              "used_percentage": 12}}})
+        # Account 2 is out of quota for the next hour: the verdict only the
+        # pinging machine can reach, and the reason it has to travel.
+        ew.write_state(b, dict(ew.read_state(b), available_at=now + 3600))
+        ew.publish_schedule([a, b])
+
+        # -- the laptop: the file, and nothing else -------------------------
+        laptop = tempfile.mkdtemp()
+        ew.STATE_ROOT = os.path.join(laptop, "state")
+        published = os.path.join(laptop, "schedule.json")
+        shutil.copy(ew.SCHEDULE_FILE, published)
+        ew.SCHEDULE_FILE = published
+
+        view = ew.schedule_view(ew.default_accounts())
+        check_true("a copied schedule is enough to answer at all", view is not None)
+        accounts, states, avail, written_at = view
+        check("every account in the file is answerable",
+              [x.name for x in accounts], ["1", "2"])
+        check("labels travel too, so the answer names what the user named",
+              [x.label for x in accounts], ["personal", "work"])
+        check("the verdict travels, not just the numbers",
+              avail["2"].tier, ew.WAITING)
+        check_true("along with the reason for it",
+                   "refused" in avail["2"].note or "limit" in avail["2"].note)
+        check("and it picks the account that can actually be used",
+              ew.choose_account(accounts, states, now, avail)[0].name, "1")
+
+        # -- and still answers when the copy is old --------------------------
+        document = json.load(open(published))
+        age = 3 * 86400                  # 14.4 windows: a phase shift, not zero
+        document["written_at"] -= age
+        for entry in document["accounts"]:
+            entry["expires_at"] -= age
+            entry["last_run"] -= age
+        with open(published, "w") as f:
+            json.dump(document, f)
+
+        accounts, states, avail, written_at = ew.schedule_view(
+            ew.default_accounts())
+        expiry = ew.next_expiry(states["1"], now)
+        window = ew.WINDOW_HOURS * HOUR
+        check_true("a stale expiry is rolled into the window running now",
+                   now < expiry <= now + window)
+        # The phase is the whole reason a days-old copy is still worth reading:
+        # windows tile back to back, so the boundary running now sits at exactly
+        # the offset the file recorded, however many windows ago that was.
+        check("and lands on the phase the file recorded",
+              round(expiry % window),
+              round((now + 600 - age) % window))
+
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            ew.which(accounts, states, avail, written_at)
+        finally:
+            sys.stdout = out
+        said = buf.getvalue()
+        check_true("the answer says where it came from",
+                   "schedule.json" in said and "72h00m" in said)
+        check_true("and does not claim the local timers are late",
+                   "check the timers" not in said)
+
+        # A bare `status` on such a machine has nothing of its own to say, and
+        # its "run ./install.sh" is the wrong advice for someone who never
+        # meant to ping from here.
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            ew.status(accounts)
+        finally:
+            sys.stdout = out
+        check_true("status points at the command that can answer",
+                   "which` answers from it" in buf.getvalue())
+
+        # -- the pinging machine trusts itself, never the file ---------------
+        mine = ew.Account("1", os.path.join(laptop, "cfg-1"), 0)
+        mine.ensure_state_dir()
+        ew.write_state(mine, {"last_run": now})
+        check("a machine with readings of its own ignores the schedule",
+              ew.schedule_view([mine]), None)
+    finally:
+        ew.STATE_ROOT, ew.SCHEDULE_FILE = saved
 
 
 # ---------------------------------------------------------------------------
@@ -2603,6 +2711,7 @@ def main():
                  test_choosing_between_accounts,
                  test_an_unusable_login_is_never_recommended,
                  test_schedule_is_publishable_for_other_machines,
+                 test_a_second_machine_answers_from_the_schedule,
                  test_spacing_optimiser,
                  test_phase_is_lost_only_when_pings_cannot_get_through,
                  test_correction_policy,

@@ -470,6 +470,12 @@ USABLE, WAITING, UNKNOWN, NEEDS_ACTION = range(4)
 # note: why, in words a user can act on — never consulted for the ranking.
 Availability = collections.namedtuple("Availability", "tier until note")
 
+# How a tier travels to another machine. Names rather than the integers, because
+# the integers are an implementation detail and a published file outlives one.
+TIER_NAMES = {USABLE: "usable", WAITING: "waiting", UNKNOWN: "unknown",
+              NEEDS_ACTION: "needs_action"}
+TIERS_BY_NAME = {name: tier for tier, name in TIER_NAMES.items()}
+
 SCHEDULE_FILE = os.path.join(SCRIPT_DIR, "schedule.json")
 
 
@@ -694,6 +700,7 @@ def publish_schedule(accounts):
             "expires_at": expiry if expiry != float("inf") else None,
             "available_at": state.get("available_at"),
             "usable_now": usable.tier == USABLE,
+            "tier": TIER_NAMES[usable.tier],
             "unusable_until": usable.until,
             "unusable_because": usable.note or None,
             "used_percentage": five.get("used_percentage"),
@@ -706,6 +713,66 @@ def publish_schedule(accounts):
     with open(tmp, "w") as f:
         json.dump(document, f, indent=2, sort_keys=True)
     os.replace(tmp, SCHEDULE_FILE)
+
+
+def read_schedule(path=None):
+    """The published schedule as written, or {} if there is not a usable one."""
+    document = _read_json(path or SCHEDULE_FILE)
+    if not isinstance(document, dict) or not document.get("accounts"):
+        return {}
+    return document
+
+
+def schedule_view(accounts):
+    """
+    Accounts and readings taken from a published schedule, or None.
+
+    This is what makes a second machine useful without running anything: copy
+    schedule.json in beside the script and `which` answers from it, with no
+    network call and nothing installed. Only the pinging machine can observe any
+    of this, so the file carries the verdicts as well as the numbers.
+
+    A stale copy still answers correctly. Windows tile back to back, so an
+    expiry that has passed is rolled forward by whole windows into the one
+    running now — what was published is really the *phase*, and a phase does not
+    move between windows. The availability travelling beside it is a snapshot
+    and does age, which is why `which` says how old the file is.
+
+    Returns None whenever this machine has readings of its own: the machine
+    doing the pinging is the authority on itself, and this is a fallback rather
+    than a second opinion.
+    """
+    if any(read_state(account).get("last_run") for account in accounts):
+        return None
+    document = read_schedule()
+    if not document:
+        return None
+
+    published, states, avail = [], {}, {}
+    for index, entry in enumerate(document["accounts"]):
+        if not isinstance(entry, dict) or not entry.get("name"):
+            continue
+        account = Account(str(entry["name"]), entry.get("config_dir"), index,
+                          entry.get("label") or "")
+        published.append(account)
+        states[account.name] = {
+            "last_run": entry.get("last_run"),
+            "rate_limits": {"five_hour": {
+                "resets_at": entry.get("expires_at"),
+                "used_percentage": entry.get("used_percentage")}},
+        }
+        # Fall back on `usable_now` if the file predates the named tier, so an
+        # older copy degrades to a coarser answer rather than to no answer.
+        tier = TIERS_BY_NAME.get(entry.get("tier"))
+        if tier is None:
+            tier = USABLE if entry.get("usable_now") else WAITING
+        avail[account.name] = Availability(
+            tier, entry.get("unusable_until"),
+            entry.get("unusable_because") or "")
+
+    if not published:
+        return None
+    return published, states, avail, document.get("written_at")
 
 
 # ---------------------------------------------------------------------------
@@ -2358,6 +2425,16 @@ def status(accounts):
         print("Spacing")
         for line in describe_alignment(accounts, states, now)[0]:
             print("  {}".format(line))
+
+    # A second machine has nothing of its own to report and does not want the
+    # "run ./install.sh" above — it is not meant to be pinging. Say where the
+    # answer it actually came for lives.
+    if schedule_view(accounts):
+        print()
+        print("Nothing has been pinged from this machine, but a schedule "
+              "published by the")
+        print("machine that does is here. `{} which` answers from "
+              "it.".format(COMMAND))
     return 0
 
 
@@ -2599,11 +2676,19 @@ def _read_text(path):
         return ""
 
 
-def which(accounts):
-    """Say which account to use, for a machine that runs no wrapper at all."""
+def which(accounts, states=None, avail=None, published_at=None):
+    """
+    Say which account to use, and why.
+
+    Advice only: nothing here switches accounts, and running it can never spend
+    quota. `states` and `avail` arrive filled in when the answer is coming from
+    a schedule published by another machine rather than from this one's own
+    state files — see `schedule_view`.
+    """
     now = time.time()
-    states = {a.name: read_state(a) for a in accounts}
-    avail = availabilities(accounts, states, now)
+    states = {a.name: read_state(a) for a in accounts} if states is None \
+        else states
+    avail = availabilities(accounts, states, now) if avail is None else avail
     chosen, reason = choose_account(accounts, states, now, avail)
 
     print(headline(chosen, avail[chosen.name], len(accounts)))
@@ -2630,7 +2715,16 @@ def which(accounts):
     # enough ago to be a different story — an answer this confident should not
     # come from readings nobody has refreshed since the timer stopped.
     freshest = max([states[a.name].get("last_run") or 0 for a in accounts])
-    if freshest and now - freshest > STALE_AFTER_SEC:
+    if published_at:
+        # Where the answer came from matters here in a way it does not on the
+        # pinging machine: nothing on this one would notice the file going
+        # stale, so the age is the reader's only guard against acting on it.
+        print()
+        print("  From schedule.json, published {} ago by the machine running "
+              "the pings.".format(fmt_delta(now - published_at)))
+        print("  Window phases hold whatever the file's age; which accounts are "
+              "usable is as old as the file.")
+    elif freshest and now - freshest > STALE_AFTER_SEC:
         print()
         print("  These readings are {} old. If that is not expected, check the "
               "timers: {} doctor".format(fmt_delta(now - freshest), COMMAND))
@@ -3320,6 +3414,7 @@ def status_json(accounts):
             "label": account.label,
             "config_dir": account.config_dir,
             "usable_now": usable.tier == USABLE,
+            "tier": TIER_NAMES[usable.tier],
             "unusable_until": usable.until,
             "unusable_because": usable.note or None,
             "last_run": state.get("last_run"),
@@ -3391,7 +3486,10 @@ def cli(argv=None):
                       "run `{} help` for all of them.".format(COMMAND))
             return code
         if command == "which":
-            return which(accounts)
+            # A machine that pings nothing has no state of its own; a copy of
+            # the pinging machine's schedule.json is all it needs to answer.
+            view = schedule_view(accounts)
+            return which(*view) if view else which(accounts)
         if command == "log":
             return show_log(accounts, args.account, args.lines, args.follow)
         if command == "realign":

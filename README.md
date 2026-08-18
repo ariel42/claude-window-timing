@@ -220,7 +220,7 @@ Beyond that, the *scheduler* never asks which limit is in the way. For deciding 
 
 A usage window belongs to the **account**, so run the service on **one** always-on machine and every other machine benefits for free. A second copy would only double the consumption for no gain.
 
-Other machines need nothing at all. If you want the advice there too, copy `schedule.json` and use `claude-window which`; it carries each window's *phase*, which does not move between windows, so even a stale copy answers correctly with no network call — along with each account's availability, which is the part only the pinging machine can see.
+Other machines need nothing at all. If you want the advice there too, put a checkout of this repository on the second machine, copy `schedule.json` into it, and run `claude-window which`. It answers from that file alone: no timers, no logins, no network call. The file carries each window's *phase*, which does not move between windows, so even a days-old copy still names the right account — along with each account's availability, which is the part only the pinging machine can see, and which does age. `which` says how old the file is.
 
 ## Commands
 
