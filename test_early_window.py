@@ -2042,7 +2042,7 @@ def _clean_install(answers, accounts=2, claude_control=None,
 
     saved = (ew.HOME, ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE,
              ew.CLAUDE_PATH, ew.UNIT_DIR,
-             ew.WRAPPER_DIR, ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE,
+             ew.BIN_DIR, ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE,
              ew._systemctl, ew._run, sys.stdin, os.environ.get("HOME"),
              ew.STARTUP_WAIT_SEC, ew.COMPLETION_TIMEOUT_SEC,
              ew.STATUSLINE_WAIT_SEC)
@@ -2061,7 +2061,7 @@ def _clean_install(answers, accounts=2, claude_control=None,
     ew.ACCOUNTS_FILE = os.path.join(repo, "accounts.json")
     ew.CLAUDE_PATH = FAKE_CLAUDE
     ew.UNIT_DIR = os.path.join(home, ".config", "systemd", "user")
-    ew.WRAPPER_DIR = os.path.join(repo, "bin")
+    ew.BIN_DIR = os.path.join(repo, "bin")
     ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
     ew.SCHEDULE_FILE = os.path.join(repo, "schedule.json")
     ew._systemctl = lambda *a: record(("systemctl",) + a)
@@ -2106,7 +2106,7 @@ def _clean_install(answers, accounts=2, claude_control=None,
             after(home, repo, calls)
     finally:
         (ew.HOME, ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE,
-         ew.CLAUDE_PATH, ew.UNIT_DIR, ew.WRAPPER_DIR,
+         ew.CLAUDE_PATH, ew.UNIT_DIR, ew.BIN_DIR,
          ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE, ew._systemctl,
          ew._run, sys.stdin, old_home, ew.STARTUP_WAIT_SEC,
          ew.COMPLETION_TIMEOUT_SEC, ew.STATUSLINE_WAIT_SEC) = saved
@@ -2670,7 +2670,7 @@ def test_uninstall_removes_the_units_and_nothing_else():
     os.makedirs(units)
     ew.STATE_ROOT = os.path.join(root, "state")
 
-    saved = (ew.UNIT_DIR, ew.WRAPPER_DIR, ew._systemctl, ew._run, ew.HOME)
+    saved = (ew.UNIT_DIR, ew.BIN_DIR, ew._systemctl, ew._run, ew.HOME)
     seen = []
 
     def record(cmd):
@@ -2681,7 +2681,7 @@ def test_uninstall_removes_the_units_and_nothing_else():
         return Ok()
 
     ew.UNIT_DIR = units
-    ew.WRAPPER_DIR = os.path.join(root, "bin"); os.makedirs(ew.WRAPPER_DIR)
+    ew.BIN_DIR = os.path.join(root, "bin"); os.makedirs(ew.BIN_DIR)
     ew.HOME = home
     ew._systemctl = lambda *a: record(("systemctl",) + a)
     ew._run = record
@@ -2695,7 +2695,7 @@ def test_uninstall_removes_the_units_and_nothing_else():
             open(os.path.join(units, name), "w").close()
         os.makedirs(os.path.join(units, "claude-early-window@2.timer.d"))
         for name in ("claude", "claude-vscode-wrapper", ew.COMMAND):
-            open(os.path.join(ew.WRAPPER_DIR, name), "w").close()
+            open(os.path.join(ew.BIN_DIR, name), "w").close()
 
         # The user's own things, which must survive untouched.
         mine = os.path.join(home, ".claude", "projects", "mine")
@@ -2731,9 +2731,9 @@ def test_uninstall_removes_the_units_and_nothing_else():
                        not os.path.exists(os.path.join(units, name)))
         for name in ("claude", "claude-vscode-wrapper"):
             check_true("the {} wrapper is removed".format(name),
-                       not os.path.exists(os.path.join(ew.WRAPPER_DIR, name)))
+                       not os.path.exists(os.path.join(ew.BIN_DIR, name)))
         check_true("the launcher itself is kept",
-                   os.path.exists(os.path.join(ew.WRAPPER_DIR, ew.COMMAND)))
+                   os.path.exists(os.path.join(ew.BIN_DIR, ew.COMMAND)))
         # A setting pointing at a wrapper we delete breaks the editor's Claude
         # Code outright: it spawns through that path.
         vs = os.path.join(home, ".vscode-server", "data", "Machine")
@@ -2790,7 +2790,7 @@ def test_uninstall_removes_the_units_and_nothing_else():
         finally:
             ew.USER_CONFIG_DIR, ew.ACCOUNTS_FILE = saved_user, saved_accounts
     finally:
-        ew.UNIT_DIR, ew.WRAPPER_DIR, ew._systemctl, ew._run, ew.HOME = saved
+        ew.UNIT_DIR, ew.BIN_DIR, ew._systemctl, ew._run, ew.HOME = saved
 
 
 def main():
