@@ -1579,9 +1579,26 @@ def test_correction_policy():
     ew.alignment_plan([a, b], st, now); settle()
     check("a multi-hour hold is not applied unasked",
           ew.apply_alignment(b, [a, b], st, st[b.name], now, now + 600), 0.0)
-    proposal = ew.read_alignment().get("proposal")
-    check_true("it is recorded as a proposal instead", proposal is not None)
-    check("with the real cost attached", round(proposal["total"] / 60), 150)
+    said = open(b.log_file).read()
+    check_true("it says so in the log instead of acting", "too long to do "
+               "unasked" in said)
+    check_true("with the real cost attached, and how to apply it",
+               "2h30m00s in total" in said and "realign --confirm" in said)
+    check_true("and nothing was booked", "hold" not in st[b.name])
+
+    # Told once is enough: a hold already booked leaves the phases where they
+    # were, so recomputing would find the same error every half hour and go on
+    # asking for a confirmation that has already been given.
+    ew.write_alignment({"participants": [a.name, b.name], "ever": [a.name, b.name],
+                        "participants_since": now - 2 * W})
+    st[b.name]["hold"] = {"from": now + 600, "until": now + 600 + 2.5 * HOUR,
+                          "reason": "realigning, on your say-so"}
+    before = len(open(b.log_file).read())
+    extra = ew.apply_alignment(b, [a, b], st, st[b.name], now, now + 600)
+    check_true("a booked correction is not proposed all over again",
+               "realign --confirm" not in open(b.log_file).read()[before:])
+    check("and the anchor is told to wait for the end of the hold, not the "
+          "boundary", round(extra / 60), 150)
 
     # Hysteresis: an account dropping out and coming back changes the ideal
     # spacing for everyone twice over, so the set has to hold steady before

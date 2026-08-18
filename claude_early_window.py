@@ -1112,6 +1112,17 @@ def apply_alignment(account, accounts, states, state, now, boundary):
     if not boundary or len(accounts) < 2:
         return 0.0
 
+    # A hold already booked for this account is the answer to this question,
+    # and it was reached once already. The phases do not move until it has been
+    # served, so recomputing here would find the same error every half hour and
+    # either re-book the identical hold or — after `realign --confirm` — go on
+    # telling the user to confirm a correction they have just confirmed. What
+    # the anchor needs is the moment that hold ends, expressed the way the
+    # caller wants it: as an amount to add to the boundary.
+    booked = state.get("hold")
+    if booked and booked.get("until", 0) > now:
+        return max(0.0, booked["until"] - boundary)
+
     delays, total, participants, settled = alignment_plan(accounts, states, now)
     delay = delays.get(account.name, 0.0)
 
@@ -1124,10 +1135,9 @@ def apply_alignment(account, accounts, states, state, now, boundary):
         return 0.0
 
     if total > AUTO_CORRECT_MAX_SEC:
-        alignment = read_alignment()
-        alignment["proposal"] = {"delays": delays, "total": total,
-                                 "created_at": now}
-        write_alignment(alignment)
+        # Said, not stored. `realign` prices the correction from live state when
+        # it is asked to, because a plan recorded half a day ago describes
+        # windows that have since moved on.
         log(account, "Spacing is out by {} in total, which needs a hold of {} "
                      "on this account. That is too long to do unasked — run "
                      "`{} realign --confirm` to apply it.".format(
@@ -2358,11 +2368,6 @@ def realign(accounts, confirm=False):
         schedule_anchor(account, boundary + delay + account.guard_sec)
         print("  account {}: next window will start {}".format(
             account.display, fmt_time(boundary + delay)))
-
-    alignment = read_alignment()
-    alignment.pop("proposal", None)
-    alignment["last_applied"] = now
-    write_alignment(alignment)
     return 0
 
 
