@@ -73,7 +73,9 @@ def session_path(session_id):
     """Mirror Claude Code's own layout, including the mangled working directory."""
     config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
         os.path.expanduser("~"), ".claude")
-    directory = os.path.join(config, "projects", os.getcwd().replace("/", "-"))
+    # Same mangling as the real CLI: separators *and* dots become dashes.
+    slug = os.getcwd().replace("/", "-").replace(".", "-")
+    directory = os.path.join(config, "projects", slug)
     if not os.path.isdir(directory):
         os.makedirs(directory)
     return os.path.join(directory, session_id + ".jsonl")

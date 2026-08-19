@@ -540,7 +540,7 @@ def test_account_paths():
                first.session_dir != second.session_dir)
     check_true("the session dir keeps Claude Code's mangled-cwd layout",
                second.session_dir.endswith(
-                   os.path.join("projects", second.ping_cwd.replace("/", "-"))))
+                   os.path.join("projects", ew._project_slug(second.ping_cwd))))
 
     # The whole point of the ping directory: a working directory whose contents
     # never change, because Claude Code puts the working directory's git state
@@ -3138,14 +3138,14 @@ def test_a_clean_install_from_nothing():
     ping_cwd = os.path.join(home, ".claude-1", "pingcwd")
     check_true("account 1's checkpoint is in its own directory",
                os.path.exists(os.path.join(home, ".claude-1", "projects",
-                                           ping_cwd.replace("/", "-"),
+                                           ew._project_slug(ping_cwd),
                                            first + ".jsonl")))
     check_true("the ping working directory was created, and is empty",
                os.path.isdir(ping_cwd) and not [
                    e for e in os.listdir(ping_cwd) if not e.startswith(".")])
     check_true("setup did not leave a checkpoint under this checkout",
                not os.path.isdir(os.path.join(home, ".claude-1", "projects",
-                                              repo.replace("/", "-"))))
+                                              ew._project_slug(repo))))
 
     units = os.path.join(home, ".config", "systemd", "user")
     check_true("the unit template is written",
