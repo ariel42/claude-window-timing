@@ -546,6 +546,13 @@ def test_account_paths():
     # never change, because Claude Code puts the working directory's git state
     # into the cached part of every prompt. Running in this checkout meant the
     # cache died every time the repository did.
+    check("dots become dashes, as Claude Code stores them",
+          ew._project_slug("/home/u/.claude-1/pingcwd"),
+          "-home-u--claude-1-pingcwd")
+    check("and a path without dots is unaffected",
+          ew._project_slug("/opt/dev/claude-early-window"),
+          "-opt-dev-claude-early-window")
+
     check_true("a ping runs inside its own account directory",
                second.ping_cwd.startswith(second.config_dir))
     check_true("and not in this checkout",

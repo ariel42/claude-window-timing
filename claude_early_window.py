@@ -130,6 +130,19 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _ACCOUNT_KEYS = frozenset(("name", "config_dir", "label"))
 
 
+def _project_slug(path):
+    """
+    Claude Code's directory name for a working directory.
+
+    Both separators and dots become dashes: /home/u/.claude-1/pingcwd is stored
+    as -home-u--claude-1-pingcwd. Replacing only "/" is right for a path with no
+    dots in it and silently wrong for one that has them — the transcript is then
+    written somewhere this never looks, every run reports "no assistant turn
+    recorded", and the account looks broken while the requests are being billed.
+    """
+    return path.replace("/", "-").replace(".", "-")
+
+
 class Account(object):
     """One Claude login, and everywhere its files and units live."""
 
@@ -185,7 +198,7 @@ class Account(object):
         for its checkpoint in the first account's tree.
         """
         return os.path.join(self.config_dir, "projects",
-                            self.ping_cwd.replace("/", "-"))
+                            _project_slug(self.ping_cwd))
 
     # -- systemd --------------------------------------------------------------
 
