@@ -22,7 +22,7 @@ Plenty of people work around it by hand: fire a throwaway "hi" at Claude early i
 
 It sends that message for you, every 30 minutes, all day and all night.
 
-Each one is tiny — a single "bye" to a saved one-line conversation — and **about 85% of them cost nothing at all**, because Claude serves them from its prompt cache and [cache reads are not deducted from your rate limit](https://platform.claude.com/docs/en/build-with-claude/prompt-caching). Measured over two days of real use: roughly 75,000 tokens per account for the ones that missed.
+Each one is tiny — a single "bye" to a saved one-line conversation — and **they cost as close to nothing as makes no difference**, because Claude serves them from its prompt cache and [cache reads are not deducted from your rate limit](https://platform.claude.com/docs/en/build-with-claude/prompt-caching). A week of logs: every ping served from cache, apart from a run of misses traced to the one thing that can spoil it — see [where the pings run](#where-the-pings-run).
 
 Same morning, with it running:
 
@@ -48,7 +48,7 @@ There are three familiar ways to attack this, and this tool is none of them.
 What this one does instead:
 
 - **It aims at the window boundary, not at the clock.** Claude Code reports exactly when your current window ends. The tool reads that, books a ping for 30 seconds after it, and so starts the next window the instant the last one closes. One correction repairs a schedule that a missed ping knocked out of step — this is the part that makes it hold up over weeks instead of days. ([Staying on schedule](#staying-on-schedule).)
-- **The pings are engineered to be free.** Every ping replays one identical saved conversation so Claude serves it from cache, and 30 minutes sits comfortably inside the ~1-hour cache lifetime while dividing 5 hours evenly. Both facts are load-bearing; [neither is a coincidence](#why-30-minutes).
+- **The pings are engineered to be free.** Every ping replays one identical saved conversation from a directory whose contents never change, so Claude serves it from cache, and 30 minutes sits comfortably inside the ~1-hour cache lifetime while dividing 5 hours evenly. All three facts are load-bearing; none is a coincidence ([why 30 minutes](#why-30-minutes), [where the pings run](#where-the-pings-run)).
 - **It runs several subscriptions as one supply.** Windows spaced 5/N hours apart, kept spaced automatically, and a straight answer to "which account should I use right now" that skips any account that cannot serve a request. ([More than one subscription](#more-than-one-subscription).)
 - **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. It never reads or writes `~/.claude` or `~/.claude.json`, and a test fails if any code goes near them.
 - **It refuses to bill you by surprise.** Pings run in interactive mode rather than `--print`, and `ANTHROPIC_API_KEY` is stripped from the environment so a ping can never land on a pay-as-you-go account.
@@ -96,7 +96,7 @@ One subtlety is worth stating, because it is the case a simpler tool gets wrong:
 
 Worth being plain about, because it is unusual for a tool like this:
 
-**It does not touch how you use Claude Code.** It creates its own directories — `~/.claude-1`, `~/.claude-2` — signs each in, and pings them. It never reads or writes `~/.claude` or `~/.claude.json`. Your conversations, your trust decisions, your MCP servers and your settings are untouched, and there is a test that fails if any code goes near them.
+**It does not touch how you use Claude Code.** It creates its own directories — `~/.claude-1`, `~/.claude-2` — signs each in, and pings them from an empty working directory inside each. It never reads or writes `~/.claude` or `~/.claude.json`. Your conversations, your trust decisions, your MCP servers and your settings are untouched, and there is a test that fails if any code goes near them.
 
 **It does not switch accounts for you.** `claude-window which` tells you which window is most perishable and which accounts cannot be used at all. Acting on it is yours.
 
@@ -159,7 +159,7 @@ When something is wrong rather than merely worth knowing:
 claude-window doctor
 ```
 
-It checks what otherwise fails silently: accounts that are secretly the same login, a lapsed subscription, a sign-in that no longer works or is about to expire, timers that stopped, runs that started but never finished, a machine clock that disagrees with Claude's, leftover units from an older install — and the one failure specific to this design, **your own Claude Code being signed in as an account nobody is pinging**, where every other check passes while you get no benefit at all.
+It checks what otherwise fails silently: accounts that are secretly the same login, a lapsed subscription, a sign-in that no longer works or is about to expire, timers that stopped, runs that started but never finished, a checkpoint that no ping can resume because it belongs to an older layout, a machine clock that disagrees with Claude's, leftover units from an older install — and the one failure specific to this design, **your own Claude Code being signed in as an account nobody is pinging**, where every other check passes while you get no benefit at all.
 
 Every run is logged, so the log doubles as a record of your usage through the day:
 
@@ -261,11 +261,11 @@ Uninstalling stops the timers and removes every unit, and by default leaves this
 |---|---|
 | `claude_early_window.py` | The whole tool. |
 | `install.sh` / `uninstall.sh` | Prerequisite checks, then the wizard; and the teardown. |
-| `test_early_window.py` | Over 600 checks. `python3 test_early_window.py`. |
+| `test_early_window.py` | Over 640 checks. `python3 test_early_window.py`. |
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 
-Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool; `~/.claude` and `~/.claude.json` are never touched.
+Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool, including the empty `pingcwd` inside each that its pings run from; `~/.claude` and `~/.claude.json` are never touched.
 
 The tests cover the decisions that fail silently — which reset time to believe, how to space windows for the least dead time, whether a ping can start a window at the wrong moment, which accounts are safe to recommend, and whether anything writes where it should not — along with the words each command prints in each state it can be in, because a recommendation nobody can act on is a bug too. A full install, uninstall, purge and re-install runs end to end in a sandboxed home directory. They spend no usage: a fake CLI stands in for Claude, so all of that can be exercised with no account at all, and nothing they do touches a running install.
 
@@ -281,11 +281,20 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 
 - Not affiliated with or endorsed by Anthropic. Running an automated background process against a subscription around the clock may conflict with Anthropic's terms of service, and using several subscriptions to raise your own ceiling is at best a grey area. Both are your call; this makes no claim that either is permitted.
 - Pings are cheap but not free, and they also draw a little from the separate **weekly** limit — about 48 pings a day per account.
+- Pings ask Claude for no thinking and never update the CLI. Thinking is billed as output and a ping's reply is discarded; an update rewrites the tool definitions that sit at the front of every cached prompt, which would make your own open sessions expensive to resume. Neither affects how you run Claude Code yourself.
 - Accounts must be genuinely different Claude accounts. Signing in twice as the same one looks like it works and buys nothing; setup checks for it.
 - **Do not use `/login` or `/logout` inside a ping directory.** That is how the tool knows which account it is pinging. Change accounts by editing `accounts.json` and re-running `./install.sh`.
 - A booked correction does not survive a reboot. Harmless: the next ordinary ping reads the reset times again and books another.
 - It relies on where Claude Code stores sessions and on the window reset time it reports. Both are internal details that a future release could change; the tests would notice, and `doctor` reports what it can verify.
 - Linux with systemd only. macOS and Windows are not supported.
+
+## Where the pings run
+
+Each account pings from an empty directory of its own, `~/.claude-<n>/pingcwd`, and not from this checkout.
+
+Claude Code puts the working directory's branch, working-tree status and recent commits into the **cached** part of every prompt. A ping running inside a git repository therefore loses its cache every time that repository changes — and the repository this ships from is one somebody commits to. In a week of logs that was the sole cause of every cache miss: a clean sweep of hits, broken only by the hours when commits were landing in the working directory.
+
+An empty directory has nothing left to change, which is the whole point. The checkpoint conversation is registered against the directory it was created in and cannot be resumed from anywhere else, so if you upgrade from a version that pinged elsewhere, `./install.sh` rebuilds it — one message per account. `claude-window doctor` says so if it ever needs doing.
 
 ## Why 30 minutes
 
