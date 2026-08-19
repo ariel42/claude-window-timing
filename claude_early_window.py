@@ -697,6 +697,15 @@ def publish_schedule(accounts):
             "name": account.name,
             "label": account.label,
             "config_dir": account.config_dir,
+            # Which account this actually is, not merely which slot it occupies.
+            # A copy of this file on another machine keys on `name` and
+            # `config_dir`, both of which are positional: if that machine's
+            # directories were created in a different order, or one was signed
+            # in again as someone else, the advice would name the wrong account
+            # with nothing to notice it by. The uuid is the only field that
+            # travels. Email is deliberately left out — this file gets copied
+            # between machines, and a uuid identifies without disclosing.
+            "account_uuid": account_identity(account).get("account_uuid"),
             "window_phase": (expiry % window) if expiry != float("inf") else None,
             "expires_at": expiry if expiry != float("inf") else None,
             "available_at": state.get("available_at"),
@@ -1379,6 +1388,18 @@ def build_claude_env(account):
                  + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         PING_MARKER_ENV: "1",
         "CLAUDE_CONFIG_DIR": account.config_dir,
+        # A ping's reply is thrown away, but thinking tokens are billed as
+        # output — and output is the expensive half. Measured on a real
+        # account: 'bye' with thinking costs 37 output tokens, without it 4.
+        # Wording the prompt to demand brevity does not help and made it
+        # worse (41 tokens), because the instruction is itself something to
+        # think about. Turning thinking off is the whole saving.
+        "MAX_THINKING_TOKENS": "0",
+        # Nothing here should upgrade the CLI behind the user's back: an
+        # update changes the tool schemas that sit at the front of every
+        # cached prompt prefix, so a background ping could silently make
+        # every session the user has open expensive to resume.
+        "DISABLE_AUTOUPDATER": "1",
     }
     for key in _ENV_PASSTHROUGH:
         if key in os.environ:
@@ -1553,6 +1574,43 @@ def read_statusline_limits(account):
         if isinstance(limits, dict) and limits:
             latest = limits
     return latest
+
+
+# How far into the future a previously-known reset must still be before a
+# claimed rollover is treated as impossible. Small, because the only thing being
+# guarded against is a reading that contradicts arithmetic, not one that is
+# merely surprising.
+ROLLOVER_SLACK_SEC = 60
+
+
+def implausible_limits(new, previous, now):
+    """
+    Why `new` cannot be believed given `previous`, or None if it can.
+
+    A window cannot begin again before the end of the one before it. So a
+    reading that reports a *later* reset time while the reset we already knew
+    about is still in the future is describing something that cannot have
+    happened, and is discarded rather than acted on.
+
+    This is not hypothetical. A run once reported "5-hour 3%, resets in exactly
+    4h00m00s, weekly 20%, resets in exactly 72h00m00s" — round numbers measured
+    from the moment of the run, i.e. placeholders rather than observations —
+    fourteen minutes before the same account correctly reported 99% with its
+    real reset time. Believed, it moved the account's boundary three hours late
+    and produced a recommendation to hold an account back for two hours.
+    """
+    if not previous:
+        return None
+    for key, name in _LIMIT_NAMES:
+        was = (previous.get(key) or {}).get("resets_at")
+        now_says = (new.get(key) or {}).get("resets_at")
+        if not was or not now_says:
+            continue
+        if now_says > was and was > now + ROLLOVER_SLACK_SEC:
+            return ("{} claims to reset at {} but the reset already known, {}, "
+                    "has not passed yet".format(name, fmt_time(now_says),
+                                                fmt_time(was)))
+    return None
 
 
 def fmt_pct(used):
@@ -2279,8 +2337,14 @@ def ping(account, accounts=None):
     # exactly via the statusLine; a refused one says so in the refusal text.
     limits = read_statusline_limits(account)
     if limits:
-        state["rate_limits"] = limits
-        state["limits_source"] = "statusline"
+        why = implausible_limits(limits, state.get("rate_limits"), time.time())
+        if why:
+            log(account, "Ignoring this run's usage report: {}. Keeping the "
+                         "previous figures.".format(why))
+            limits = state.get("rate_limits") or {}
+        else:
+            state["rate_limits"] = limits
+            state["limits_source"] = "statusline"
 
     boundary, horizon, label = next_window_start(
         limits, result["text"], result["limited"])
@@ -2764,9 +2828,12 @@ def which(accounts, states=None, avail=None, published_at=None):
 
 BIN_DIR = os.path.join(SCRIPT_DIR, "bin")
 
+# The interpreter is resolved at generation time rather than hardcoded:
+# /usr/bin/python3 does not exist on NixOS, on Homebrew Python installs, or in
+# many containers, and the tool would install cleanly and then fail to run.
 _ENTRY_POINT = '''#!/usr/bin/env bash
 # Generated by claude-early-window. Put this directory on your PATH.
-exec /usr/bin/python3 {script} "$@"
+exec {python} {script} "$@"
 '''
 
 
@@ -2783,7 +2850,9 @@ def write_entry_point():
         os.makedirs(BIN_DIR, 0o755)
     path = os.path.join(BIN_DIR, COMMAND)
     with open(path, "w") as f:
-        f.write(_ENTRY_POINT.format(script=shlex.quote(os.path.abspath(__file__))))
+        f.write(_ENTRY_POINT.format(
+            python=shlex.quote(sys.executable or "/usr/bin/python3"),
+            script=shlex.quote(os.path.abspath(__file__))))
     os.chmod(path, 0o755)
     return path
 
@@ -3021,7 +3090,7 @@ Description=Claude Code Early Window — ping for account %i
 [Service]
 Type=oneshot
 WorkingDirectory={script_dir}
-ExecStart=/usr/bin/python3 {script} ping %i
+ExecStart={python} {script} ping %i
 # PATH so the script can locate the claude CLI; HOME comes from the user manager.
 Environment=PATH={home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -3103,6 +3172,7 @@ def install_units(accounts):
     script = os.path.abspath(__file__)
     with open(os.path.join(UNIT_DIR, "claude-early-window@.service"), "w") as f:
         f.write(_SERVICE_UNIT.format(script_dir=SCRIPT_DIR, script=script,
+                                     python=sys.executable or "/usr/bin/python3",
                                      home=HOME))
     with open(os.path.join(UNIT_DIR, "claude-early-window@.timer"), "w") as f:
         f.write(_TIMER_UNIT.format(interval=INTERVAL_MIN))

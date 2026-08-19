@@ -1244,6 +1244,60 @@ def test_an_unusable_login_is_never_recommended():
           ew.account_availability(elsewhere, fresh, now).tier, ew.USABLE)
 
 
+def test_an_impossible_usage_report_is_ignored():
+    section("a usage report that contradicts arithmetic is not believed")
+    now = time.time()
+
+    # The real case: a run reported a fresh window resetting in exactly four
+    # hours while the reset it already knew about was still an hour away.
+    known = {"five_hour": {"resets_at": now + 3600, "used_percentage": 99}}
+    placeholder = {"five_hour": {"resets_at": now + 4 * 3600, "used_percentage": 3}}
+    why = ew.implausible_limits(placeholder, known, now)
+    check_true("a rollover before the known reset is rejected", bool(why))
+    check_true("the reason names the impossible reset",
+               why and "has not passed yet" in why)
+
+    # A genuine rollover, observed after the previous window actually ended.
+    later = now + 3700
+    check("a rollover after the known reset is believed",
+          ew.implausible_limits({"five_hour": {"resets_at": later + 5 * 3600,
+                                               "used_percentage": 0}},
+                                known, later), None)
+
+    # An ordinary reading inside the same window, usage climbing.
+    check("usage rising inside one window is believed",
+          ew.implausible_limits({"five_hour": {"resets_at": now + 3600,
+                                               "used_percentage": 40}},
+                                known, now), None)
+
+    # Nothing to compare against yet.
+    check("the first reading is always believed",
+          ew.implausible_limits(placeholder, {}, now), None)
+
+    # The weekly limit is guarded on the same principle.
+    check_true("a weekly rollover before its reset is rejected",
+               bool(ew.implausible_limits(
+                   {"seven_day": {"resets_at": now + 72 * 3600}},
+                   {"seven_day": {"resets_at": now + 3600}}, now)))
+
+
+def test_schedule_carries_account_identity():
+    section("schedule.json says which account, not merely which slot")
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    ew.SCHEDULE_FILE = os.path.join(ew.STATE_ROOT, "schedule.json")
+    account = ew.Account("1", tempfile.mkdtemp(), 0)
+    account.ensure_state_dir()
+    with open(account.config_json, "w") as f:
+        json.dump({"oauthAccount": {"accountUuid": "uuid-abc",
+                                    "emailAddress": "someone@example.com"}}, f)
+
+    ew.publish_schedule([account])
+    entry = json.load(open(ew.SCHEDULE_FILE))["accounts"][0]
+    check("the uuid travels with the entry", entry.get("account_uuid"), "uuid-abc")
+    check_true("the email does not, because this file gets copied around",
+               "someone@example.com" not in json.dumps(entry))
+
+
 def test_schedule_is_publishable_for_other_machines():
     section("schedule.json carries enough for a laptop to choose on its own")
     now = time.time()
@@ -3733,6 +3787,8 @@ def main():
 
     for test in (test_refusal_text, test_next_window_start, test_guard_rails,
                  test_anchor_scheduling, test_statusline_parsing,
+                 test_an_impossible_usage_report_is_ignored,
+                 test_schedule_carries_account_identity,
                  test_the_status_line_writes_only_where_it_was_told,
                  test_resume_baseline_race, test_without_systemd, test_formatting,
                  test_usage_line, test_init_refuses_to_checkpoint_a_refusal,
