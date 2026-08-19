@@ -3119,11 +3119,19 @@ def setup(argv_accounts=None):
     built = []
     for account in accounts:
         if os.path.exists(account.session_id_file) and \
-           os.path.exists(account.checkpoint_backup):
+           os.path.exists(account.checkpoint_backup) and \
+           checkpoint_is_for_this_cwd(account):
             continue
         print()
-        print("Creating account {}'s background conversation...".format(
-            account.display))
+        if os.path.exists(account.checkpoint_backup):
+            # An upgrade moved where pings run, so the existing conversation is
+            # registered against a directory it will never be resumed from.
+            print("Rebuilding account {}'s background conversation — the old "
+                  "one belongs to a working directory this no longer uses..."
+                  .format(account.display))
+        else:
+            print("Creating account {}'s background conversation...".format(
+                account.display))
         init(account)
         built.append(account)
 
