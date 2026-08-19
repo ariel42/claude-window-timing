@@ -143,6 +143,11 @@ class Account(object):
         self.state_dir         = os.path.join(STATE_ROOT, name)
         self.session_id_file   = os.path.join(self.state_dir, "session_id.txt")
         self.checkpoint_backup = os.path.join(self.state_dir, "checkpoint.jsonl.bak")
+        # Which working directory the checkpoint was built for. Claude Code
+        # registers a session against the directory it was created in and will
+        # not resume it from anywhere else, so a checkpoint made under an older
+        # layout has to be rebuilt rather than moved.
+        self.checkpoint_cwd_file = os.path.join(self.state_dir, "checkpoint_cwd.txt")
         self.state_file        = os.path.join(self.state_dir, "state.json")
         self.statusline_file   = os.path.join(self.state_dir, "statusline.jsonl")
         # Per-account rather than one shared log: rotate_log() rewrites the whole
@@ -151,6 +156,23 @@ class Account(object):
         self.log_file          = os.path.join(self.state_dir, "ping.log")
 
     # -- Claude Code's own layout --------------------------------------------
+
+    @property
+    def ping_cwd(self):
+        """
+        The directory a ping runs in: <config dir>/pingcwd, empty and permanent.
+
+        Not this checkout, which is what earlier versions used. Claude Code puts
+        the working directory's branch, working-tree status and recent commits
+        into the *cached* part of every prompt, so a ping that runs inside a git
+        repository loses its cache every time that repository changes — and the
+        repository this tool ships from is one its own author commits to. A week
+        of logs bore that out: a 100% cache hit rate except during the three
+        hours when commits were landing here, and every miss in that stretch.
+
+        Empty and outside any repository, there is nothing left to change.
+        """
+        return os.path.join(self.config_dir, "pingcwd")
 
     @property
     def session_dir(self):
@@ -163,7 +185,7 @@ class Account(object):
         for its checkpoint in the first account's tree.
         """
         return os.path.join(self.config_dir, "projects",
-                            SCRIPT_DIR.replace("/", "-"))
+                            self.ping_cwd.replace("/", "-"))
 
     # -- systemd --------------------------------------------------------------
 
@@ -247,11 +269,13 @@ def ensure_ping_config(account):
     """
     if not os.path.isdir(account.config_dir):
         os.makedirs(account.config_dir, 0o700)
+    if not os.path.isdir(account.ping_cwd):
+        os.makedirs(account.ping_cwd, 0o700)
     config = _read_json(account.config_json)
     changed = False
-    for key, value in ping_config(SCRIPT_DIR).items():
+    for key, value in ping_config(account.ping_cwd).items():
         if key == "projects":
-            entry = config.setdefault("projects", {}).setdefault(SCRIPT_DIR, {})
+            entry = config.setdefault("projects", {}).setdefault(account.ping_cwd, {})
             if not entry.get("hasTrustDialogAccepted"):
                 entry["hasTrustDialogAccepted"] = True
                 changed = True
@@ -1964,13 +1988,73 @@ def backup_checkpoint(account, session_id):
         os.path.getsize(account.checkpoint_backup)))
 
 
+def ensure_ping_cwd(account):
+    """
+    Create the account's ping working directory if absent, and return it.
+
+    Called from every place that spawns Claude, because a working directory that
+    does not exist turns an ordinary run into "could not run the CLI" — which
+    reads as a broken login rather than a missing directory.
+    """
+    try:
+        if not os.path.isdir(account.ping_cwd):
+            os.makedirs(account.ping_cwd, 0o700)
+    except OSError:
+        # Fall back to somewhere that certainly exists rather than fail the run.
+        return account.config_dir if os.path.isdir(account.config_dir) else HOME
+    return account.ping_cwd
+
+
+def checkpoint_is_for_this_cwd(account):
+    """
+    Whether the stored checkpoint can actually be resumed where pings now run.
+
+    Claude Code resolves `--resume <id>` through a per-account registry that
+    records the directory a session was created in; resuming from anywhere else
+    answers "No conversation found". A checkpoint from an install that pinged
+    somewhere else is therefore unusable, and unusable in a way that looks like
+    a working install until the first ping fails.
+
+    An absent marker means the checkpoint predates this file, which is exactly
+    the case that needs rebuilding.
+    """
+    if not os.path.exists(account.checkpoint_backup):
+        return True          # nothing to be wrong about yet
+    return _read_text(account.checkpoint_cwd_file).strip() == account.ping_cwd
+
+
 def restore_checkpoint(account, session_id):
     # The session directory belongs to Claude Code and may not exist yet on a
     # freshly created account, so make it rather than assume it.
     if not os.path.isdir(account.session_dir):
         os.makedirs(account.session_dir, 0o700)
-    shutil.copy2(account.checkpoint_backup, _session_file(account, session_id))
-    log(account, "Checkpoint restored to frozen 'hi' state")
+
+    # Every transcript line records the directory the session ran in, and Claude
+    # Code will not resume a session whose recorded directory is not the one it
+    # is being resumed from — it belongs to a different project. Rewriting the
+    # field on restore is what lets the working directory move at all, and makes
+    # a checkpoint taken under an older layout usable under a newer one without
+    # asking the user to re-initialise (which would cost a window).
+    written = 0
+    with open(account.checkpoint_backup) as src, \
+            open(_session_file(account, session_id), "w") as dst:
+        for line in src:
+            stripped = line.strip()
+            if stripped:
+                try:
+                    entry = json.loads(stripped)
+                except ValueError:
+                    dst.write(line)
+                    continue
+                if isinstance(entry, dict) and entry.get("cwd") is not None:
+                    entry["cwd"] = account.ping_cwd
+                    written += 1
+                dst.write(json.dumps(entry) + "\n")
+            else:
+                dst.write(line)
+    log(account, "Checkpoint restored to frozen 'hi' state"
+                 + (" ({} line(s) repointed at {})".format(written, account.ping_cwd)
+                    if written else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -2082,7 +2166,7 @@ def run_interactive(account, extra_args, prompt_text, session_id,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
-            cwd=SCRIPT_DIR,
+            cwd=ensure_ping_cwd(account),
             preexec_fn=os.setsid,
             env=build_claude_env(account),
         )
@@ -2228,6 +2312,18 @@ def init(account):
     Must be run once per account before its systemd timer starts.
     """
     if os.path.exists(account.session_id_file) and \
+       os.path.exists(account.checkpoint_backup) and \
+       not checkpoint_is_for_this_cwd(account):
+        print("Account {}: the existing checkpoint was built for another "
+              "working directory, so it cannot be resumed. Rebuilding it."
+              .format(account.display))
+        for path in (account.session_id_file, account.checkpoint_backup):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    if os.path.exists(account.session_id_file) and \
        os.path.exists(account.checkpoint_backup):
         print("Account {}: checkpoint already exists.".format(account.display))
         print("  Session: {}".format(_read_text(account.session_id_file).strip()))
@@ -2271,6 +2367,8 @@ def init(account):
         f.write(checkpoint_id)
 
     backup_checkpoint(account, checkpoint_id)
+    with open(account.checkpoint_cwd_file, "w") as f:
+        f.write(account.ping_cwd)
     log(account, f"Checkpoint ready: {checkpoint_id}")
 
 
@@ -2307,6 +2405,14 @@ def ping(account, accounts=None):
        not os.path.exists(account.checkpoint_backup):
         log(account, "ERROR: No checkpoint for account {}. Run ./install.sh to "
                      "initialise.".format(account.name))
+        sys.exit(1)
+
+    if not checkpoint_is_for_this_cwd(account):
+        log(account, "ERROR: account {}'s checkpoint was built for another "
+                     "working directory and cannot be resumed from {}. This "
+                     "happens after an upgrade that moved where pings run. "
+                     "Run ./install.sh to rebuild it — one message per account."
+                     .format(account.name, account.ping_cwd))
         sys.exit(1)
 
     with open(account.session_id_file) as f:
@@ -2553,6 +2659,14 @@ def doctor(accounts):
             findings.append(Finding(
                 "error", "Account {} has no checkpoint".format(account.name),
                 "Run ./install.sh"))
+        elif not checkpoint_is_for_this_cwd(account):
+            # Invisible otherwise: everything looks installed, and every ping
+            # fails for a reason that is only in the log.
+            findings.append(Finding(
+                "error",
+                "Account {}'s checkpoint was built for a different working "
+                "directory, so no ping can resume it".format(account.name),
+                "Run ./install.sh to rebuild it — one message per account"))
 
         ok, detail = account_auth_ok(account)
         if not ok:
@@ -2703,7 +2817,8 @@ def account_auth_ok(account):
     try:
         result = subprocess.run(
             [CLAUDE_PATH, "auth", "status", "--json"],
-            env=build_claude_env(account), cwd=SCRIPT_DIR, timeout=60,
+            env=build_claude_env(account), cwd=ensure_ping_cwd(account),
+            timeout=60,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             universal_newlines=True)
     except (OSError, ValueError, subprocess.SubprocessError):

@@ -36,6 +36,13 @@ import claude_early_window as ew
 FAILURES = []
 
 
+def stamp_checkpoint(account):
+    """Mark a fabricated checkpoint as built for this account's ping directory."""
+    account.ensure_state_dir()
+    with open(account.checkpoint_cwd_file, "w") as f:
+        f.write(account.ping_cwd)
+
+
 def check(name, got, want):
     if got == want:
         print("  PASS  {}".format(name))
@@ -533,7 +540,18 @@ def test_account_paths():
                first.session_dir != second.session_dir)
     check_true("the session dir keeps Claude Code's mangled-cwd layout",
                second.session_dir.endswith(
-                   os.path.join("projects", ew.SCRIPT_DIR.replace("/", "-"))))
+                   os.path.join("projects", second.ping_cwd.replace("/", "-"))))
+
+    # The whole point of the ping directory: a working directory whose contents
+    # never change, because Claude Code puts the working directory's git state
+    # into the cached part of every prompt. Running in this checkout meant the
+    # cache died every time the repository did.
+    check_true("a ping runs inside its own account directory",
+               second.ping_cwd.startswith(second.config_dir))
+    check_true("and not in this checkout",
+               not second.ping_cwd.startswith(ew.SCRIPT_DIR))
+    check_true("the two accounts do not share a working directory",
+               first.ping_cwd != second.ping_cwd)
 
     for attr in ("state_dir", "session_id_file", "checkpoint_backup",
                  "state_file", "statusline_file", "log_file"):
@@ -888,6 +906,7 @@ def test_two_accounts_stay_out_of_each_others_files():
             account.ensure_state_dir()
             with open(account.session_id_file, "w") as f:
                 f.write("session-" + account.name)
+            stamp_checkpoint(account)
             with open(account.checkpoint_backup, "w") as f:
                 f.write("{}\n")
             ew.ping(account)
@@ -1244,6 +1263,47 @@ def test_an_unusable_login_is_never_recommended():
           ew.account_availability(elsewhere, fresh, now).tier, ew.USABLE)
 
 
+def test_a_checkpoint_from_another_directory_is_rebuilt():
+    section("a checkpoint that cannot be resumed where pings run is noticed")
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    account = ew.Account("1", tempfile.mkdtemp(), 0)
+    account.ensure_state_dir()
+
+    check_true("nothing to be wrong about before there is a checkpoint",
+               ew.checkpoint_is_for_this_cwd(account))
+
+    with open(account.checkpoint_backup, "w") as f:
+        f.write("{}\n")
+    if os.path.exists(account.checkpoint_cwd_file):
+        os.remove(account.checkpoint_cwd_file)
+    check_true("a checkpoint with no recorded directory is treated as stale",
+               not ew.checkpoint_is_for_this_cwd(account))
+
+    with open(account.checkpoint_cwd_file, "w") as f:
+        f.write("/somewhere/else")
+    check_true("and so is one recorded against another directory",
+               not ew.checkpoint_is_for_this_cwd(account))
+
+    with open(account.checkpoint_cwd_file, "w") as f:
+        f.write(account.ping_cwd)
+    check_true("one built here is usable", ew.checkpoint_is_for_this_cwd(account))
+
+    # And the same condition is what doctor reports, since a ping failing every
+    # half hour for a reason only in the log is the failure mode to avoid.
+    with open(account.session_id_file, "w") as f:
+        f.write("11111111-2222-3333-4444-555555555555")
+    with open(account.checkpoint_cwd_file, "w") as f:
+        f.write("/somewhere/else")
+    held, sys.stdout = sys.stdout, io.StringIO()
+    try:
+        ew.doctor([account])
+        said = sys.stdout.getvalue()
+    finally:
+        sys.stdout = held
+    check_true("doctor says so", "different working directory" in said)
+    check_true("and names the fix", "install.sh" in said)
+
+
 def test_an_impossible_usage_report_is_ignored():
     section("a usage report that contradicts arithmetic is not believed")
     now = time.time()
@@ -1474,7 +1534,7 @@ def test_a_login_that_stopped_working_is_reported():
         account = ew.Account("1", os.path.join(root, "cfg"), 0)
 
         def answers(report):
-            control = os.path.join(root, ".fake_claude.json")
+            control = os.path.join(account.config_dir, ".fake_claude.json")
             with open(control, "w") as f:
                 json.dump({"auth": report}, f)
             return ew.account_auth_ok(account)
@@ -1638,6 +1698,7 @@ def test_the_status_display_shows_the_unusual_parts():
         account.ensure_state_dir()
         with open(account.session_id_file, "w") as f:
             f.write("abc-123\n")
+        stamp_checkpoint(account)
         open(account.checkpoint_backup, "w").close()
         ew.write_state(account, {
             "last_run": now - 120,
@@ -2206,6 +2267,7 @@ def test_what_a_ping_records_from_how_it_went():
                                          "subscriptionType": "max"}}, f)
         with open(account.session_id_file, "w") as f:
             f.write("sess\n")
+        stamp_checkpoint(account)
         open(account.checkpoint_backup, "w").close()
 
         def ping_with(result, limits):
@@ -2285,6 +2347,7 @@ def test_a_hold_suppresses_the_ping_and_nothing_else():
     account = temp_account()
     with open(account.session_id_file, "w") as f:
         f.write("sid")
+    stamp_checkpoint(account)
     with open(account.checkpoint_backup, "w") as f:
         f.write("{}\n")
 
@@ -2352,6 +2415,7 @@ def test_an_unusable_account_is_still_pinged():
     account = temp_account()
     with open(account.session_id_file, "w") as f:
         f.write("sid")
+    stamp_checkpoint(account)
     with open(account.checkpoint_backup, "w") as f:
         f.write("{}\n")
 
@@ -2538,6 +2602,7 @@ def test_setup_and_init_refuse_the_obviously_wrong():
         account.ensure_state_dir()
         with open(account.session_id_file, "w") as f:
             f.write("kept-session\n")
+        stamp_checkpoint(account)
         with open(account.checkpoint_backup, "w") as f:
             f.write("{}\n")
         buf = io.StringIO()
@@ -2902,10 +2967,12 @@ def _clean_install(answers, accounts=2, claude_control=None,
     os.environ["HOME"] = home
     sys.stdin = io.StringIO(answers)
     if claude_control:
-        with open(os.path.join(repo, "fake_claude.json"), "w") as f:
-            json.dump(claude_control, f)
-        os.rename(os.path.join(repo, "fake_claude.json"),
-                  os.path.join(repo, ".fake_claude.json"))
+        for slot in range(1, accounts + 1):
+            config = os.path.join(home, ".claude-{}".format(slot))
+            if not os.path.isdir(config):
+                os.makedirs(config, 0o700)
+            with open(os.path.join(config, ".fake_claude.json"), "w") as f:
+                json.dump(claude_control, f)
 
     # Sign both accounts in, as far as anything here can tell. Tolerant of
     # directories that already exist, because a second install over the same
@@ -3061,10 +3128,17 @@ def test_a_clean_install_from_nothing():
         check_true("account {}'s config was written by us".format(name),
                    ew._read_json(os.path.join(d, ".claude.json"))
                    .get("hasCompletedClaudeInChromeOnboarding") is True)
+    ping_cwd = os.path.join(home, ".claude-1", "pingcwd")
     check_true("account 1's checkpoint is in its own directory",
                os.path.exists(os.path.join(home, ".claude-1", "projects",
-                                           repo.replace("/", "-"),
+                                           ping_cwd.replace("/", "-"),
                                            first + ".jsonl")))
+    check_true("the ping working directory was created, and is empty",
+               os.path.isdir(ping_cwd) and not [
+                   e for e in os.listdir(ping_cwd) if not e.startswith(".")])
+    check_true("setup did not leave a checkpoint under this checkout",
+               not os.path.isdir(os.path.join(home, ".claude-1", "projects",
+                                              repo.replace("/", "-"))))
 
     units = os.path.join(home, ".config", "systemd", "user")
     check_true("the unit template is written",
@@ -3788,6 +3862,7 @@ def main():
     for test in (test_refusal_text, test_next_window_start, test_guard_rails,
                  test_anchor_scheduling, test_statusline_parsing,
                  test_an_impossible_usage_report_is_ignored,
+                 test_a_checkpoint_from_another_directory_is_rebuilt,
                  test_schedule_carries_account_identity,
                  test_the_status_line_writes_only_where_it_was_told,
                  test_resume_baseline_race, test_without_systemd, test_formatting,

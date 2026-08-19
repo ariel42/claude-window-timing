@@ -42,10 +42,28 @@ import uuid
 CONTROL_FILE = ".fake_claude.json"
 
 
+def _control_path():
+    """
+    Where the control file lives: the working directory, or failing that the
+    config directory.
+
+    Two places rather than one because the tool's working directory is its own
+    business and has changed once already; the config directory is passed in
+    CLAUDE_CONFIG_DIR and is the one thing a stand-in can always find.
+    """
+    here = os.path.join(os.getcwd(), CONTROL_FILE)
+    if os.path.exists(here):
+        return here
+    config = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config:
+        return os.path.join(config, CONTROL_FILE)
+    return here
+
+
 def control():
     """How this run should behave. Missing file means 'like a healthy account'."""
     try:
-        with open(os.path.join(os.getcwd(), CONTROL_FILE)) as f:
+        with open(_control_path()) as f:
             return json.load(f)
     except (IOError, OSError, ValueError):
         return {}
