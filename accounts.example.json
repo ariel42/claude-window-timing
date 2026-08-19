@@ -6,7 +6,9 @@
     "thing that makes one Claude login distinct from another, so two entries",
     "sharing one would silently be the same account twice.",
     "These directories belong to this tool. Your own ~/.claude is never one of",
-    "them and is never read or written.",
+    "them, and nothing that runs on a timer reads or writes it. The one command",
+    "that does is `claude-window switch`, which parks a separate login per",
+    "account under ~/.claude-switch/ and points your own Claude Code at one.",
     "Log in to each with:  CLAUDE_CONFIG_DIR=~/.claude-2 claude   then /login",
     "Logging in sends no message, so it never starts a usage window."
   ],

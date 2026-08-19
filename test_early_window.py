@@ -23,6 +23,7 @@ import os
 import pty
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2210,7 +2211,11 @@ def test_the_json_report_is_a_contract():
 
     document = json.loads(buf.getvalue())      # fails loudly if anything else printed
     check("the top level says what it is and what to do",
-          sorted(document), ["accounts", "generated_at", "use"])
+          sorted(document), ["accounts", "generated_at", "switching", "use"])
+    check("including which account the user's own Claude Code is on",
+          sorted(document["switching"]), ["configured", "current_account"])
+    check("reported as unconfigured until a store exists",
+          document["switching"], {"configured": False, "current_account": None})
     check("the recommendation names an account and its directory",
           sorted(document["use"]), ["account", "config_dir", "reason"])
     check("it recommends the account that can actually be used",
@@ -2946,7 +2951,8 @@ def _clean_install(answers, accounts=2, claude_control=None,
              ew.BIN_DIR, ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE,
              ew._systemctl, ew._run, sys.stdin, os.environ.get("HOME"),
              ew.STARTUP_WAIT_SEC, ew.COMPLETION_TIMEOUT_SEC,
-             ew.STATUSLINE_WAIT_SEC)
+             ew.STATUSLINE_WAIT_SEC,
+             ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON, ew.SWITCH_ROOT)
     calls = []
 
     def record(cmd):
@@ -2965,6 +2971,12 @@ def _clean_install(answers, accounts=2, claude_control=None,
     ew.BIN_DIR = os.path.join(repo, "bin")
     ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
     ew.SCHEDULE_FILE = os.path.join(repo, "schedule.json")
+    # Derived from HOME at import time, so rebinding HOME alone would leave
+    # these three pointing at the real user's files — which is the one thing a
+    # test of this tool must never touch.
+    ew.USER_CONFIG_DIR = os.path.join(home, ".claude")
+    ew.USER_CONFIG_JSON = os.path.join(home, ".claude.json")
+    ew.SWITCH_ROOT = os.path.join(home, ".claude-switch")
     ew._systemctl = lambda *a: record(("systemctl",) + a)
     ew._run = record
     # A stand-in Claude answers instantly, so the fixed pauses meant for a real
@@ -3012,7 +3024,8 @@ def _clean_install(answers, accounts=2, claude_control=None,
          ew.CLAUDE_PATH, ew.UNIT_DIR, ew.BIN_DIR,
          ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE, ew._systemctl,
          ew._run, sys.stdin, old_home, ew.STARTUP_WAIT_SEC,
-         ew.COMPLETION_TIMEOUT_SEC, ew.STATUSLINE_WAIT_SEC) = saved
+         ew.COMPLETION_TIMEOUT_SEC, ew.STATUSLINE_WAIT_SEC,
+         ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON, ew.SWITCH_ROOT) = saved
         if old_home is not None:
             os.environ["HOME"] = old_home
     return code, home, repo, calls
@@ -3549,7 +3562,7 @@ def test_every_command_routes_to_the_thing_it_names():
 
         check("status --json is JSON and nothing else",
               sorted(json.loads(run(["status", "--json"])[1])),
-              ["accounts", "generated_at", "use"])
+              ["accounts", "generated_at", "switching", "use"])
 
         code, said, _ = run(["which"])
         check("which succeeds", code, 0)
@@ -3861,6 +3874,702 @@ def test_uninstall_removes_the_units_and_nothing_else():
         ew.UNIT_DIR, ew.BIN_DIR, ew._systemctl, ew._run, ew.HOME = saved
 
 
+
+# ---------------------------------------------------------------------------
+# Switching your own Claude Code between accounts
+# ---------------------------------------------------------------------------
+
+
+def _capture(fn):
+    """Run fn with stdout and stderr captured. Returns (out, err, result)."""
+    out, err = io.StringIO(), io.StringIO()
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out, err
+    try:
+        result = fn()
+    finally:
+        sys.stdout, sys.stderr = saved
+    return out.getvalue(), err.getvalue(), result
+
+
+def _tree_snapshot(root):
+    """{path: bytes} for every file under root, for before/after comparison."""
+    out = {}
+    for base, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(base, name)
+            try:
+                with open(path, "rb") as f:
+                    out[path] = f.read()
+            except (IOError, OSError):
+                pass
+    return out
+
+
+def _snapshot_user_files():
+    """The two files a switch is allowed to rewrite, exactly as they are now."""
+    out = {}
+    for path in (ew.credentials_path(ew.user_login()), ew.USER_CONFIG_JSON):
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                out[path] = f.read()
+    return out
+
+
+def _switch_sandbox(names=("1", "2"), signed_in_as=None, parked=(), now=None):
+    """
+    A home directory with ping directories, a signed-in ~/.claude, and stores.
+
+    Returns (restore, home, accounts). `signed_in_as` is the account name the
+    user's own Claude Code holds; `parked` names the accounts with a login in
+    their store. Every login is given a distinct refresh token, because telling
+    two *copies* of one login apart from two separate logins is the whole point
+    of several checks here.
+    """
+    now = time.time() if now is None else now
+    root = tempfile.mkdtemp()
+    home = os.path.join(root, "home")
+    os.makedirs(home)
+
+    saved = (ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON, ew.SWITCH_ROOT,
+             ew.STATE_ROOT)
+    ew.HOME = home
+    ew.USER_CONFIG_DIR = os.path.join(home, ".claude")
+    ew.USER_CONFIG_JSON = os.path.join(home, ".claude.json")
+    ew.SWITCH_ROOT = os.path.join(home, ".claude-switch")
+    ew.STATE_ROOT = os.path.join(root, "state")
+
+    def restore():
+        (ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON, ew.SWITCH_ROOT,
+         ew.STATE_ROOT) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+    def write_login(directory, config_json, uuid_, email, refresh,
+                    refresh_expires=None, extra=None):
+        if not os.path.isdir(directory):
+            os.makedirs(directory, 0o700)
+        with open(os.path.join(directory, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {
+                "accessToken": "access-" + refresh,
+                "refreshToken": refresh,
+                "subscriptionType": "pro",
+                "refreshTokenExpiresAt": int(
+                    (refresh_expires if refresh_expires is not None
+                     else now + 30 * 86400) * 1000)}}, f)
+        config = {"oauthAccount": {"accountUuid": uuid_, "emailAddress": email}}
+        config.update(extra or {})
+        directory_of = os.path.dirname(config_json)
+        if directory_of and not os.path.isdir(directory_of):
+            os.makedirs(directory_of, 0o700)
+        with open(config_json, "w") as f:
+            json.dump(config, f)
+
+    accounts = []
+    for index, name in enumerate(names):
+        account = ew.Account(name, os.path.join(home, ".claude-" + name), index,
+                             "label" + name)
+        accounts.append(account)
+        # The ping directory's own login: always distinct from the store's.
+        write_login(account.config_dir, account.config_json,
+                    "uuid-" + name, "a{}@example.com".format(name),
+                    "ping-refresh-" + name)
+        if name in parked:
+            store = ew.switch_store(account)
+            write_login(store.config_dir, store.config_json,
+                        "uuid-" + name, "a{}@example.com".format(name),
+                        "parked-refresh-" + name)
+
+    if signed_in_as is not None:
+        account = ew.find_account(accounts, signed_in_as)
+        write_login(ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON,
+                    "uuid-" + signed_in_as,
+                    "a{}@example.com".format(signed_in_as),
+                    "live-refresh-" + signed_in_as,
+                    extra={"projects": {"/work": {"hasTrustDialogAccepted": True}},
+                           "numStartups": 7,
+                           # Two of the account-scoped caches, so the test can
+                           # watch them go.
+                           "cachedExtraUsageDisabledReason": "out_of_credits",
+                           "penguinModeOrgEnabled": True})
+    return restore, home, accounts
+
+
+def _creds(path):
+    with open(path) as f:
+        return json.load(f)["claudeAiOauth"]
+
+
+def test_a_login_is_never_in_two_places_at_once():
+    """
+    The invariant the whole design rests on, and the one that fails silently.
+
+    Refresh tokens rotate, so two directories holding one login take turns
+    invalidating each other until one is signed out — about eight hours later,
+    with nothing to connect it to the switch. The defence is that a switch
+    *moves* rather than copies: the outgoing login is parked before the incoming
+    one is installed, so exactly one live copy of each exists at every moment.
+    """
+    section("A login is never in two places at once")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        before = _creds(os.path.join(ew.USER_CONFIG_DIR, ".credentials.json"))
+        code = ew.switch_account(accounts, "2")
+        check("switching to a parked account succeeds", code, 0)
+
+        live = _creds(os.path.join(ew.USER_CONFIG_DIR, ".credentials.json"))
+        store1 = ew.switch_store(accounts[0])
+        store2 = ew.switch_store(accounts[1])
+        parked1 = _creds(ew.credentials_path(store1))
+
+        check("the incoming login is now live", live["refreshToken"],
+              "parked-refresh-2")
+        check("the outgoing login was parked, not discarded",
+              parked1["refreshToken"], before["refreshToken"])
+        check("and the account it came from is where it was parked",
+              json.load(open(store1.config_json))["oauthAccount"]["accountUuid"],
+              "uuid-1")
+
+        # The heart of it: no refresh token appears in two live places.
+        holders = {}
+        for label, path in (("live", ew.credentials_path(ew.user_login())),
+                            ("store 1", ew.credentials_path(store1)),
+                            ("store 2", ew.credentials_path(store2)),
+                            ("ping 1", ew.credentials_path(accounts[0])),
+                            ("ping 2", ew.credentials_path(accounts[1]))):
+            if os.path.exists(path):
+                holders.setdefault(_creds(path)["refreshToken"], []).append(label)
+        duplicated = {token: where for token, where in holders.items()
+                      if len(where) > 1}
+        check("no login is held in two places after a switch", duplicated, {})
+
+        # Switching back must park the other one, symmetrically.
+        ew.switch_account(accounts, "1")
+        live = _creds(ew.credentials_path(ew.user_login()))
+        check("switching back restores the parked login",
+              live["refreshToken"], before["refreshToken"])
+        check("and parks the one that was live",
+              _creds(ew.credentials_path(store2))["refreshToken"],
+              "parked-refresh-2")
+    finally:
+        restore()
+
+
+def test_the_token_and_the_identity_move_together():
+    """
+    The token decides billing; oauthAccount decides what Claude Code says you
+    are. Nothing in Claude Code reconciles them, and a session run with the two
+    disagreeing rewrites the per-account caches under the token's account — so
+    one account's extra-usage state ends up filed under another's name.
+    """
+    section("The token and the identity move together")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        ew.switch_account(accounts, "2")
+        config = json.load(open(ew.USER_CONFIG_JSON))
+
+        check("the identity followed the token",
+              config["oauthAccount"]["accountUuid"], "uuid-2")
+        check("and so did the email it displays",
+              config["oauthAccount"]["emailAddress"], "a2@example.com")
+        check("the outgoing account's billing cache was dropped",
+              "cachedExtraUsageDisabledReason" in config, False)
+        check("and so was its organisation flag",
+              "penguinModeOrgEnabled" in config, False)
+
+        check("everything that is not the account's was left alone",
+              config.get("projects"), {"/work": {"hasTrustDialogAccepted": True}})
+        check("including unrelated counters", config.get("numStartups"), 7)
+
+        check("every account-scoped key is one Claude Code refetches",
+              [k for k in ew.ACCOUNT_SCOPED_KEYS if k in config], [])
+    finally:
+        restore()
+
+
+def test_switching_refuses_what_cannot_possibly_work():
+    """
+    An error here means the switch could not achieve anything, not that it is
+    unwise — which is why there is no --force to type past. In every one of
+    these the user's files must come out untouched.
+    """
+    section("Switching refuses what cannot work")
+
+    def refuses(label, expect, **kw):
+        restore, home, accounts = _switch_sandbox(**kw)
+        try:
+            before = _snapshot_user_files()
+            out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+            check("{}: refused".format(label), code, 1)
+            check_true("{}: says why ({})".format(label, expect),
+                       expect in (out + err))
+            check("{}: changed nothing".format(label),
+                  _snapshot_user_files(), before)
+        finally:
+            restore()
+
+    refuses("no login parked", "No login is parked", signed_in_as="1", parked=())
+
+    # An expired parked login.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        store = ew.switch_store(accounts[1])
+        creds = json.load(open(ew.credentials_path(store)))
+        creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
+            (time.time() - 86400) * 1000)
+        with open(ew.credentials_path(store), "w") as f:
+            json.dump(creds, f)
+        before = _snapshot_user_files()
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+        check("an expired parked login is refused", code, 1)
+        check_true("and names expiry as the reason", "expired" in (out + err))
+        check("with the user's files untouched", _snapshot_user_files(), before)
+    finally:
+        restore()
+
+    # A store holding a copy of the login the pings use: the mistake that looks
+    # like it works and signs you out later.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        store = ew.switch_store(accounts[1])
+        shutil.copyfile(ew.credentials_path(accounts[1]),
+                        ew.credentials_path(store))
+        before = _snapshot_user_files()
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+        check("a parked login copied from the ping directory is refused", code, 1)
+        check_true("and says they would sign each other out",
+                   "signed out" in (out + err) or "rotate" in (out + err))
+        check("with the user's files untouched", _snapshot_user_files(), before)
+    finally:
+        restore()
+
+    # A store signed in as somebody else entirely.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        store = ew.switch_store(accounts[1])
+        config = json.load(open(store.config_json))
+        config["oauthAccount"] = {"accountUuid": "uuid-stranger",
+                                  "emailAddress": "someone@else.com"}
+        with open(store.config_json, "w") as f:
+            json.dump(config, f)
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+        check("a store signed in as the wrong account is refused", code, 1)
+        check_true("and names who it actually is",
+                   "someone@else.com" in (out + err))
+    finally:
+        restore()
+
+    # A store with a credential but no identity: switching would leave
+    # ~/.claude.json naming the account being left while the other is billed.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        store = ew.switch_store(accounts[1])
+        with open(store.config_json, "w") as f:
+            json.dump({"numStartups": 1}, f)
+        before = _snapshot_user_files()
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+        check("a parked login with no identity is refused", code, 1)
+        check_true("and says the identity is what is missing",
+                   "does not say which account" in (out + err))
+        check("with the user's files untouched", _snapshot_user_files(), before)
+    finally:
+        restore()
+
+    # Anything that outranks the saved login makes the whole operation a no-op.
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN"):
+        restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+        os.environ[var] = "x"
+        try:
+            before = _snapshot_user_files()
+            out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+            check("{} set: refused".format(var), code, 1)
+            check_true("{} set: names the variable".format(var), var in err)
+            check("{} set: changed nothing".format(var),
+                  _snapshot_user_files(), before)
+        finally:
+            del os.environ[var]
+            restore()
+
+    # settings.json is checked too, because its env block overwrites the
+    # process environment rather than deferring to it.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        os.makedirs(ew.USER_CONFIG_DIR, exist_ok=True)
+        with open(os.path.join(ew.USER_CONFIG_DIR, "settings.json"), "w") as f:
+            json.dump({"env": {"ANTHROPIC_API_KEY": "sk-x"}}, f)
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+        check("an override in settings.json is refused too", code, 1)
+        check_true("and points at the file", "settings.json" in err)
+    finally:
+        restore()
+
+
+def test_switching_says_what_it_will_and_will_not_fix():
+    """
+    The things that are true, worth saying, and not reasons to stop: a spent
+    window, a symlink that Claude Code was going to destroy anyway, and sessions
+    that will move underneath the user without telling them.
+    """
+    section("Switching says what it will and will not fix")
+
+    # A spent window is a warning, never a refusal: it is instantly reversible
+    # and the user may well know something this tool does not.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        accounts[1].ensure_state_dir()
+        ew.write_state(accounts[1], {
+            "last_run": time.time() - 60,
+            "rate_limits": {"five_hour": {"used_percentage": 100,
+                                          "resets_at": time.time() + 3600}}})
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+        check("a spent window does not block the switch", code, 0)
+        check_true("but it is said out loud", "not usable yet" in out)
+        check_true("and the switch still happened", "Switched your Claude Code" in out)
+    finally:
+        restore()
+
+    # A symlink at the credentials path is replaced, and the user is told why
+    # that is not this tool's doing.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        target = ew.credentials_path(ew.user_login())
+        elsewhere = os.path.join(home, "elsewhere.json")
+        shutil.move(target, elsewhere)
+        os.symlink(elsewhere, target)
+        keep = open(elsewhere).read()
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+        check("switching over a symlink works", code, 0)
+        check_true("and says the link is being replaced", "symlink" in out)
+        check("the link is gone, as Claude Code would have left it too",
+              os.path.islink(target), False)
+        check("and the file it pointed at is untouched",
+              open(elsewhere).read(), keep)
+    finally:
+        restore()
+
+    # Nothing to do is not an error.
+    restore, home, accounts = _switch_sandbox(signed_in_as="2", parked=("2",))
+    try:
+        before = _snapshot_user_files()
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+        check("switching to the account already in use is a no-op", code, 0)
+        check_true("and says so plainly", "already signed in" in out)
+        check("without rewriting anything", _snapshot_user_files(), before)
+    finally:
+        restore()
+
+    # One account is not a thing to switch between.
+    restore, home, accounts = _switch_sandbox(names=("1",), signed_in_as="1")
+    try:
+        out, err, code = _capture(lambda: ew.switch_account(accounts, None))
+        check("one configured account refuses with a usage code", code, 2)
+        check_true("and says why", "nothing to switch between" in err)
+    finally:
+        restore()
+
+
+def test_switching_with_no_account_named_follows_which():
+    """
+    The default has to be the useful one: the reason to switch is almost always
+    "this one is spent, give me the one that is not", and that is exactly the
+    question `which` already answers.
+    """
+    section("Switching with no account named follows `which`")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                              parked=("1", "2"))
+    try:
+        now = time.time()
+        for account, resets in ((accounts[0], now + 4 * 3600),
+                                (accounts[1], now + 900)):
+            account.ensure_state_dir()
+            ew.write_state(account, {
+                "last_run": now - 60,
+                "rate_limits": {"five_hour": {"used_percentage": 10,
+                                              "resets_at": resets}}})
+        chosen, _ = ew.choose_account(accounts)
+        check("`which` prefers the window that expires first", chosen.name, "2")
+
+        out, err, code = _capture(lambda: ew.switch_account(accounts, None))
+        check("and a bare switch goes there", code, 0)
+        check("leaving the user signed in as it",
+              ew.current_account(accounts).name, "2")
+    finally:
+        restore()
+
+
+def test_the_user_is_told_which_account_they_are_on():
+    """
+    Nothing about switching appears until it has been set up: an install that
+    only pings must read exactly as it did before this feature existed.
+    """
+    section("Saying which account the user is on")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1")
+    try:
+        for account in accounts:
+            account.ensure_state_dir()
+            ew.write_state(account, {"last_run": time.time() - 60,
+                                     "rate_limits": {"five_hour": {
+                                         "used_percentage": 10,
+                                         "resets_at": time.time() + 3600}}})
+        out, _, _ = _capture(lambda: ew.status(accounts))
+        check("status says nothing about switching before it is set up",
+              "Your Claude Code" in out, False)
+        out, _, _ = _capture(lambda: ew.which(accounts))
+        check("and neither does which", "switch" in out, False)
+    finally:
+        restore()
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        # Account 2's window expires first, so it is the one to spend while the
+        # user is signed in as the other -- the case the suggestion exists for.
+        now = time.time()
+        for account, resets in ((accounts[0], now + 4 * 3600),
+                                (accounts[1], now + 900)):
+            account.ensure_state_dir()
+            ew.write_state(account, {"last_run": now - 60,
+                                     "rate_limits": {"five_hour": {
+                                         "used_percentage": 10,
+                                         "resets_at": resets}}})
+        out, _, _ = _capture(lambda: ew.status(accounts))
+        check_true("once set up, status names the account in use",
+                   "Your Claude Code" in out and "label1" in out)
+        check_true("and offers to move it to the one worth spending",
+                   "switch" in out and "label2" in out)
+        out, _, _ = _capture(lambda: ew.which(accounts))
+        check_true("and which offers the command to move it",
+                   "{} switch 2".format(ew.COMMAND) in out)
+    finally:
+        restore()
+
+    # An account this tool has never heard of is a state worth naming, not a
+    # crash: it is exactly what happens after someone logs in by hand.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        config = json.load(open(ew.USER_CONFIG_JSON))
+        config["oauthAccount"] = {"accountUuid": "uuid-stranger",
+                                  "emailAddress": "who@example.com"}
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            json.dump(config, f)
+        check("an unknown login is reported as unknown",
+              ew.current_account(accounts), None)
+        out, _, _ = _capture(lambda: ew.status(accounts))
+        check_true("and status says so rather than guessing",
+                   "does not know" in out)
+    finally:
+        restore()
+
+
+def test_a_switch_backs_up_what_it_replaces():
+    """
+    These two files are the difference between a signed-in Claude Code and a
+    browser login. This is the only command here that rewrites them.
+    """
+    section("A switch backs up what it replaces")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        before_creds = open(ew.credentials_path(ew.user_login())).read()
+        before_config = open(ew.USER_CONFIG_JSON).read()
+        ew.switch_account(accounts, "2")
+
+        backups = os.path.join(ew.SWITCH_ROOT, ".backups")
+        stamps = sorted(os.listdir(backups))
+        check("one backup was taken", len(stamps), 1)
+        saved = os.path.join(backups, stamps[0])
+        check("the credentials it replaced are recoverable",
+              open(os.path.join(saved, "credentials.json")).read(), before_creds)
+        check("and so is the config", open(os.path.join(saved, "claude.json")).read(),
+              before_config)
+        check("the backup is not world-readable",
+              oct(stat.S_IMODE(os.stat(
+                  os.path.join(saved, "credentials.json")).st_mode)), "0o600")
+
+        # And they do not pile up for ever.
+        for n in range(ew.SWITCH_BACKUPS_KEPT + 3):
+            os.makedirs(os.path.join(backups, "20200101-0000%02d" % n),
+                        exist_ok=True)
+        ew._prune_backups()
+        check("old backups are pruned to the limit",
+              len(os.listdir(backups)) <= ew.SWITCH_BACKUPS_KEPT, True)
+    finally:
+        restore()
+
+
+def test_an_unknown_login_is_backed_up_rather_than_lost():
+    """
+    Someone who signed in by hand has a login this tool cannot name. Refusing
+    would strand them; parking it under a name that is not theirs would be a
+    lie. It goes to the backup, and the switch says so.
+    """
+    section("An unknown login is backed up rather than lost")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        config = json.load(open(ew.USER_CONFIG_JSON))
+        config["oauthAccount"] = {"accountUuid": "uuid-stranger",
+                                  "emailAddress": "who@example.com"}
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            json.dump(config, f)
+        keep = open(ew.credentials_path(ew.user_login())).read()
+
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
+        check("the switch still happens", code, 0)
+        check_true("and says the old login was not parked",
+                   "not parked" in out and "who@example.com" in out)
+
+        backups = os.path.join(ew.SWITCH_ROOT, ".backups")
+        stamp = sorted(os.listdir(backups))[0]
+        check("the stranded login is in the backup",
+              open(os.path.join(backups, stamp, "credentials.json")).read(), keep)
+        check("and was not filed under an account it does not belong to",
+              os.path.exists(ew.credentials_path(ew.switch_store(accounts[0]))),
+              False)
+    finally:
+        restore()
+
+
+def test_doctor_notices_a_store_going_stale():
+    """
+    Both failures here are invisible until the day you need to switch: a parked
+    login that quietly expired, and one that is a copy of a login something else
+    is already refreshing.
+    """
+    section("Doctor notices a store going stale")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        check("a healthy store produces no findings",
+              ew.switch_findings(accounts), [])
+
+        store = ew.switch_store(accounts[1])
+        creds = json.load(open(ew.credentials_path(store)))
+        creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
+            (time.time() - 3600) * 1000)
+        with open(ew.credentials_path(store), "w") as f:
+            json.dump(creds, f)
+        findings = ew.switch_findings(accounts)
+        check("an expired parked login is an error",
+              [f.level for f in findings], ["error"])
+        check_true("naming the account", "label2" in findings[0].message)
+
+        creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
+            (time.time() + 2 * 86400) * 1000)
+        with open(ew.credentials_path(store), "w") as f:
+            json.dump(creds, f)
+        findings = ew.switch_findings(accounts)
+        check("one about to expire is a warning", [f.level for f in findings],
+              ["warning"])
+
+        shutil.copyfile(ew.credentials_path(accounts[1]),
+                        ew.credentials_path(store))
+        levels = [f.level for f in ew.switch_findings(accounts)]
+        check("a copied login is an error", levels, ["error"])
+    finally:
+        restore()
+
+    # And nothing at all is said when the feature is not in use.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1")
+    try:
+        check("silent when switching was never set up",
+              ew.switch_findings(accounts), [])
+    finally:
+        restore()
+
+
+def test_only_one_function_writes_to_the_users_own_files():
+    """
+    The invariant, tightened for the one feature allowed to break it.
+
+    Before switching existed, nothing here wrote to ~/.claude at all. Now
+    exactly one function does, and this test fails if a second one ever starts
+    — which is the failure that would otherwise be found by a user whose
+    conversations went missing.
+    """
+    section("Only one function writes to the user's own files")
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    source = open(os.path.join(here, "claude_early_window.py")).read()
+    tree = ast.parse(source)
+
+    writes = {"_write_atomically", "copyfile", "copy", "copy2", "copytree",
+              "replace", "remove", "unlink", "rmdir", "rmtree", "symlink",
+              "rename", "makedirs", "chmod", "write_text"}
+    writers = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call) or not call.args:
+                continue
+            name = (call.func.attr if isinstance(call.func, ast.Attribute)
+                    else getattr(call.func, "id", ""))
+            writing = name in writes or (name == "open" and len(call.args) > 1)
+            if not writing:
+                continue
+            target = ast.dump(call.args[0])
+            if "USER_CONFIG" in target or "user_login" in target:
+                writers.add(node.name)
+
+    check("exactly one function writes to the user's own files",
+          sorted(writers), ["install_login"])
+
+    # Static analysis stops at a variable, so the same claim is made again from
+    # the outside: a switch may touch those two files and nothing else under
+    # the user's directory.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        os.makedirs(os.path.join(ew.USER_CONFIG_DIR, "projects", "mine"))
+        with open(os.path.join(ew.USER_CONFIG_DIR, "projects", "mine", "a.jsonl"),
+                  "w") as f:
+            f.write('{"type":"user"}\n')
+        with open(os.path.join(ew.USER_CONFIG_DIR, "settings.json"), "w") as f:
+            json.dump({"theme": "dark"}, f)
+
+        before = _tree_snapshot(ew.USER_CONFIG_DIR)
+        ew.switch_account(accounts, "2")
+        after = _tree_snapshot(ew.USER_CONFIG_DIR)
+
+        changed = sorted(k for k in set(before) | set(after)
+                         if before.get(k) != after.get(k))
+        check("a switch changes exactly one file inside ~/.claude",
+              changed, [os.path.join(ew.USER_CONFIG_DIR, ".credentials.json")])
+        check("the user's conversation is untouched",
+              after[os.path.join(ew.USER_CONFIG_DIR, "projects", "mine",
+                                 "a.jsonl")], b'{"type":"user"}\n')
+        check("and so are their settings",
+              json.loads(after[os.path.join(ew.USER_CONFIG_DIR,
+                                            "settings.json")].decode()),
+              {"theme": "dark"})
+        check("the installed credential is not world-readable",
+              oct(stat.S_IMODE(os.stat(
+                  ew.credentials_path(ew.user_login())).st_mode)), "0o600")
+    finally:
+        restore()
+
+
+def test_running_sessions_are_looked_for_without_counting_our_own_pings():
+    """
+    A ping runs the same binary every half hour, so counting them would make the
+    warning permanent and therefore worthless.
+    """
+    section("Running sessions exclude our own pings")
+
+    found = ew.running_claude_sessions()
+    check_true("the scan returns a list of pids", isinstance(found, list))
+    check_true("all of them are integers",
+               all(isinstance(pid, int) for pid in found))
+    # A ping process is marked in its environment; that marker is what excludes
+    # it, so the constant must keep existing for the exclusion to mean anything.
+    check_true("pings are identifiable in the environment",
+               ew.PING_MARKER_ENV in ew.build_claude_env(
+                   ew.Account("1", "/tmp/nonexistent", 0)))
+
+
 def main():
     # Log somewhere disposable: several decisions are only visible in the log, so
     # the tests read it, and they should not scribble on the running tool's.
@@ -3915,7 +4624,18 @@ def main():
                  test_three_accounts_install_and_space_correctly,
                  test_removing_an_account_stops_its_timer,
                  test_a_clean_install_refuses_a_refused_first_message,
-                 test_doctor_notices_a_deployment_going_wrong):
+                 test_doctor_notices_a_deployment_going_wrong,
+                 test_a_login_is_never_in_two_places_at_once,
+                 test_the_token_and_the_identity_move_together,
+                 test_switching_refuses_what_cannot_possibly_work,
+                 test_switching_says_what_it_will_and_will_not_fix,
+                 test_switching_with_no_account_named_follows_which,
+                 test_the_user_is_told_which_account_they_are_on,
+                 test_a_switch_backs_up_what_it_replaces,
+                 test_an_unknown_login_is_backed_up_rather_than_lost,
+                 test_doctor_notices_a_store_going_stale,
+                 test_only_one_function_writes_to_the_users_own_files,
+                 test_running_sessions_are_looked_for_without_counting_our_own_pings):
         test()
     # Nothing armed on the way out, whatever a test did or failed to do.
     for name in (TEST_PREFIX, TEST_PREFIX + "-a", TEST_PREFIX + "-b"):

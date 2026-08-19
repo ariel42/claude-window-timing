@@ -4,7 +4,7 @@
 
 A small background service that keeps your 5-hour windows rolling around the clock. You sit down to an almost-untouched window, and the next one arrives sooner. With more than one Claude subscription, it spaces their windows evenly through the day so a fresh one is never far away, and tells you which account to spend next.
 
-It does this without touching your Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. About 3,500 lines of Python standard library and a systemd timer — no dependencies, no daemon, and no network calls of its own.
+It does this without touching your Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing in the background goes near `~/.claude`. One command you run by hand, `claude-window switch`, points your own Claude Code at whichever account still has quota. About 4,400 lines of Python standard library and a systemd timer — no dependencies, no daemon, and no network calls of its own.
 
 ---
 
@@ -43,14 +43,14 @@ There are three familiar ways to attack this, and this tool is none of them.
 
 **A usage monitor.** Tells you how much of your window is left, which is worth knowing and completely orthogonal: it observes the window, it does not start one earlier.
 
-**A wrapper, proxy or router that switches accounts for you.** These sit in front of the CLI and multiplex your requests. They work, at the price of putting a third party in the path of every request you make, and of a config directory that is no longer just yours.
+**A wrapper, proxy or router that switches accounts for you.** These sit in front of the CLI and multiplex your requests. They work, at the price of putting a third party in the path of every request you make, and of a config directory that is no longer just yours. `claude-window switch` is not one of these: it hands Claude Code a different login and gets out of the way, so there is nothing left running to fail, and a failure while switching costs a backup file rather than your session.
 
 What this one does instead:
 
 - **It aims at the window boundary, not at the clock.** Claude Code reports exactly when your current window ends. The tool reads that, books a ping for 30 seconds after it, and so starts the next window the instant the last one closes. One correction repairs a schedule that a missed ping knocked out of step — this is the part that makes it hold up over weeks instead of days. ([Staying on schedule](#staying-on-schedule).)
 - **The pings are engineered to be free.** Every ping replays one identical saved conversation from a directory whose contents never change, so Claude serves it from cache, and 30 minutes sits comfortably inside the ~1-hour cache lifetime while dividing 5 hours evenly. All three facts are load-bearing; none is a coincidence ([why 30 minutes](#why-30-minutes), [where the pings run](#where-the-pings-run)).
 - **It runs several subscriptions as one supply.** Windows spaced 5/N hours apart, kept spaced automatically, and a straight answer to "which account should I use right now" that skips any account that cannot serve a request. ([More than one subscription](#more-than-one-subscription).)
-- **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. It never reads or writes `~/.claude` or `~/.claude.json`, and a test fails if any code goes near them.
+- **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. Nothing that runs on a timer ever writes to `~/.claude` or `~/.claude.json`. The one thing that does is `claude-window switch`, only when you run it, to two files, after copying both somewhere safe — and a test names the single function allowed to write there and fails the day a second one appears.
 - **It refuses to bill you by surprise.** Pings run in interactive mode rather than `--print`, and `ANTHROPIC_API_KEY` is stripped from the environment so a ping can never land on a pay-as-you-go account.
 - **It says when it is broken.** Most failures here are silent — a timer that will never fire again, a login that expired, two accounts that are secretly the same account. `claude-window doctor` names them.
 - **It is small enough to read.** Standard library only, one file, no service to trust and nothing running unless a timer fires. Every design decision that could fail quietly is written down at the point in the source where it applies.
@@ -92,13 +92,42 @@ So an account is skipped, and told to wait, when any of this is true: its 5-hour
 
 One subtlety is worth stating, because it is the case a simpler tool gets wrong: a ping getting through is not proof that an account is usable. Pings are cache reads and are exempt from the rate limit, so one can sail through an account whose limit is spent and whose next real request would be refused. The reported percentages are believed over the ping.
 
+### Switching to it
+
+`which` names the account worth spending. This points your own Claude Code at it:
+
+```bash
+claude-window switch        # the account `which` recommends
+claude-window switch 2      # or a named one
+```
+
+It moves two things together — the credential, which decides what you are billed for, and the identity block, which decides what Claude Code tells you that you are. It backs up what it replaces first. **Restart Claude Code afterwards.**
+
+Each account parks its login in `~/.claude-switch/<name>`, signed in once per machine:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-switch/2 claude    # then /login
+```
+
+The account you are signed in as right now needs no sign-in of its own: the first switch away from it parks the login you already have.
+
+**Give each one its own sign-in rather than a copy of an existing login.** Claude Code rotates refresh tokens, so two directories holding the same login take turns invalidating each other and one of them is signed out about eight hours later — long enough that nothing connects it to the copy. Two *separate* logins to one account coexist indefinitely, which is why the ping directories each get their own too.
+
+That is also why a switch **moves** a login rather than copying one: the store is a parking place, the copy in `~/.claude` is the only live one, and switching parks the outgoing login before installing the incoming one. `doctor` says so if it ever finds one login in two places.
+
+Three things worth knowing before you rely on it:
+
+- **It is one dial for the whole machine.** Credentials are re-read per request, so sessions already running move to the new account on their next turn — while still displaying the old one until they restart. There is no per-session version of this that does not put software in the path of every request, which is a much worse trade.
+- **The first request on the new account re-sends whatever you resume**, because the prompt cache belongs to the account you left. That is the same cost as signing out and back in by hand: roughly a percentage point of the new window per 27,000 tokens of conversation. Switch at a break, and start a fresh session where you can — a new conversation pays almost nothing, a resumed one pays for its whole history.
+- **It refuses when it would not work.** No parked login, one that expired, one signed in as the wrong account, one that is a copy of a login something else is already refreshing, or an `ANTHROPIC_API_KEY`-style override that outranks the saved login entirely — each stops the switch and says which it was. There is no `--force`, because nothing it refuses would have worked.
+
 ## What it does *not* do
 
 Worth being plain about, because it is unusual for a tool like this:
 
-**It does not touch how you use Claude Code.** It creates its own directories — `~/.claude-1`, `~/.claude-2` — signs each in, and pings them from an empty working directory inside each. It never reads or writes `~/.claude` or `~/.claude.json`. Your conversations, your trust decisions, your MCP servers and your settings are untouched, and there is a test that fails if any code goes near them.
+**It does not touch how you use Claude Code.** It creates its own directories — `~/.claude-1`, `~/.claude-2` — signs each in, and pings them from an empty working directory inside each. Nothing it does on a schedule reads or writes `~/.claude` or `~/.claude.json`. Your conversations, your trust decisions, your MCP servers and your settings are never touched by any of it.
 
-**It does not switch accounts for you.** `claude-window which` tells you which window is most perishable and which accounts cannot be used at all. Acting on it is yours.
+**It does not switch accounts behind your back.** `claude-window which` tells you which window is most perishable and which accounts cannot be used at all; `claude-window switch` acts on that, when you type it. Nothing switches on a timer, in a hook, or in response to a limit being hit ([switching to it](#switching-to-it)).
 
 **It does not need you to use Claude Code on the machine running it.** A usage window belongs to the *account*, server-side — not to a directory or a computer. A window started by a ping on your home server is the same window you get on your laptop. Run the service in one place and every machine benefits.
 
@@ -230,7 +259,9 @@ Beyond that, the *scheduler* never asks which limit is in the way. For deciding 
 
 A usage window belongs to the **account**, so run the service on **one** always-on machine and every other machine benefits for free. A second copy would only double the consumption for no gain.
 
-Other machines need nothing at all. If you want the advice there too, put a checkout of this repository on the second machine, copy `schedule.json` into it, and run `claude-window which`. It answers from that file alone: no timers, no logins, no network call. The file carries each window's *phase*, which does not move between windows, so even a days-old copy still names the right account — along with each account's availability, which is the part only the pinging machine can see, and which does age. `which` says how old the file is.
+Other machines need nothing at all. If you want the advice there too, put a checkout of this repository on the second machine, copy `accounts.json` and `schedule.json` into it, and run `claude-window which`. It answers from those files alone: no timers, no logins, no network call. The file carries each window's *phase*, which does not move between windows, so even a days-old copy still names the right account — along with each account's availability, which is the part only the pinging machine can see, and which does age. `which` says how old the file is.
+
+`switch` works on those machines too, and is the reason to want it there: the pings run in one place, and every machine you actually type on can follow them. It needs nothing from the pinging machine — only its own parked logins, signed in once, on that machine.
 
 ## Commands
 
@@ -240,6 +271,7 @@ Other machines need nothing at all. If you want the advice there too, put a chec
 | `claude-window` | Status. Typing it can never spend quota. |
 | `claude-window status [--json]` | What every account is doing, and which to use now. |
 | `claude-window which` | Just the recommendation, and what is unusable. |
+| `claude-window switch [2]` | Point your own Claude Code at an account. The only command that writes to `~/.claude`. |
 | `claude-window doctor` | Check the setup and say what is wrong. |
 | `claude-window realign [--confirm]` | Show, then optionally apply, a spacing correction. |
 | `claude-window log [2] [-f]` | A ping log, or every account's interleaved. |
@@ -251,9 +283,9 @@ Other machines need nothing at all. If you want the advice there too, put a chec
 | `claude-window uninstall [--purge]` | Remove the timers; with `--purge`, the generated files too. |
 | `./uninstall.sh [--purge]` | The same, from the shell. |
 
-`claude-window help <command>` explains any of them. Nothing here changes which account you use.
+`claude-window help <command>` explains any of them. Only `switch` changes which account you use, and only when you type it.
 
-Uninstalling stops the timers and removes every unit, and by default leaves this directory's state, checkpoints and logs alone so that re-installing carries on where it left off. `--purge` removes those too, leaving the checkout as git has it. Neither form ever deletes a ping directory: those hold logins you performed, and signing you out is not an uninstaller's business.
+Uninstalling stops the timers and removes every unit, and by default leaves this directory's state, checkpoints and logs alone so that re-installing carries on where it left off. `--purge` removes those too, leaving the checkout as git has it. Neither form ever deletes a ping directory or a parked login: those hold sign-ins you performed, and signing you out is not an uninstaller's business — a parked login is also the *only* copy of itself, so deleting one would cost a browser round-trip to recover.
 
 ## Files
 
@@ -261,13 +293,13 @@ Uninstalling stops the timers and removes every unit, and by default leaves this
 |---|---|
 | `claude_early_window.py` | The whole tool. |
 | `install.sh` / `uninstall.sh` | Prerequisite checks, then the wizard; and the teardown. |
-| `test_early_window.py` | Over 640 checks. `python3 test_early_window.py`. |
+| `test_early_window.py` | Over 720 checks. `python3 test_early_window.py`. |
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 
-Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool, including the empty `pingcwd` inside each that its pings run from; `~/.claude` and `~/.claude.json` are never touched.
+Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool, including the empty `pingcwd` inside each that its pings run from. `~/.claude-switch/<name>` holds a parked login per account and exists only if you use `switch`, which is also the only thing that ever writes to `~/.claude` or `~/.claude.json`.
 
-The tests cover the decisions that fail silently — which reset time to believe, how to space windows for the least dead time, whether a ping can start a window at the wrong moment, which accounts are safe to recommend, and whether anything writes where it should not — along with the words each command prints in each state it can be in, because a recommendation nobody can act on is a bug too. A full install, uninstall, purge and re-install runs end to end in a sandboxed home directory. They spend no usage: a fake CLI stands in for Claude, so all of that can be exercised with no account at all, and nothing they do touches a running install.
+The tests cover the decisions that fail silently — which reset time to believe, how to space windows for the least dead time, whether a ping can start a window at the wrong moment, which accounts are safe to recommend, and whether anything writes where it should not — along with the words each command prints in each state it can be in, because a recommendation nobody can act on is a bug too. Switching gets the same treatment, and one test there is worth more than the rest: after a switch, no login may exist in two places at once. That is the failure that would otherwise show up as an unexplained logout eight hours later, and it is checked by counting refresh tokens across every directory involved. A full install, uninstall, purge and re-install runs end to end in a sandboxed home directory. They spend no usage: a fake CLI stands in for Claude, so all of that can be exercised with no account at all, and nothing they do touches a running install.
 
 ## Billing: subscription vs. API
 

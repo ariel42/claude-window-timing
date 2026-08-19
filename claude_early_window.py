@@ -12,6 +12,7 @@ Usage:
   ./install.sh                 # the setup wizard, safe to re-run
   claude-window                # what every account is doing
   claude-window which          # which account to use right now
+  claude-window switch 2       # point your own Claude Code at one of them
   claude-window ping 2         # send one ping; this is what the timer runs
   claude-window --help         # everything else
 
@@ -21,12 +22,14 @@ run `python3 claude_early_window.py <command>` directly.
 
 import argparse
 import collections
+import hashlib
 import json
 import os
 import pty
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -2571,6 +2574,23 @@ def status(accounts):
     print(headline(chosen, avail[chosen.name], len(accounts)))
     print("  {}".format(reason))
 
+    # Only once switching has been set up. Until then this tool has no business
+    # having an opinion about which account the user is signed in as, and an
+    # install that only pings should read exactly as it always did.
+    if switching_configured(accounts):
+        mine = current_account(accounts)
+        print()
+        if mine is None:
+            print("Your Claude Code  : signed in as an account this tool does "
+                  "not know")
+        elif mine.name == chosen.name:
+            print("Your Claude Code  : account {} — the one to spend".format(
+                mine.display))
+        else:
+            print("Your Claude Code  : account {}".format(mine.display))
+            print("                    `{} switch` moves it to account "
+                  "{}".format(COMMAND, chosen.display))
+
     for account in accounts:
         state = states[account.name]
         print()
@@ -2738,6 +2758,7 @@ def doctor(accounts):
                 "on it."))
 
     findings.extend(_user_account_findings(accounts))
+    findings.extend(switch_findings(accounts))
     findings.extend(_stray_unit_findings(accounts))
 
     if len(accounts) > 1:
@@ -2872,13 +2893,19 @@ def _user_account_findings(accounts):
     if not pinged or theirs in pinged:
         return []
 
+    if parked_logins(accounts):
+        fix = ("Switch to one of them with `{} switch`, or add the account you "
+               "actually use to accounts.json and re-run ./install.sh.".format(
+                   COMMAND))
+    else:
+        fix = ("Either sign in as one of {}, or add the account you actually "
+               "use to accounts.json and re-run ./install.sh.".format(
+                   ", ".join(sorted(pinged.values()))))
     return [Finding(
         "warning",
         "Your own Claude Code is signed in as {}, which is not one of the "
         "accounts being pinged".format(identity.get("emailAddress") or theirs[:8]),
-        "You are getting no early-window benefit from this tool. Either sign in "
-        "as one of {}, or add the account you actually use to accounts.json and "
-        "re-run ./install.sh.".format(", ".join(sorted(pinged.values()))))]
+        "You are getting no early-window benefit from this tool. " + fix)]
 
 
 def _log_run_counts(account):
@@ -2922,6 +2949,17 @@ def which(accounts, states=None, avail=None, published_at=None):
             and next_expiry(states[chosen.name], now) != float("inf")):
         print("  That is the window to spend; how you use the account is up "
               "to you.")
+
+    # The one line that turns advice into something to do — and only when it is
+    # actually actionable, because a recommendation to run a command that is not
+    # set up is worse than no recommendation at all.
+    if switching_configured(accounts):
+        mine = current_account(accounts)
+        if mine is None or mine.name != chosen.name:
+            print("  Point your own Claude Code at it:  {} switch {}".format(
+                COMMAND, chosen.name))
+        else:
+            print("  Your own Claude Code is already signed in as it.")
 
     if len(accounts) > 1:
         print()
@@ -2998,6 +3036,591 @@ def report_findings(findings):
     print()
     print("{} error(s), {} warning(s).".format(errors, len(findings) - errors))
     return 1 if errors else 0
+
+
+# ---------------------------------------------------------------------------
+# Switching your own Claude Code between accounts
+# ---------------------------------------------------------------------------
+#
+# `which` says which account holds the window worth spending. This points your
+# own Claude Code at it — the one part of this tool that writes to ~/.claude. It
+# writes only when you run it, only to two files, and it copies both somewhere
+# safe first.
+#
+# Three measured facts about Claude Code shape the design, and each of them rules
+# out something simpler:
+#
+#   * Credential files are replaced by rename, never edited in place. A symlink
+#     at ~/.claude/.credentials.json is therefore destroyed by the first write,
+#     leaving two files that look like one and silently disagree. Nothing here
+#     links; it copies.
+#
+#   * Refresh tokens rotate. Two holders of one login diverge the moment either
+#     refreshes, and the stale one is signed out about eight hours later, from a
+#     cause nobody would connect to the switch. So a login is never in two places
+#     at once: each account's store is a parking place, the copy in ~/.claude is
+#     the only live one, and a switch *parks the outgoing login before installing
+#     the incoming one*. That is why this is a move and not a copy, and it is the
+#     single most important thing in this section.
+#
+#   * The bearer token decides which account is billed; the oauthAccount block in
+#     ~/.claude.json decides which account Claude Code tells you that you are.
+#     Nothing reconciles them, and a session run with the two disagreeing
+#     rewrites the per-account caches in that file under the *token's* account —
+#     mixing one account's organisation and extra-usage state into another's. So
+#     the two move together here, and those caches are dropped rather than
+#     carried: Claude Code refetches each on demand, so a dropped key repairs
+#     itself within one session and a stale one never does.
+#
+# What it will not do: pick for you, run in the background, or know anything
+# about your sessions. It is one dial for one machine, pulled by hand.
+
+SWITCH_ROOT = os.path.join(HOME, ".claude-switch")
+
+# How many previous credential backups to keep. Each is two small files; the
+# point of keeping several is that the switch you need to undo is not always the
+# most recent one.
+SWITCH_BACKUPS_KEPT = 10
+
+# Keys in ~/.claude.json that Claude Code fills in from the server for whichever
+# account is signed in. Observed being rewritten under the token's account during
+# a single four-second session, `cachedExtraUsageDisabledReason` among them —
+# which is why carrying one across a switch attributes one account's billing
+# state to another. Dropping them costs nothing.
+ACCOUNT_SCOPED_KEYS = (
+    "additionalModelCostsCache",
+    "cachedExperimentData",
+    "cachedExperimentFeatures",
+    "cachedExtraUsageDisabledReason",
+    "cachedGrowthBookFeatures",
+    "cachedGrowthBookFeaturesAt",
+    "clientDataCacheSlots",
+    "fableOverageConsentV2",
+    "hasAvailableSubscription",
+    "modelAccessCache",
+    "orgModelDefaultCache",
+    "overageCreditGrantCache",
+    "passesEligibilityCache",
+    "penguinModeOrgEnabled",
+    "subscriptionNoticeCount",
+)
+
+# A directory holding one Claude Code login, in the shape account_identity()
+# already reads: somewhere to find .credentials.json, and a .claude.json holding
+# the oauthAccount block. Accounts are that shape already; this gives it to the
+# two directories that are not accounts — a switch store, and the user's own,
+# where the config file sits *beside* the directory rather than inside it.
+Login = collections.namedtuple("Login", "name config_dir config_json")
+
+
+def switch_store(account):
+    """Where this account's login is parked: ~/.claude-switch/<name>."""
+    directory = os.path.join(SWITCH_ROOT, account.name)
+    return Login(account.name, directory,
+                 os.path.join(directory, ".claude.json"))
+
+
+def user_login():
+    """The user's own Claude Code: ~/.claude, with ~/.claude.json beside it."""
+    return Login("your own Claude Code", USER_CONFIG_DIR, USER_CONFIG_JSON)
+
+
+def credentials_path(login):
+    return os.path.join(login.config_dir, ".credentials.json")
+
+
+def login_fingerprint(login):
+    """
+    A stable, non-secret identifier for the login stored here, or "".
+
+    It hashes the refresh token, which names the *grant* rather than the account.
+    That is exactly the distinction worth drawing: two directories holding the
+    same grant are one login copied twice, and one of them is going to be signed
+    out. Two separate logins to one account have different grants and coexist
+    indefinitely.
+    """
+    creds = (_read_json(credentials_path(login)).get("claudeAiOauth") or {})
+    token = creds.get("refreshToken") or ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
+
+
+def parked_logins(accounts):
+    """{account name: Login} for every account with a login parked."""
+    return {a.name: switch_store(a) for a in accounts
+            if os.path.exists(credentials_path(switch_store(a)))}
+
+
+def switching_configured(accounts):
+    """
+    Whether the user has set any of this up.
+
+    Nothing about switching is printed until they have, so an install that only
+    pings looks exactly as it did before this existed.
+    """
+    return any(os.path.isdir(switch_store(a).config_dir) for a in accounts)
+
+
+def current_account(accounts):
+    """
+    Which configured account the user's own Claude Code is signed in as, or None.
+
+    Matched on the account UUID rather than on any file, because that is what
+    survives a re-login: the identity is the account, not the directory it came
+    from. Both the ping directory and the parked login are consulted, so this
+    answers correctly before anything has ever been parked.
+    """
+    mine = account_identity(user_login())["account_uuid"]
+    if not mine:
+        return None
+    for account in accounts:
+        for login in (account, switch_store(account)):
+            if account_identity(login)["account_uuid"] == mine:
+                return account
+    return None
+
+
+def running_claude_sessions():
+    """
+    PIDs of this user's running Claude Code processes, pings excluded.
+
+    Worth knowing before a switch rather than after: credentials are re-read per
+    request, so a session that is running when you switch moves to the new
+    account on its very next turn — while still displaying the old one, because
+    that is read once at startup. Pings are excluded because they run constantly
+    and are the one kind of session a switch is not about to surprise.
+    """
+    try:
+        entries = os.listdir("/proc")
+    except (IOError, OSError):
+        return []                        # not Linux, or no /proc: say nothing
+    mine, found = os.getuid(), []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        base = os.path.join("/proc", entry)
+        try:
+            if os.stat(base).st_uid != mine:
+                continue
+            exe = os.path.realpath(os.path.join(base, "exe"))
+            # Two shapes in the wild: the editor extension ships a binary called
+            # `claude`, the native install a versioned one under .../versions/.
+            if os.path.basename(exe) != "claude" and "/claude/versions/" not in exe:
+                continue
+            with open(os.path.join(base, "environ"), "rb") as f:
+                if PING_MARKER_ENV.encode("utf-8") in f.read():
+                    continue
+        except (IOError, OSError):
+            continue                     # exited while we looked, or not ours
+        found.append(int(entry))
+    return sorted(found)
+
+
+_ACCOUNT_OVERRIDE_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                          "CLAUDE_CODE_OAUTH_TOKEN")
+
+
+def account_overrides():
+    """
+    Settings that would make a switch pointless, as (where, variable) pairs.
+
+    All three take precedence over the saved login, so with one of them set the
+    switch would rewrite a file nothing reads. Two are worse than ineffective:
+    ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN move requests on to pay-as-you-go
+    billing, which is the opposite of what someone reaching for a subscription
+    switcher wants. settings.json is checked as well as the environment because
+    its `env` block overwrites the environment rather than deferring to it.
+    """
+    found = []
+    for var in _ACCOUNT_OVERRIDE_VARS:
+        if os.environ.get(var):
+            found.append(("the environment", var))
+    settings = os.path.join(USER_CONFIG_DIR, "settings.json")
+    env = (_read_json(settings).get("env") or {})
+    for var in _ACCOUNT_OVERRIDE_VARS:
+        if env.get(var):
+            found.append((settings, var))
+    return found
+
+
+def _write_atomically(path, body, mode=0o600):
+    """
+    Write via a temp file and a rename, the way Claude Code writes these files.
+
+    Anything less leaves a window in which a crash puts half a credential in
+    ~/.claude, which reads to Claude Code as a broken login and costs a browser
+    sign-in to repair.
+    """
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory, 0o700)
+    tmp = "{}.tmp.{}".format(path, os.getpid())
+    with open(tmp, "w") as f:
+        f.write(body)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def _existing_mode(path, fallback=0o600):
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except (IOError, OSError):
+        return fallback
+
+
+def backup_user_login():
+    """
+    Copy ~/.claude/.credentials.json and ~/.claude.json somewhere safe.
+
+    Taken before every switch. These two files are the difference between a
+    signed-in Claude Code and a browser login, and this is the only command here
+    that rewrites them.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    directory = os.path.join(SWITCH_ROOT, ".backups", stamp)
+    if not os.path.isdir(directory):
+        os.makedirs(directory, 0o700)
+    saved = []
+    for source, name in ((credentials_path(user_login()), "credentials.json"),
+                         (USER_CONFIG_JSON, "claude.json")):
+        if os.path.exists(source):
+            target = os.path.join(directory, name)
+            shutil.copyfile(source, target)
+            os.chmod(target, 0o600)
+            saved.append(target)
+    if not saved:
+        os.rmdir(directory)              # nothing to say sorry about later
+        return None
+    _prune_backups()
+    return directory
+
+
+def _prune_backups():
+    """Keep the most recent SWITCH_BACKUPS_KEPT, oldest first out."""
+    root = os.path.join(SWITCH_ROOT, ".backups")
+    try:
+        stamps = sorted(d for d in os.listdir(root)
+                        if os.path.isdir(os.path.join(root, d)))
+    except (IOError, OSError):
+        return
+    for stamp in stamps[:max(0, len(stamps) - SWITCH_BACKUPS_KEPT)]:
+        shutil.rmtree(os.path.join(root, stamp), ignore_errors=True)
+
+
+def park_login(account):
+    """
+    Move the login currently in ~/.claude into `account`'s store.
+
+    A move rather than a copy, in effect: the caller overwrites ~/.claude
+    immediately afterwards, so the store is left holding the only copy. That
+    invariant — one live copy per login — is what keeps token rotation from
+    signing anyone out, and it is why parking has to happen before installing
+    rather than after.
+    """
+    store = switch_store(account)
+    if not os.path.isdir(store.config_dir):
+        os.makedirs(store.config_dir, 0o700)
+    source = credentials_path(user_login())
+    if os.path.exists(source):
+        with open(source) as f:
+            _write_atomically(credentials_path(store), f.read())
+    identity = (_read_json(USER_CONFIG_JSON).get("oauthAccount") or {})
+    if identity:
+        config = _read_json(store.config_json)
+        config["oauthAccount"] = identity
+        _write_atomically(store.config_json,
+                          json.dumps(config, indent=2, sort_keys=True),
+                          _existing_mode(store.config_json))
+    return store
+
+
+def install_login(store):
+    """
+    Point ~/.claude at the login parked in `store` — token and identity together.
+
+    The credential is **taken out** of the store, not copied from it. Leaving a
+    copy behind would put two holders on one grant, which is the exact thing
+    this design exists to prevent: whichever one refreshed first would strip the
+    other of a working refresh token, and a switch back weeks later would install
+    a credential that fails and takes the user's login with it. The store keeps
+    its .claude.json, so the directory still knows whose login it parks; the
+    token itself lives in exactly one place, and after this that place is
+    ~/.claude.
+
+    Removal happens only once the install has landed, so a failure part-way
+    leaves the login where it was rather than nowhere.
+
+    Returns the account-scoped keys that were dropped. They are dropped rather
+    than replaced because Claude Code refills each from the server on demand: a
+    key removed here is repaired within one session, while a key carried over
+    from the other account is never repaired at all.
+    """
+    with open(credentials_path(store)) as f:
+        _write_atomically(credentials_path(user_login()), f.read())
+
+    config = _read_json(USER_CONFIG_JSON)
+    identity = (_read_json(store.config_json).get("oauthAccount") or {})
+    if identity:
+        config["oauthAccount"] = identity
+    dropped = []
+    for key in ACCOUNT_SCOPED_KEYS:
+        if key in config:
+            del config[key]
+            dropped.append(key)
+    _write_atomically(USER_CONFIG_JSON,
+                      json.dumps(config, indent=2, sort_keys=True),
+                      _existing_mode(USER_CONFIG_JSON))
+
+    try:
+        os.remove(credentials_path(store))
+    except OSError:
+        pass
+    return dropped
+
+
+def switch_blockers(accounts, account):
+    """
+    Everything that should stop or interrupt a switch to `account`, worst first.
+
+    Findings, in the shape `doctor` and `check` already use. An **error** means
+    the switch cannot achieve anything — no login to install, one that is expired
+    or belongs to somebody else, or a setting that overrides it — so the switch
+    does not happen. A **warning** means it will work and there is something
+    worth knowing. Nothing here is merely unwise-but-blocked, which is why there
+    is no --force to type.
+    """
+    findings = []
+    store = switch_store(account)
+
+    for where, var in account_overrides():
+        findings.append(Finding(
+            "error",
+            "{} is set in {}".format(var, where),
+            "It takes precedence over the saved login, so switching would "
+            "change nothing"
+            + ("." if var == "CLAUDE_CODE_OAUTH_TOKEN"
+               else " — and it bills a pay-as-you-go account rather than a "
+                    "subscription.")))
+
+    if not os.path.exists(credentials_path(store)):
+        findings.append(Finding(
+            "error",
+            "No login is parked for account {}".format(account.display),
+            "Sign in once, in a browser, and it stays parked:\n"
+            "       {}\n"
+            "     then /login. Give it its own sign-in rather than copying one: "
+            "two holders of a single login sign each other out.".format(
+                sign_in_command(store))))
+        return findings          # nothing further can be said about an absent login
+
+    identity = account_identity(store)
+    if not identity["has_token"]:
+        findings.append(Finding(
+            "error",
+            "Account {}'s parked login has no access token".format(account.display),
+            "Sign in again: {}".format(sign_in_command(store))))
+    expires = identity["refresh_expires_at"]
+    if expires and expires <= time.time():
+        findings.append(Finding(
+            "error",
+            "Account {}'s parked login expired {}".format(
+                account.display, fmt_time(expires)),
+            "Sign in again: {}".format(sign_in_command(store))))
+
+    want = account_identity(account)["account_uuid"]
+    got = identity["account_uuid"]
+    if not got:
+        # Without it the identity in ~/.claude.json would keep naming the old
+        # account while the new one is billed — the mixture this whole section
+        # exists to avoid, and one nothing downstream would notice.
+        findings.append(Finding(
+            "error",
+            "The login parked for account {} does not say which account it "
+            "is".format(account.display),
+            "Its .claude.json has no oauthAccount block, so switching would "
+            "leave Claude Code naming the account you left. Sign in again: "
+            "{}".format(sign_in_command(store))))
+    elif want and want != got:
+        findings.append(Finding(
+            "error",
+            "The login parked for account {} is signed in as {}, which is not "
+            "the account this slot pings".format(
+                account.display, identity["email"] or got[:8]),
+            "Sign in as the right account: {}".format(sign_in_command(store))))
+
+    parked_grant = login_fingerprint(store)
+    if parked_grant and parked_grant == login_fingerprint(account):
+        findings.append(Finding(
+            "error",
+            "Account {}'s parked login is the same login its pings use, not a "
+            "separate one".format(account.display),
+            "Refresh tokens rotate, so the two would take turns invalidating "
+            "each other and one of them would be signed out. Sign in again so "
+            "the store holds its own: {}".format(sign_in_command(store))))
+
+    target = credentials_path(user_login())
+    if os.path.islink(target):
+        findings.append(Finding(
+            "warning",
+            "{} is a symlink; switching replaces it with a real file".format(target),
+            "Claude Code would have replaced it on its next token refresh "
+            "anyway — it writes these files by rename — so nothing is lost that "
+            "was not already going to be."))
+
+    state = read_state(account)
+    usable = account_availability(account, state, time.time())
+    if usable.tier == WAITING:
+        findings.append(Finding(
+            "warning",
+            "Account {} is not usable yet — {}".format(account.display, usable.note),
+            "It comes back {}. Switching now is harmless; the first request "
+            "before then is simply refused.".format(fmt_time(usable.until))))
+    elif usable.tier == NEEDS_ACTION:
+        findings.append(Finding(
+            "warning",
+            "Account {} needs attention — {}".format(account.display, usable.note),
+            "Run `{} doctor`. Switching to it now will not get you a working "
+            "session.".format(COMMAND)))
+
+    return findings
+
+
+def switch_account(accounts, name=None):
+    """
+    Point the user's own Claude Code at one account. Returns an exit code.
+
+    With no account named it follows `which`, which is the useful default: the
+    reason to switch is almost always "this one is spent, give me the one that
+    is not". Naming an account overrides that without argument.
+    """
+    if len(accounts) < 2:
+        sys.stderr.write(
+            "Only one account is configured, so there is nothing to switch "
+            "between.\nAdd another to accounts.json and re-run ./install.sh.\n")
+        return 2
+
+    if name:
+        account = find_account(accounts, name)
+    else:
+        account, _ = choose_account(accounts)
+
+    current = current_account(accounts)
+    if current is not None and current.name == account.name:
+        print("Your Claude Code is already signed in as account {}.".format(
+            account.display))
+        return 0
+
+    findings = switch_blockers(accounts, account)
+    errors = [f for f in findings if f.level == "error"]
+    for finding in findings:
+        stream = sys.stderr if finding.level == "error" else sys.stdout
+        stream.write("{}: {}\n".format(finding.level.upper(), finding.message))
+        if finding.hint:
+            stream.write("  -> {}\n".format(finding.hint))
+    if errors:
+        sys.stderr.write("\nNothing was changed.\n")
+        return 1
+    if findings:
+        print()
+
+    # Read before anything is overwritten: after install_login the outgoing
+    # identity is gone from ~/.claude.json, and it is the only way to name the
+    # login for someone whose Claude Code was signed in by hand.
+    outgoing = account_identity(user_login())["email"]
+
+    backup = backup_user_login()
+    parked = park_login(current) if current is not None else None
+    dropped = install_login(switch_store(account))
+
+    print("Switched your Claude Code to account {}.".format(account.display))
+    if parked is not None:
+        print("  Parked account {} in {}".format(current.display,
+                                                 parked.config_dir))
+    elif backup:
+        # Refusing would be worse: it would leave someone stuck behind a login
+        # this tool cannot name. Saying exactly where it went is enough.
+        print("  The login that was here{} is not one of the configured "
+              "accounts, so it was not parked.".format(
+                  " ({})".format(outgoing) if outgoing else ""))
+        print("  It is in the backup below, and nowhere else.")
+    if backup:
+        print("  Previous credentials backed up to {}".format(backup))
+    if dropped:
+        print("  Dropped {} cached account setting{} that belonged to the old "
+              "account; Claude Code refetches them.".format(
+                  len(dropped), "" if len(dropped) == 1 else "s"))
+
+    print()
+    print("  Restart Claude Code to pick this up.")
+    sessions = running_claude_sessions()
+    if len(sessions) == 1:
+        print("  One Claude Code session is already running. It moves to this "
+              "account on its next request, while still showing the old one.")
+    elif sessions:
+        print("  {} Claude Code sessions are already running. They move to "
+              "this account on their next request, while still showing the "
+              "old one.".format(len(sessions)))
+
+    state = read_state(account)
+    expiry = next_expiry(state, time.time())
+    if expiry != float("inf"):
+        print("  Account {}'s window ends {} (in {}).".format(
+            account.name, fmt_time(expiry), fmt_delta(expiry - time.time())))
+    # The one cost worth naming, because it is payable and avoidable in the
+    # same breath: the prompt cache belongs to the account you left, so the
+    # first request on this one re-sends whatever it resumes.
+    print("  A fresh session here costs almost nothing; resuming a long one "
+          "pays for its whole history again.")
+    return 0
+
+
+def switch_findings(accounts):
+    """
+    What `doctor` should say about the switch stores, or [] if unconfigured.
+
+    Only the failures that are invisible otherwise: a parked login that has
+    quietly expired, and one that is a copy of a login something else is already
+    refreshing.
+    """
+    if not switching_configured(accounts):
+        return []
+    findings = []
+    for account in accounts:
+        store = switch_store(account)
+        if not os.path.isdir(store.config_dir):
+            continue
+        if not os.path.exists(credentials_path(store)):
+            findings.append(Finding(
+                "warning",
+                "Account {} has a switch directory but no login parked in "
+                "it".format(account.display),
+                "Sign in there once: {}".format(sign_in_command(store))))
+            continue
+        identity = account_identity(store)
+        expires = identity["refresh_expires_at"]
+        if expires and expires <= time.time():
+            findings.append(Finding(
+                "error",
+                "Account {}'s parked login expired {}".format(
+                    account.display, fmt_time(expires)),
+                "You cannot switch to it until you sign in again: {}".format(
+                    sign_in_command(store))))
+        elif expires and expires - time.time() < REFRESH_WARNING_DAYS * 86400:
+            findings.append(Finding(
+                "warning",
+                "Account {}'s parked login expires {}".format(
+                    account.display, fmt_time(expires)),
+                "Switch to it before then and it renews itself; leave it and it "
+                "needs a browser sign-in."))
+        parked_grant = login_fingerprint(store)
+        if parked_grant and parked_grant == login_fingerprint(account):
+            findings.append(Finding(
+                "error",
+                "Account {}'s parked login is a copy of the one its pings "
+                "use".format(account.display),
+                "Refresh tokens rotate, so these two will take turns "
+                "invalidating each other until one is signed out. Give the "
+                "store its own sign-in: {}".format(sign_in_command(store))))
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -3185,6 +3808,14 @@ def setup(argv_accounts=None):
         print("  {} which       which one to use right now".format(COMMAND))
         print("  {} realign     what evening out the spacing would "
               "cost".format(COMMAND))
+        print()
+        # Worth one line here rather than none: the whole point of knowing
+        # which account to spend is being able to go and spend it, and nobody
+        # reads the help for a command they do not know exists.
+        print("`{} switch` can point your own Claude Code at whichever "
+              "account".format(COMMAND))
+        print("that is. It needs one browser sign-in per account, per machine;")
+        print("`{} help switch` explains it.".format(COMMAND))
     return 0
 
 
@@ -3360,9 +3991,11 @@ def uninstall(accounts, purge=False):
     Remove everything this tool installed, and nothing else.
 
     Two rules. The user's own `~/.claude`, `~/.claude.json` and conversations are
-    never touched — they were never ours. And the ping directories are left in
-    place rather than deleted: they hold logins the user performed, so signing
-    somebody out is not an uninstaller's business.
+    never touched — they were never ours, and uninstalling is not the moment to
+    start. And directories holding a login the user performed are left in place
+    rather than deleted: the ping directories, and any parked login under
+    `~/.claude-switch`. Signing somebody out is not an uninstaller's business,
+    and a parked login is the only copy of itself.
 
     `purge` additionally removes what this tool *generated* inside its own
     directory — state, logs, the published schedule, the account list and the
@@ -3470,6 +4103,16 @@ def build_parser():
                         help="report it as JSON instead, for scripting")
 
     add("which", "Say which account to use right now, and why.")
+
+    switching = sub.add_parser(
+        "switch",
+        help="Point your own Claude Code at one account's login.",
+        description="Point your own Claude Code at one account's login. This is "
+                    "the only command that writes to ~/.claude, and it backs up "
+                    "what it replaces. Restart Claude Code afterwards.")
+    switching.add_argument("account", nargs="?", metavar="ACCOUNT",
+                           help="which account (default: the one `{} which` "
+                                "recommends)".format(COMMAND))
 
     add("ping", "Send one ping. Spends a little quota, and starts a new window "
                 "if the last one has ended. This is what the timer runs.",
@@ -3602,10 +4245,16 @@ def status_json(accounts):
     states = {a.name: read_state(a) for a in accounts}
     avail = availabilities(accounts, states, now)
     chosen, reason = choose_account(accounts, states, now, avail)
+    mine = current_account(accounts)
     document = {
         "generated_at": now,
         "use": {"account": chosen.name, "reason": reason,
                 "config_dir": chosen.config_dir},
+        # Always present, unlike the human output, which stays silent until
+        # switching is set up: a shape that appears and disappears is not a
+        # contract anybody can write against.
+        "switching": {"configured": switching_configured(accounts),
+                      "current_account": mine.name if mine else None},
         "accounts": [],
     }
     for account in accounts:
@@ -3693,6 +4342,8 @@ def cli(argv=None):
             # the pinging machine's schedule.json is all it needs to answer.
             view = schedule_view(accounts)
             return which(*view) if view else which(accounts)
+        if command == "switch":
+            return switch_account(accounts, args.account)
         if command == "log":
             return show_log(accounts, args.account, args.lines, args.follow)
         if command == "realign":
@@ -3718,6 +4369,13 @@ def cli(argv=None):
                 print()
             print("Your ~/.claude, ~/.claude.json and every conversation are "
                   "untouched.")
+            # Parked logins are sign-ins the user performed, exactly like a ping
+            # directory's, so an uninstaller has no business removing them —
+            # and deleting the only live copy of a login is unrecoverable
+            # without a browser.
+            if switching_configured(accounts):
+                print("Parked logins in {} are left alone; delete them "
+                      "yourself if you want them gone.".format(SWITCH_ROOT))
             disposable = [a for a in accounts
                           if os.path.realpath(a.config_dir)
                           != os.path.realpath(USER_CONFIG_DIR)]
