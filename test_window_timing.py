@@ -6406,6 +6406,48 @@ def test_a_switch_backs_up_what_it_replaces():
         restore()
 
 
+def test_nothing_after_the_swap_turns_a_switch_into_a_traceback():
+    """
+    Once the credential has been replaced the switch has happened, and nothing
+    after that line may abort: a traceback from a command that touches
+    ~/.claude reads as though it got half way, and the reader has no way to
+    know which half.
+
+    The last thing that writes after the swap is the copy kept of a login that
+    belonged to no configured account. A full disk there used to raise.
+    """
+    section("Nothing after the swap turns a switch into a traceback")
+    restore, home, accounts = _switch_sandbox(signed_in_as=None, parked=("2",))
+    saved = ew.orphan_login
+    try:
+        # Signed in as somebody this tool does not configure.
+        os.makedirs(ew.USER_CONFIG_DIR, 0o700)
+        with open(ew.credentials_path(ew.user_login()), "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r",
+                                         "subscriptionType": "pro"}}, f)
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": "uuid-stranger",
+                                        "emailAddress": "who@example.com"}}, f)
+
+        def full_disk(taken):
+            raise IOError(28, "No space left on device")
+
+        ew.orphan_login = full_disk
+        out, err, code = _capture(
+            lambda: ew.switch_account(accounts, "2", sign_in=False))
+        check("the switch still reports success", code, 0)
+        check_true("because it did succeed",
+                   ew.account_identity(ew.user_login())["email"]
+                   == "a2@example.com")
+        check_true("and the failure is a sentence, not a stack trace",
+                   "Could not keep a copy" in err and "Traceback" not in err)
+        check_true("pointing at the copy that does exist",
+                   "backup" in err.lower() or "backed up" in out)
+    finally:
+        ew.orphan_login = saved
+        restore()
+
+
 def test_an_unknown_login_is_backed_up_rather_than_lost():
     """
     Someone who signed in by hand has a login this tool cannot name. Refusing
@@ -7355,6 +7397,7 @@ def main():
                  test_the_user_is_told_which_account_they_are_on,
                  test_a_switch_backs_up_what_it_replaces,
                  test_an_unknown_login_is_backed_up_rather_than_lost,
+                 test_nothing_after_the_swap_turns_a_switch_into_a_traceback,
                  test_doctor_notices_a_store_going_stale,
                  test_only_one_function_writes_to_the_users_own_files,
                  test_running_sessions_are_looked_for_without_counting_our_own_pings,

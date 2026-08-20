@@ -4957,7 +4957,18 @@ def _perform_switch(account, current, states):
     elif any(taken):
         # Refusing would be worse: it would leave someone stuck behind a login
         # this tool cannot name. Saying exactly where it went is enough.
-        orphan = orphan_login(taken)
+        #
+        # Guarded because everything from here on is after the point of no
+        # return: the credential has been swapped, and a disk that filled up
+        # while writing this copy must not turn a switch that worked into a
+        # traceback that reads as though it had not.
+        try:
+            orphan = orphan_login(taken)
+        except (IOError, OSError) as e:
+            orphan = None
+            sys.stderr.write(
+                "Could not keep a copy of the login that was here: {}\n"
+                "  It is in the backup below, and nowhere else.\n".format(e))
         print("  The login that was here{} is not one of the configured "
               "accounts, so it was not parked.".format(
                   " ({})".format(outgoing) if outgoing else ""))

@@ -214,6 +214,8 @@ claude-window doctor
 
 It checks what otherwise fails silently: accounts that are secretly the same login, a lapsed subscription, a sign-in that no longer works or is about to expire, timers that stopped, runs that started but never finished, a checkpoint that no ping can resume because it belongs to an older layout, a machine clock that disagrees with Claude's, leftover units from an older install — and the one failure specific to this design, **your own Claude Code being signed in as an account nobody is pinging**, where every other check passes while you get no benefit at all.
 
+Three of those are worth naming, because each one leaves an install that looks perfect and does nothing: **a timer that cannot find the Claude CLI** (an npm or nvm install lives where only your shell knows to look, and the timer has none of your shell), **lingering being off** (a user timer belongs to your login session, so the pings stop when you log out), and **`claude-window` not being on your PATH** (every instruction here begins with it).
+
 Every run is logged, so the log doubles as a record of your usage through the day:
 
 ```
