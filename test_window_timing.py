@@ -1393,6 +1393,22 @@ def test_schedule_is_publishable_for_other_machines():
     check("phases differ, which is what makes the choice meaningful",
           entries["1"]["window_phase"] != entries["2"]["window_phase"], True)
 
+    # A bound must not arrive on the other machine looking like an observation.
+    ew.write_state(b, {"rate_limits": {
+        "five_hour": {"resets_at": now + 9600, "used_percentage": 3},
+        "seven_day": {"used_percentage": 100}}})
+    ew.publish_schedule([a, b])
+    entries = {e["name"]: e
+               for e in json.load(open(ew.SCHEDULE_FILE))["accounts"]}
+    check("a spent limit with no reset time is published as a bound",
+          entries["2"]["unusable_until_exact"], False)
+    for account in (a, b):
+        shutil.rmtree(account.state_dir, ignore_errors=True)
+    _, _, avail, _ = ew.schedule_view([a, b])
+    check("and reads back on the other machine as a bound",
+          avail["2"].exact, False)
+    check("while an observed time reads as observed", avail["1"].exact, True)
+
 
 def test_a_second_machine_answers_from_the_schedule():
     """
@@ -2374,7 +2390,7 @@ def test_the_json_report_is_a_contract():
                "config_dir", "consecutive_failures", "expires_at", "hold",
                "label", "last_run", "limits_read_at", "limits_source", "name",
                "rate_limits", "tier", "unusable_because", "unusable_until",
-               "usable_now"])
+               "unusable_until_exact", "usable_now"])
     # The integers are an implementation detail; a caller should never see one.
     check("tiers travel as words", [entries[n]["tier"] for n in ("1", "2")],
           ["usable", "waiting"])

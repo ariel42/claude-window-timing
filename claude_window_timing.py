@@ -667,8 +667,9 @@ def choose_account(accounts, states=None, now=None, avail=None):
     if chosen.tier == UNKNOWN:
         return best, chosen.note
     if chosen.tier == WAITING:
-        return best, "{}; back {} (in {})".format(
-            chosen.note, fmt_time(chosen.until), fmt_delta(chosen.until - now))
+        return best, "{}; back {}{} (in {})".format(
+            chosen.note, "" if chosen.exact else "no later than ",
+            fmt_time(chosen.until), fmt_delta(chosen.until - now))
 
     expiry = next_expiry(state, now)
     if expiry == float("inf"):
@@ -760,6 +761,11 @@ def publish_schedule(accounts):
             "usable_now": usable.tier == USABLE,
             "tier": TIER_NAMES[usable.tier],
             "unusable_until": usable.until,
+            # Whether that time was observed, or is the longest the limit could
+            # possibly run. It has to travel with the time it qualifies, or the
+            # machine reading this file repeats a bound as though it were a
+            # fact.
+            "unusable_until_exact": usable.exact,
             "unusable_because": usable.note or None,
             "used_percentage": five.get("used_percentage"),
             "last_run": state.get("last_run"),
@@ -833,10 +839,13 @@ def schedule_view(accounts):
         tier = TIERS_BY_NAME.get(entry.get("tier"))
         if tier is None:
             tier = USABLE if entry.get("usable_now") else WAITING
-        # A published file carries the pinging machine's observed reset time,
-        # so it is exact where it exists at all; a WAITING entry that arrives
-        # without one is bounded here the same way a local one would be.
-        until, exact = entry.get("unusable_until"), True
+        # A WAITING entry that arrives with no time at all is bounded here the
+        # same way a local one would be. One that arrives with a time says
+        # beside it whether that time was observed; a file written before that
+        # flag existed only ever carried observed times, so its absence reads
+        # as observed.
+        until = entry.get("unusable_until")
+        exact = entry.get("unusable_until_exact", True) is not False
         if tier == WAITING and not until:
             until, exact = now + WINDOW_HOURS * 3600, False
         avail[account.name] = Availability(
@@ -2890,8 +2899,10 @@ def status(accounts):
         if account.name in absent:
             print("  Usable        : cannot tell — {}".format(usable.note))
         elif usable.tier == WAITING:
-            print("  Usable again  : {} (in {}) — {}".format(
-                fmt_time(usable.until), fmt_delta(usable.until - now), usable.note))
+            print("  Usable again  : {}{} (in {}) — {}".format(
+                "" if usable.exact else "no later than ",
+                fmt_time(usable.until), fmt_delta(usable.until - now),
+                usable.note))
         elif usable.tier != USABLE:
             print("  Usable        : no — {}".format(usable.note))
 
@@ -5440,6 +5451,10 @@ def status_json(accounts):
             "usable_now": usable.tier == USABLE,
             "tier": TIER_NAMES[usable.tier],
             "unusable_until": usable.until,
+            # False where that time is an upper bound rather than a reset time
+            # anybody observed — a limit reported spent without one cannot run
+            # longer than its own length, and that is what is being reported.
+            "unusable_until_exact": usable.exact,
             "unusable_because": usable.note or None,
             "last_run": state.get("last_run"),
             "available_at": state.get("available_at"),
