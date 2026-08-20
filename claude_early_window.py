@@ -3366,24 +3366,41 @@ def _prune_backups():
         shutil.rmtree(os.path.join(root, stamp), ignore_errors=True)
 
 
-def park_login(account):
+def take_login():
     """
-    Move the login currently in ~/.claude into `account`'s store.
+    Read the login now in ~/.claude, to be parked once it has been replaced.
 
-    A move rather than a copy, in effect: the caller overwrites ~/.claude
-    immediately afterwards, so the store is left holding the only copy. That
-    invariant — one live copy per login — is what keeps token rotation from
-    signing anyone out, and it is why parking has to happen before installing
-    rather than after.
+    Read rather than copied, because *when* it reaches the store decides
+    whether the invariant can be broken at all. Writing it to the store first
+    leaves a moment — between that write and the install — when one grant sits
+    in two directories, and a crash inside that moment leaves it there: two
+    refreshers, and one of them signed out about eight hours later with nothing
+    on the machine recording why. Holding it in memory until the install has
+    landed removes the moment; the backup taken beforehand covers a crash in
+    what is left.
     """
+    path = credentials_path(user_login())
+    credential = None
+    if os.path.exists(path):
+        with open(path) as f:
+            credential = f.read()
+    return credential, (_read_json(USER_CONFIG_JSON).get("oauthAccount") or {})
+
+
+def park_login(account, taken):
+    """
+    Write a login previously read by take_login() into `account`'s store.
+
+    Called only once ~/.claude has been overwritten, so the store is left
+    holding the only copy — which is the whole invariant, and the reason token
+    rotation never signs anybody out here.
+    """
+    credential, identity = taken
     store = switch_store(account)
     if not os.path.isdir(store.config_dir):
         os.makedirs(store.config_dir, 0o700)
-    source = credentials_path(user_login())
-    if os.path.exists(source):
-        with open(source) as f:
-            _write_atomically(credentials_path(store), f.read())
-    identity = (_read_json(USER_CONFIG_JSON).get("oauthAccount") or {})
+    if credential is not None:
+        _write_atomically(credentials_path(store), credential)
     if identity:
         config = _read_json(store.config_json)
         config["oauthAccount"] = identity
@@ -3680,9 +3697,10 @@ def switch_account(accounts, name=None, sign_in=True):
     # login for someone whose Claude Code was signed in by hand.
     outgoing = account_identity(user_login())["email"]
 
+    taken = take_login()
     backup = backup_user_login()
-    parked = park_login(current) if current is not None else None
     dropped = install_login(switch_store(account))
+    parked = park_login(current, taken) if current is not None else None
 
     print("Switched your Claude Code to account {}.".format(account.display))
     if parked is not None:
@@ -3773,6 +3791,17 @@ def switch_findings(accounts):
                 "Switch to it before then and it renews itself; leave it and it "
                 "needs a browser sign-in."))
         parked_grant = login_fingerprint(store)
+        if parked_grant and parked_grant == login_fingerprint(user_login()):
+            findings.append(Finding(
+                "error",
+                "Account {}'s parked login is the same one your Claude Code is "
+                "using right now".format(account.display),
+                "Two directories are refreshing one login, and in about eight "
+                "hours whichever refreshes second is signed out. Nothing here "
+                "creates this state, so it is either a switch that was "
+                "interrupted or a credentials file copied by hand: delete "
+                "{} and sign in again there.".format(
+                    credentials_path(store))))
         if parked_grant and parked_grant == login_fingerprint(account):
             findings.append(Finding(
                 "error",

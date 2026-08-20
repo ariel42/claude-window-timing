@@ -4073,6 +4073,64 @@ def test_a_login_is_never_in_two_places_at_once():
         restore()
 
 
+def test_an_interrupted_switch_never_leaves_a_login_in_two_places():
+    """
+    The ordering that makes the invariant survive a crash, not just a clean run.
+
+    Parking the outgoing login *before* installing the incoming one would leave
+    a moment when one grant sits in two directories. A crash there leaves it
+    there for good: two refreshers, and one signed out about eight hours later
+    with nothing recording why. So the outgoing login is held in memory until
+    the install has landed, and the backup taken first is what covers the rest.
+    """
+    section("An interrupted switch leaves nothing duplicated")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    real_park = ew.park_login
+    try:
+        ew.park_login = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("power cut"))
+        try:
+            _capture(lambda: ew.switch_account(accounts, "2", sign_in=False))
+        except RuntimeError:
+            pass                      # exactly the crash being modelled
+
+        holders = {}
+        for label, login in (("live", ew.user_login()),
+                             ("store 1", ew.switch_store(accounts[0])),
+                             ("store 2", ew.switch_store(accounts[1])),
+                             ("ping 1", accounts[0]), ("ping 2", accounts[1])):
+            grant = ew.login_fingerprint(login)
+            if grant:
+                holders.setdefault(grant, []).append(label)
+        check("no login is in two places after the crash",
+              {g: w for g, w in holders.items() if len(w) > 1}, {})
+
+        backups = os.path.join(ew.SWITCH_ROOT, ".backups")
+        stamp = sorted(os.listdir(backups))[-1]
+        saved = json.load(open(os.path.join(backups, stamp, "credentials.json")))
+        check("and the login that was interrupted is recoverable from the backup",
+              saved["claudeAiOauth"]["refreshToken"], "live-refresh-1")
+    finally:
+        ew.park_login = real_park
+        restore()
+
+    # And doctor names the state if it is ever reached another way.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        store = ew.switch_store(accounts[0])
+        os.makedirs(store.config_dir, exist_ok=True)
+        shutil.copyfile(ew.credentials_path(ew.user_login()),
+                        ew.credentials_path(store))
+        findings = ew.switch_findings(accounts)
+        check("a store holding the live login is an error",
+              [f.level for f in findings], ["error"])
+        check_true("that says what happens and when",
+                   "eight hours" in findings[0].hint)
+    finally:
+        restore()
+
+
 def test_the_token_and_the_identity_move_together():
     """
     The token decides billing; oauthAccount decides what Claude Code says you
@@ -4989,6 +5047,7 @@ def main():
                  test_a_clean_install_refuses_a_refused_first_message,
                  test_doctor_notices_a_deployment_going_wrong,
                  test_a_login_is_never_in_two_places_at_once,
+                 test_an_interrupted_switch_never_leaves_a_login_in_two_places,
                  test_the_token_and_the_identity_move_together,
                  test_switching_refuses_what_cannot_possibly_work,
                  test_switching_says_what_it_will_and_will_not_fix,
