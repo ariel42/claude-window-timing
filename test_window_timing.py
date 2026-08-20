@@ -2823,6 +2823,65 @@ def test_what_a_ping_records_from_how_it_went():
          ew.restore_checkpoint, ew._systemctl, ew._run) = saved
 
 
+def test_two_pings_at_once_do_not_tread_on_each_other():
+    """
+    systemd will not run two instances of one service unit at once, so the
+    timer and the boundary anchor cannot collide. A ping typed by hand can —
+    and it lands on the one file a run cannot share.
+
+    Every run copies the frozen checkpoint over the session transcript before
+    resuming it. A second run doing that while the first is mid-flight is how a
+    perfectly good ping comes back as "no assistant turn recorded", counted
+    against an account that answered fine.
+    """
+    section("Two pings at once do not tread on each other")
+    account = temp_account()
+    saved = (ew.run_interactive, ew.restore_checkpoint, ew.schedule_anchor,
+             ew._systemctl, ew._run)
+
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+
+    inner = []
+
+    try:
+        with open(account.session_id_file, "w") as f:
+            f.write("sess\n")
+        stamp_checkpoint(account)
+        open(account.checkpoint_backup, "w").close()
+        ew.restore_checkpoint = lambda a, s: None
+        ew.schedule_anchor = lambda a, t: True
+        ew._systemctl = lambda *a: Ok()
+        ew._run = lambda cmd: Ok()
+
+        def reentrant(*args, **kwargs):
+            """A ping that tries to start a second ping while it is running."""
+            ew.ping(account)
+            inner.append(open(account.log_file).read())
+            return {"completed": True, "limited": False, "text": "ok"}
+
+        ew.run_interactive = reentrant
+        ew.ping(account)
+
+        check("the second run was turned away", len(inner), 1)
+        check_true("saying so, rather than pinging twice",
+                   "already running" in inner[0])
+        check("and the first run is the only one that sent anything",
+              inner[0].count("Starting ping run"), 1)
+
+        # And once it is over, the lock is nobody's: the next ping runs.
+        ew.run_interactive = lambda *a, **k: {"completed": True,
+                                              "limited": False, "text": "ok"}
+        ew.ping(account)
+        check("a later ping is not blocked by a lock nobody holds",
+              open(account.log_file).read().count("Starting ping run"), 2)
+    finally:
+        (ew.run_interactive, ew.restore_checkpoint, ew.schedule_anchor,
+         ew._systemctl, ew._run) = saved
+        ew.cancel_anchor(account)
+
+
 def test_a_hold_suppresses_the_ping_and_nothing_else():
     section("A hold skips the ping, and only for timing")
     ew.STATE_ROOT = tempfile.mkdtemp()
@@ -7149,6 +7208,7 @@ def main():
                  test_realign_is_the_only_way_a_long_hold_happens,
                  test_the_json_report_is_a_contract,
                  test_what_a_ping_records_from_how_it_went,
+                 test_two_pings_at_once_do_not_tread_on_each_other,
                  test_a_hold_suppresses_the_ping_and_nothing_else,
                  test_an_unusable_account_is_still_pinged,
                  test_the_log_reads_in_the_order_it_was_written,

@@ -259,6 +259,20 @@ class Account(object):
         return "<Account {} at {}>".format(self.name, self.config_dir)
 
 
+def _temp_name(path):
+    """
+    A scratch name beside `path` that no other process can be writing.
+
+    Every atomic write here is tmp-then-rename, and two of them shared one
+    scratch name: schedule.json is republished after every ping and
+    alignment.json after every one that spaces, so two accounts finishing
+    together -- a slow ping, a hand-run one beside the timer's -- wrote the
+    same file at the same time and renamed whatever the interleaving produced
+    into place.
+    """
+    return "{}.tmp.{}".format(path, os.getpid())
+
+
 def _read_json(path):
     """Parse a JSON file, treating "missing" and "unreadable" as empty."""
     try:
@@ -304,7 +318,7 @@ def ensure_ping_config(account):
             config[key] = value
             changed = True
     if changed:
-        tmp = account.config_json + ".tmp"
+        tmp = _temp_name(account.config_json)
         with open(tmp, "w") as f:
             json.dump(config, f, indent=2, sort_keys=True)
         os.replace(tmp, account.config_json)
@@ -783,7 +797,7 @@ def publish_schedule(accounts):
 
     document = {"written_at": now, "window_hours": WINDOW_HOURS,
                 "accounts": entry}
-    tmp = SCHEDULE_FILE + ".tmp"
+    tmp = _temp_name(SCHEDULE_FILE)
     with open(tmp, "w") as f:
         json.dump(document, f, indent=2, sort_keys=True)
     os.replace(tmp, SCHEDULE_FILE)
@@ -1046,7 +1060,7 @@ def write_alignment(data):
     try:
         if not os.path.isdir(STATE_ROOT):
             os.makedirs(STATE_ROOT, 0o700)
-        tmp = ALIGNMENT_FILE + ".tmp"
+        tmp = _temp_name(ALIGNMENT_FILE)
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2, sort_keys=True)
         os.replace(tmp, ALIGNMENT_FILE)
@@ -1571,7 +1585,7 @@ def read_state(account):
 
 def write_state(account, state):
     account.ensure_state_dir()
-    tmp = account.state_file + ".tmp"
+    tmp = _temp_name(account.state_file)
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2, sort_keys=True)
     os.replace(tmp, account.state_file)
@@ -2747,7 +2761,45 @@ def init(account):
 # The ping run (called by the systemd timer on each interval)
 # ---------------------------------------------------------------------------
 
+def acquire_ping_lock(account):
+    """
+    Hold this account's ping lock, or return None if a ping is already running.
+
+    systemd will not run two instances of one service unit at once, so the
+    timer and the anchor cannot collide. A ping typed by hand can, and it lands
+    on the one file a run cannot share: the checkpoint is copied over the
+    session transcript at the start of every run, so a second run restoring it
+    while the first is being read is how a perfectly good ping comes back as
+    "no assistant turn recorded" -- and gets counted against the account.
+
+    The loser skips rather than waits. The pings are half an hour apart and the
+    schedule is repaired by the boundary anchor, so one skipped ping costs
+    nothing; a queued second one would ping twice in a row for no reason.
+    """
+    account.ensure_state_dir()
+    fd = os.open(os.path.join(account.state_dir, "ping.lock"),
+                 os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        os.close(fd)
+        return None
+    return fd
+
+
 def ping(account, accounts=None):
+    lock = acquire_ping_lock(account)
+    if lock is None:
+        log(account, "A ping for account {} is already running — skipping this "
+                     "one rather than pinging twice.".format(account.display))
+        return
+    try:
+        _ping(account, accounts)
+    finally:
+        os.close(lock)          # releases the flock with it
+
+
+def _ping(account, accounts=None):
     rotate_log(account)
     accounts = accounts or [account]
     states = {a.name: read_state(a) for a in accounts}
@@ -4213,7 +4265,7 @@ def _write_atomically(path, body, mode=0o600):
     directory = os.path.dirname(path)
     if directory and not os.path.isdir(directory):
         os.makedirs(directory, 0o700)
-    tmp = "{}.tmp.{}".format(path, os.getpid())
+    tmp = _temp_name(path)
     # Created at its final mode rather than widened-then-narrowed: opening with
     # the default and calling chmod afterwards leaves a real window in which a
     # credential sits on disk at 0644, and these directories are shared.
@@ -5540,7 +5592,7 @@ def _write_accounts_file(accounts, pings=True):
     # exactly what it always was and nobody has to wonder what a new key means.
     if not pings:
         document["pings"] = False
-    tmp = ACCOUNTS_FILE + ".tmp"
+    tmp = _temp_name(ACCOUNTS_FILE)
     with open(tmp, "w") as f:
         json.dump(document, f, indent=2)
         f.write("\n")
@@ -6025,6 +6077,13 @@ def show_log(accounts, name, lines, follow):
             subprocess.call(["tail", "-n", str(lines), "-f", account.log_file])
         except KeyboardInterrupt:
             pass
+        except OSError as e:
+            # Following is the one thing here that shells out. A container
+            # without coreutils is a strange place to run this, but answering
+            # with a traceback is stranger.
+            sys.stderr.write("Could not run `tail` to follow the log: {}\n"
+                             "  The log is at {}\n".format(e, account.log_file))
+            return 1
         return 0
 
     if follow:
