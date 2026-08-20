@@ -5109,6 +5109,61 @@ def test_doctor_notices_a_timer_running_the_wrong_script():
         restore()
 
 
+def test_a_directory_the_wizard_asked_for_is_not_left_wide():
+    """
+    The sign-ins setup prints are run by the user, and Claude Code creates a
+    config directory with whatever umask it is handed — 0775 on an ordinary
+    machine. So the directory the tool just told somebody to put a login in
+    ends up writable by their group, and `doctor` greets a brand-new install
+    with a warning about a directory the install itself asked for. Seen on a
+    fresh clone: two of them, one per account.
+
+    A directory you can write is a file you can replace, whatever mode the
+    file has, so this is worth more than a diagnostic.
+    """
+    section("A directory the wizard asked for is never left wide")
+    restore, home, accounts = _switch_sandbox(names=("1", "2"), parked=("1",))
+    try:
+        store = ew.switch_store(accounts[0])
+        # As `claude` would have left them, having created them itself.
+        for directory in (ew.SWITCH_ROOT, store.config_dir,
+                          accounts[0].config_dir):
+            os.chmod(directory, 0o775)
+        check("the fixture starts as loose as a real one",
+              ew._permissions(store.config_dir), 0o775)
+
+        changed = ew.tighten_login_dirs(accounts, pings=True)
+        check("every directory holding a login is narrowed",
+              ew._permissions(store.config_dir), 0o700)
+        check("including the root they sit in",
+              ew._permissions(ew.SWITCH_ROOT), 0o700)
+        check("and the ping directories, which hold one too",
+              ew._permissions(accounts[0].config_dir), 0o700)
+        check_true("each one is reported rather than done silently",
+                   store.config_dir in changed and ew.SWITCH_ROOT in changed)
+
+        check("a second run has nothing left to do",
+              ew.tighten_login_dirs(accounts, pings=True), [])
+        check("and doctor stops warning about them",
+              [f for f in ew.switch_findings(accounts)
+               if "others can reach" in f.message], [])
+
+        # A store nobody has signed into is not created here. It appearing
+        # would tell `status` that switching is set up when it is not.
+        missing = ew.switch_store(accounts[1]).config_dir
+        check("a store that does not exist is not conjured up",
+              os.path.exists(missing), False)
+
+        # On a machine that does not ping, the ping directories are not this
+        # machine's business at all.
+        os.chmod(accounts[0].config_dir, 0o775)
+        ew.tighten_login_dirs(accounts, pings=False)
+        check("a switch-only machine leaves the ping directories alone",
+              ew._permissions(accounts[0].config_dir), 0o775)
+    finally:
+        restore()
+
+
 def test_a_credential_directory_is_never_left_wide():
     """
     os.makedirs applies its mode to the leaf only, so every intermediate landed
@@ -6572,6 +6627,7 @@ def main():
                  test_switching_refuses_where_it_cannot_work,
                  test_an_override_is_reported_before_anything_reassuring,
                  test_doctor_notices_a_timer_running_the_wrong_script,
+                 test_a_directory_the_wizard_asked_for_is_not_left_wide,
                  test_a_credential_directory_is_never_left_wide,
                  test_the_mutation_path_is_hardened,
                  test_a_failure_mid_switch_is_a_sentence_not_a_traceback,

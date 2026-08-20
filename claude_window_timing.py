@@ -4932,6 +4932,34 @@ def sign_ins_needed(accounts, pings):
     return needed
 
 
+def tighten_login_dirs(accounts, pings):
+    """
+    Narrow every directory here that holds a login. Returns the ones changed.
+
+    The sign-ins this wizard prints are run by the user, and Claude Code
+    creates a config directory with whatever umask it is handed -- 0775 on an
+    ordinary machine. So a directory the tool has just told somebody to sign
+    into ends up writable by their group, and `doctor` opens a brand-new
+    install with a warning about a directory the install asked for.
+
+    Narrowed rather than reported, and on every run rather than only the run
+    that created them, so that re-running setup repairs one that was loosened.
+    Nothing is created here: a store that does not exist is a sign-in nobody
+    has done, and `switch` offers that when it needs it.
+    """
+    changed = []
+    for directory in ([SWITCH_ROOT]
+                      + [switch_store(a).config_dir for a in accounts]
+                      + ([a.config_dir for a in accounts] if pings else [])):
+        if not os.path.isdir(directory):
+            continue
+        mode = _permissions(directory)
+        if mode is not None and mode & 0o077:
+            secure_dir(directory)
+            changed.append(directory)
+    return changed
+
+
 def setup(argv_accounts=None, pings=None, assume_yes=False):
     """The whole first-run experience. Safe to re-run at any time."""
     global ASSUME_YES
@@ -5097,6 +5125,9 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
         print("needs, when it needs it.")
         print()
         _ask("Press Enter when you are done.")
+
+    for directory in tighten_login_dirs(accounts, pings):
+        print("Tightened {} to 700 — it holds a login.".format(_tilde(directory)))
 
     # ── Checking ────────────────────────────────────────────────────────────
     print()
