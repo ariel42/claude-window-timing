@@ -157,7 +157,7 @@ Claude Code itself must already be installed — on every machine, including the
 
 systemd is only needed on the machine that runs the pings, and that question is asked before it is checked, so a machine without it can still install the switcher.
 
-The wizard asks how many accounts you have and whether this machine should run the pings, shows the directories it will create, walks you through signing in to each, creates one background conversation per account, and starts a timer for each. Re-run it any time — adding an account, or changing your mind about the pings, is just running it again. It asks only for the sign-ins that are still missing, so a re-run costs nothing you have already done.
+The wizard asks how many accounts you have and whether this machine should run the pings, shows the directories it will create, walks you through signing in to each, creates one background conversation per account, starts a timer for each, and makes `claude-window` typeable — with one symlink into a directory your PATH already holds, so it works in the shell you installed from as well as in every new one. It asks first, and `uninstall --purge` takes it back out. Re-run it any time — adding an account, or changing your mind about the pings, is just running it again. It asks only for the sign-ins that are still missing, so a re-run costs nothing you have already done.
 
 For an unattended install: `./install.sh --accounts 2 -y`, and `--no-pings` on the machines that only switch.
 
@@ -314,7 +314,7 @@ Answering "no pings" on a machine that has been pinging offers to stop its timer
 | `claude-window check` | Validate the accounts without changing anything. |
 | `claude-window ping [2]` | Send one ping. This is what the timer runs. |
 | `claude-window init [2]` | Build one account's checkpoint. Setup does this for you. |
-| `claude-window install-command` | Rewrite the `claude-window` launcher in `bin/`. |
+| `claude-window install-command` | Rewrite the `claude-window` launcher in `bin/`, and offer to put it where your shell will find it. |
 | `claude-window uninstall [--purge]` | Remove the timers; with `--purge`, the generated files too. |
 | `./uninstall.sh [--purge]` | The same, from the shell. |
 
@@ -332,7 +332,7 @@ Uninstalling stops the timers and removes every unit, and by default leaves this
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 
-Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool, including the empty `pingcwd` inside each that its pings run from. `~/.claude-switch/<name>` holds a parked login per account; it appears as soon as you run the sign-in the wizard prints, alongside `.backups/` and `.orphaned/`. `switch` is the only thing that ever writes to `~/.claude` or `~/.claude.json`.
+Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`, and — if you accept the offer — a `claude-window` symlink to `~/.local/bin`, or failing that one marked line in your shell's startup file. Both are removed by `uninstall --purge`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool, including the empty `pingcwd` inside each that its pings run from. `~/.claude-switch/<name>` holds a parked login per account; it appears as soon as you run the sign-in the wizard prints, alongside `.backups/` and `.orphaned/`. `switch` is the only thing that ever writes to `~/.claude` or `~/.claude.json`.
 
 The tests cover the decisions that fail silently — which reset time to believe, how to space windows for the least dead time, whether a ping can start a window at the wrong moment, which accounts are safe to recommend, and whether anything writes where it should not — along with the words each command prints in each state it can be in, because a recommendation nobody can act on is a bug too. Switching gets the same treatment, and one test there is worth more than the rest: after a switch, no login may exist in two places at once. That is the failure that would otherwise show up as an unexplained logout eight hours later, and it is checked by counting refresh tokens across every directory involved. A full install, uninstall, purge and re-install runs end to end in a sandboxed home directory. They spend no usage: a fake CLI stands in for Claude, so all of that can be exercised with no account at all, and nothing they do touches a running install.
 

@@ -3095,6 +3095,7 @@ def doctor(accounts):
                 "The machine clock may be wrong; every schedule here depends "
                 "on it."))
 
+    findings.extend(_launcher_findings())
     findings.extend(_user_account_findings(accounts))
     findings.extend(switch_findings(accounts))
     findings.extend(unit_target_findings())
@@ -3254,6 +3255,34 @@ def _user_account_findings(accounts):
         "You are getting no benefit from this tool at all. " + fix)]
 
 
+def _launcher_findings():
+    """
+    Warn when `claude-window` cannot be typed.
+
+    Silent otherwise, and worth saying at all because every instruction this
+    tool prints -- in setup, in `which`, in `status`, in these findings --
+    begins with the command. An install where it is not on PATH looks complete
+    and answers "command not found" to every one of them.
+    """
+    state, path = launcher_link()
+    if state == "reachable":
+        return []
+    if state == "foreign":
+        return [Finding(
+            "warning",
+            "The `{}` on your PATH belongs to a different checkout".format(
+                COMMAND),
+            "It is {}; this one is {}. Whichever you run decides which "
+            "checkout's accounts and state you are looking at.".format(
+                path, os.path.join(BIN_DIR, COMMAND)))]
+    return [Finding(
+        "warning",
+        "`{}` is not on your PATH, so every command here has to be typed "
+        "as a path".format(COMMAND),
+        "Run `{} install-command`, which offers to link it somewhere your "
+        "shell already looks.".format(os.path.join(BIN_DIR, COMMAND)))]
+
+
 def _log_run_counts(account):
     try:
         with open(account.log_file) as f:
@@ -3381,10 +3410,9 @@ def write_entry_point():
     """
     Write bin/claude-window, so the tool is a command rather than a path.
 
-    A directory of its own rather than a symlink into ~/.local/bin: the
-    launcher embeds the absolute path of this checkout, so it belongs beside
-    the checkout and goes away with `uninstall --purge`. One PATH entry is the
-    whole installation.
+    The real file lives here, beside the checkout whose absolute path it
+    embeds, and goes away with `uninstall --purge`. Whether a shell can find
+    it is a separate question, answered by `launcher_link`.
     """
     if not os.path.isdir(BIN_DIR):
         os.makedirs(BIN_DIR, 0o755)
@@ -3395,6 +3423,262 @@ def write_entry_point():
             script=shlex.quote(os.path.abspath(__file__))))
     os.chmod(path, 0o755)
     return path
+
+
+def link_dirs():
+    """
+    Where a launcher can be reached from without editing anybody's dotfiles.
+
+    Both are conventional user bin directories -- ~/.local/bin is the one
+    Ubuntu's own ~/.profile puts on PATH when it exists -- and a symlink in one
+    of them is a file this tool created and can take back.
+
+    Resolved against HOME when asked rather than when the module loads, so that
+    a test which redirects HOME redirects this too. As a constant it named the
+    developer's own ~/.local/bin, and a suite whose first promise is that it
+    writes nothing outside a temporary directory would have linked into it.
+    """
+    return (os.path.join(HOME, ".local", "bin"), os.path.join(HOME, "bin"))
+
+
+def _path_dirs():
+    """The directories on PATH, absolute, in order."""
+    return [os.path.abspath(os.path.expanduser(entry))
+            for entry in (os.environ.get("PATH") or "").split(os.pathsep)
+            if entry]
+
+
+def launcher_link():
+    """
+    Whether `claude-window` can be typed, and what would make it so.
+
+    Returns (state, path):
+
+      "reachable"  a shell finds this checkout's launcher; path is where.
+      "foreign"    a shell finds a *different* one; path is that one. Another
+                   checkout owns the name, and quietly replacing it would take
+                   its timers' command away from it.
+      "linkable"   nothing on PATH yet, but a conventional bin directory is on
+                   PATH; path is the link to create.
+      "manual"     nothing on PATH and nowhere conventional to link from; path
+                   is the directory the user has to add themselves.
+
+    Printing an `export PATH=...` line and calling it an installation is what
+    this replaces: the line dies with the shell it was printed in, and every
+    instruction this tool gives afterwards begins with `claude-window`.
+    """
+    ours = os.path.join(os.path.abspath(BIN_DIR), COMMAND)
+    on_path = _path_dirs()
+    for directory in on_path:
+        candidate = os.path.join(directory, COMMAND)
+        if not os.path.exists(candidate):
+            continue
+        if os.path.realpath(candidate) == os.path.realpath(ours):
+            return "reachable", candidate
+        return "foreign", candidate
+    for directory in link_dirs():
+        if os.path.abspath(directory) in on_path:
+            return "linkable", os.path.join(directory, COMMAND)
+    return "manual", BIN_DIR
+
+
+def link_launcher(path):
+    """
+    Point `path` at this checkout's launcher. Returns True if it now does.
+
+    A symlink rather than a copy: the launcher embeds the absolute path of
+    this checkout and is rewritten whenever that changes, and a copy would go
+    on naming wherever the checkout used to be.
+
+    Anything already there that is not a link of ours is left alone. Nothing
+    reaches this function in that state -- a `claude-window` on PATH is
+    reported as somebody else's rather than linked over -- but this is the
+    line where a mistake would take away another program's command.
+    """
+    target = os.path.join(os.path.abspath(BIN_DIR), COMMAND)
+    directory = os.path.dirname(path)
+    try:
+        if os.path.lexists(path):
+            if not os.path.islink(path):
+                sys.stderr.write(
+                    "{} already exists and is not a link; leaving it "
+                    "alone.\n".format(path))
+                return False
+            os.remove(path)
+        elif not os.path.isdir(directory):
+            os.makedirs(directory, 0o755)
+        os.symlink(target, path)
+    except OSError as e:
+        sys.stderr.write("Could not link {} to {}: {}\n".format(
+            path, target, e))
+        return False
+    return True
+
+
+# The line added to a shell's startup file, and the comment that makes it
+# findable again. Marked because anything written into somebody else's dotfile
+# has to be removable without them reading a diff to work out which line was
+# ours -- `uninstall --purge` takes it back out by this marker.
+PATH_MARKER = "# Added by claude-window-timing"
+
+
+def shell_rc_file():
+    """
+    The startup file this user's shell reads, or "" if it cannot be guessed.
+
+    $SHELL is the login shell, which is what a *new* terminal will start --
+    the thing being fixed here. bash reads ~/.bashrc for interactive shells
+    and, on the distributions that matter here, sources it from ~/.profile for
+    login shells too, so it is the one file that covers both. fish is left out
+    deliberately: its syntax is not this line, and guessing wrong writes a
+    startup file that errors on every new shell.
+    """
+    shell = os.path.basename(os.environ.get("SHELL") or "")
+    if shell == "bash":
+        return os.path.join(HOME, ".bashrc")
+    if shell == "zsh":
+        return os.path.join(HOME, ".zshrc")
+    if shell in ("sh", "dash", "ksh"):
+        return os.path.join(HOME, ".profile")
+    return ""
+
+
+def path_line_present(path):
+    """Whether `path` already puts this checkout's bin/ on PATH."""
+    body = _read_text(path)
+    return bool(body) and os.path.abspath(BIN_DIR) in body
+
+
+def add_path_line(path):
+    """
+    Append the PATH line to a shell startup file. Returns True if it is there.
+
+    Appended, never rewritten: this is the user's file, it may be under
+    version control, and the only safe edit to make to somebody else's
+    configuration is one at the end that says who made it.
+    """
+    if path_line_present(path):
+        return True
+    try:
+        with open(path, "a") as f:
+            f.write('\n{} -- so `{}` can be typed anywhere.\n'
+                    'export PATH="{}:$PATH"\n'.format(
+                        PATH_MARKER, COMMAND, os.path.abspath(BIN_DIR)))
+    except (IOError, OSError) as e:
+        sys.stderr.write("Could not write {}: {}\n".format(path, e))
+        return False
+    return True
+
+
+def remove_path_line(path):
+    """Take our marked line back out of a startup file. True if anything went."""
+    body = _read_text(path)
+    if not body or PATH_MARKER not in body:
+        return False
+    kept, dropped, lines = [], False, body.splitlines(True)
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith(PATH_MARKER):
+            # The marker and the export beneath it, and the blank line the two
+            # were written after -- exactly what add_path_line wrote.
+            index += 2
+            dropped = True
+            if kept and not kept[-1].strip():
+                kept.pop()
+            continue
+        kept.append(line)
+        index += 1
+    if not dropped:
+        return False
+    try:
+        with open(path, "w") as f:
+            f.writelines(kept)
+    except (IOError, OSError):
+        return False
+    return True
+
+
+def _rehash_hint():
+    """What this shell needs in order to see a command that just appeared."""
+    # bash searches PATH again for a name it has never found, so a link that
+    # lands in a directory already on PATH works in the shell that made it.
+    # zsh keeps a table of what is in each PATH directory and needs telling.
+    return ("  This shell needs `rehash` before it sees it."
+            if os.path.basename(os.environ.get("SHELL") or "") == "zsh" else "")
+
+
+def offer_launcher_link():
+    """
+    Make `claude-window` typeable -- in this shell, and in every later one.
+
+    Asked rather than assumed: a symlink in ~/.local/bin and a line in a
+    startup file are the only things this tool puts outside its own directory
+    other than systemd units, and both are named out loud and taken back by
+    `uninstall --purge`.
+
+    A child process cannot change its parent's environment, so "works in this
+    shell too" has exactly one honest implementation: put the launcher in a
+    directory the shell is *already* searching. Where there is no such
+    directory, the startup file fixes every later shell and the one line
+    printed at the end fixes this one.
+    """
+    state, path = launcher_link()
+    if state == "reachable":
+        print("`{}` is on your PATH ({}).".format(COMMAND, path))
+        return True
+
+    if state == "foreign":
+        print("Another `{}` is already on your PATH:".format(COMMAND))
+        print("  {}".format(path))
+        print("It belongs to a different checkout, so this one is left alone.")
+        print("Run this checkout's copy as:  {}".format(
+            os.path.join(BIN_DIR, COMMAND)))
+        return False
+
+    if state == "linkable":
+        directory = os.path.dirname(path)
+        print("`{}` is not on your PATH yet, but {} is.".format(
+            COMMAND, directory))
+        print("One link there makes it work in this shell as well as in "
+              "every new one.")
+        if _ask_yes("Link it into {}?".format(directory)):
+            if link_launcher(path):
+                print("  Linked {} -> {}".format(
+                    path, os.path.join(BIN_DIR, COMMAND)))
+                hint = _rehash_hint()
+                if hint:
+                    print(hint)
+                return True
+
+    elif state == "manual":
+        rc = shell_rc_file()
+        if rc and not path_line_present(rc):
+            print("`{}` is not on your PATH, and nothing on your PATH is a "
+                  "place this".format(COMMAND))
+            print("tool should be putting files. One line in {} fixes every "
+                  "new shell.".format(_tilde(rc)))
+            if _ask_yes("Add it to {}?".format(_tilde(rc))) \
+                    and add_path_line(rc):
+                print("  Added to {}, marked so `uninstall --purge` can take "
+                      "it back out.".format(_tilde(rc)))
+                print("  This shell has already read that file, so for this "
+                      "one only:")
+                print('    export PATH="{}:$PATH"'.format(BIN_DIR))
+                return True
+        elif rc and path_line_present(rc):
+            # The line is there and PATH still lacks it: this shell started
+            # before it was added. Nothing to write, only something to run.
+            print("{} already puts `{}` on the PATH of new shells.".format(
+                _tilde(rc), COMMAND))
+            print("This shell started before that, so for this one only:")
+            print('  export PATH="{}:$PATH"'.format(BIN_DIR))
+            return True
+
+    print("Add it to your PATH to type `{}` anywhere:".format(COMMAND))
+    print('  export PATH="{}:$PATH"'.format(BIN_DIR))
+    print("  (in ~/.bashrc, ~/.zshrc, or wherever your shell reads it)")
+    return False
 
 
 def report_findings(findings):
@@ -4874,10 +5158,8 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
                       .format(COMMAND))
                 print("error until the two agree.")
     print()
-    write_entry_point()
-    print("Wrote {}".format(os.path.join(BIN_DIR, COMMAND)))
-    print("  put it on your PATH with:  "
-          "export PATH=\"{}:$PATH\"".format(BIN_DIR))
+    print("Wrote {}".format(write_entry_point()))
+    offer_launcher_link()
 
     # ── What happens next ───────────────────────────────────────────────────
     print()
@@ -5173,6 +5455,20 @@ def uninstall(accounts, purge=False):
         # Generated files only, each one re-created by the next install. The
         # ping directories are deliberately not in this list: they hold logins,
         # and a flag called --purge is not consent to sign anybody out.
+        # The link is removed before the launcher it points at, and only
+        # when it is ours: a `claude-window` on PATH belonging to another
+        # checkout is that checkout's, and purging here would take away the
+        # command its timers were installed with.
+        state, link = launcher_link()
+        if state == "reachable" and os.path.islink(link):
+            try:
+                os.remove(link)
+                removed.append(link)
+            except OSError:
+                pass
+        rc = shell_rc_file()
+        if rc and remove_path_line(rc):
+            removed.append("the PATH line in " + _tilde(rc))
         for path in (STATE_ROOT, SCHEDULE_FILE, ACCOUNTS_FILE,
                      os.path.join(BIN_DIR, COMMAND), BIN_DIR):
             if os.path.isdir(path):
@@ -5619,10 +5915,8 @@ def cli(argv=None):
                           ", ".join(a.name for a in kept), USER_CONFIG_DIR))
             return 0
         if command == "install-command":
-            path = write_entry_point()
-            print("Wrote {}".format(path))
-            print("Put it on your PATH:  export PATH=\"{}:$PATH\"".format(
-                BIN_DIR))
+            print("Wrote {}".format(write_entry_point()))
+            offer_launcher_link()
             return 0
         if command == "init":
             init(_selected(accounts, args.account))

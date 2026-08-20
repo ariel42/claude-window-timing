@@ -2902,6 +2902,196 @@ def test_the_first_run_screen_says_the_things_that_stop_people():
         ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE, ew.HOME, sys.stdin = saved
 
 
+def _launcher_sandbox():
+    """A home, a checkout's bin/, and a PATH nobody's real shell shares."""
+    root = tempfile.mkdtemp()
+    home = os.path.join(root, "home")
+    os.makedirs(home)
+    saved = (ew.HOME, ew.BIN_DIR, ew.link_dirs, ew.STATE_ROOT,
+             ew.ACCOUNTS_FILE, ew.SCHEDULE_FILE, ew._systemctl, ew._run,
+             os.environ.get("PATH"), os.environ.get("SHELL"), sys.stdin)
+    ew.HOME = home
+    ew.BIN_DIR = os.path.join(root, "repo", "bin")
+    ew.STATE_ROOT = os.path.join(root, "repo", "state")
+    ew.ACCOUNTS_FILE = os.path.join(root, "repo", "accounts.json")
+    ew.SCHEDULE_FILE = os.path.join(root, "repo", "schedule.json")
+
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+
+    ew._systemctl = lambda *a: Ok()
+    ew._run = lambda cmd: Ok()
+    os.environ["SHELL"] = "/bin/bash"
+    os.environ["PATH"] = "/usr/bin:/bin"
+
+    def restore():
+        (ew.HOME, ew.BIN_DIR, ew.link_dirs, ew.STATE_ROOT, ew.ACCOUNTS_FILE,
+         ew.SCHEDULE_FILE, ew._systemctl, ew._run, path, shell,
+         sys.stdin) = saved
+        for name, value in (("PATH", path), ("SHELL", shell)):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        shutil.rmtree(root, ignore_errors=True)
+
+    return restore, root, home
+
+
+def test_the_command_can_be_typed_after_installing():
+    """
+    An install that ends in "command not found" is not an install.
+
+    Every instruction this tool gives -- in setup, in `which`, in `status`, in
+    `doctor`'s hints -- begins with `claude-window`, and for a long time the
+    installer only *printed* an `export PATH=...` line, which dies with the
+    shell it was printed in. A new terminal knew nothing about it.
+
+    A child process cannot change its parent's environment, so "works in the
+    shell you installed from" has exactly one honest implementation: put the
+    launcher in a directory that shell is already searching. That is what the
+    link does, and it is why the fallback -- a line in a startup file, which
+    only new shells read -- comes with the one command to run here and now.
+    """
+    section("Making `claude-window` typeable, here and in new shells")
+    restore, root, home = _launcher_sandbox()
+    try:
+        launcher = ew.write_entry_point()
+        check("the launcher is written inside the checkout",
+              os.path.dirname(launcher), ew.BIN_DIR)
+        # Resolved against HOME when asked. As a constant read at import it
+        # named the real ~/.local/bin, and this suite would have linked into
+        # the home of whoever ran it.
+        check("the directories it may link into follow HOME",
+              ew.link_dirs()[0], os.path.join(home, ".local", "bin"))
+
+        # -- already reachable: say so, change nothing ---------------------
+        os.environ["PATH"] = ew.BIN_DIR + ":/usr/bin"
+        check("a checkout already on PATH needs nothing",
+              ew.launcher_link(), ("reachable", launcher))
+        said, _, done = _capture(ew.offer_launcher_link)
+        check_true("and says so", done and "on your PATH" in said)
+        check("with no finding from doctor", ew._launcher_findings(), [])
+
+        # -- somebody else's launcher: never quietly replaced --------------
+        other = os.path.join(root, "other-bin")
+        os.makedirs(other)
+        with open(os.path.join(other, ew.COMMAND), "w") as f:
+            f.write("#!/bin/sh\necho other\n")
+        os.chmod(os.path.join(other, ew.COMMAND), 0o755)
+        os.environ["PATH"] = other + ":/usr/bin"
+        state, found = ew.launcher_link()
+        check("another checkout's launcher is recognised as foreign", state,
+              "foreign")
+        said, _, done = _capture(ew.offer_launcher_link)
+        check_true("which is reported rather than replaced",
+                   not done and "different checkout" in said)
+        check("and the other file is left exactly as it was",
+              open(os.path.join(other, ew.COMMAND)).read(),
+              "#!/bin/sh\necho other\n")
+        findings = ew._launcher_findings()
+        check("doctor says which one wins", len(findings), 1)
+        check_true("naming both", found in findings[0].hint
+                   and launcher in findings[0].hint)
+
+        # -- linkable: one link into a directory PATH already holds --------
+        local = os.path.join(home, ".local", "bin")
+        os.makedirs(local)
+        os.environ["PATH"] = local + ":/usr/bin"
+        check("a conventional bin directory on PATH is where it goes",
+              ew.launcher_link(), ("linkable", os.path.join(local, ew.COMMAND)))
+        findings = ew._launcher_findings()
+        check("until then doctor says the command cannot be typed",
+              len(findings), 1)
+        check_true("and names the command that fixes it",
+                   "install-command" in findings[0].hint)
+
+        sys.stdin = io.StringIO("n\n")
+        said, _, done = _capture(ew.offer_launcher_link)
+        check_true("declining leaves nothing behind",
+                   not done and not os.path.exists(os.path.join(local, ew.COMMAND)))
+        check_true("and prints the line that would do it",
+                   'export PATH="{}:$PATH"'.format(ew.BIN_DIR) in said)
+
+        sys.stdin = io.StringIO("y\n")
+        said, _, done = _capture(ew.offer_launcher_link)
+        link = os.path.join(local, ew.COMMAND)
+        check_true("accepting creates the link", done and os.path.islink(link))
+        check("which points at this checkout's launcher",
+              os.path.realpath(link), os.path.realpath(launcher))
+        # The whole point: the directory was already on PATH, so the shell
+        # that ran the install finds it without being restarted.
+        check("so this very shell's PATH finds it", shutil.which(ew.COMMAND),
+              link)
+        check("and doctor has nothing left to say", ew._launcher_findings(), [])
+
+        # -- a real file in the way is never removed -----------------------
+        os.remove(link)
+        with open(link, "w") as f:
+            f.write("mine\n")
+        _, err, done = _capture(lambda: ew.link_launcher(link))
+        check_true("a file that is not our link stays",
+                   not done and open(link).read() == "mine\n"
+                   and "not a link" in err)
+        os.remove(link)
+
+        # -- nothing on PATH to link into: the startup file, plus this shell
+        os.environ["PATH"] = "/usr/bin:/bin"
+        ew.link_dirs = lambda: (os.path.join(home, "nowhere"),)
+        check("with nowhere to link, it says so",
+              ew.launcher_link(), ("manual", ew.BIN_DIR))
+        rc = os.path.join(home, ".bashrc")
+        with open(rc, "w") as f:
+            f.write("# theirs\n")
+        check("the startup file is the login shell's", ew.shell_rc_file(), rc)
+
+        sys.stdin = io.StringIO("n\n")
+        said, _, done = _capture(ew.offer_launcher_link)
+        check("declining writes nothing", open(rc).read(), "# theirs\n")
+        check_true("and still prints the line to paste",
+                   'export PATH="{}:$PATH"'.format(ew.BIN_DIR) in said)
+
+        sys.stdin = io.StringIO("y\n")
+        said, _, done = _capture(ew.offer_launcher_link)
+        body = open(rc).read()
+        check_true("accepting appends one marked line",
+                   done and body.startswith("# theirs\n")
+                   and ew.PATH_MARKER in body and ew.BIN_DIR in body)
+        check_true("and says how to fix the shell that cannot read it yet",
+                   'export PATH="{}:$PATH"'.format(ew.BIN_DIR) in said)
+
+        sys.stdin = io.StringIO("y\n")
+        _capture(ew.offer_launcher_link)
+        check("a second run does not add it twice",
+              open(rc).read().count(ew.PATH_MARKER), 1)
+        said, _, done = _capture(ew.offer_launcher_link)
+        check_true("it says the line is already there, and what this shell needs",
+                   done and "already puts" in said
+                   and 'export PATH="{}:$PATH"'.format(ew.BIN_DIR) in said)
+
+        # -- what a purge takes back ---------------------------------------
+        os.environ["PATH"] = local + ":/usr/bin"
+        ew.link_dirs = lambda: (local,)
+        sys.stdin = io.StringIO("y\n")
+        _capture(ew.offer_launcher_link)
+        check_true("linked again for the purge to find", os.path.islink(link))
+        removed = ew.uninstall([], purge=True)
+        check_true("purge removes the link it made",
+                   not os.path.lexists(link) and link in removed)
+        check_true("and the line it added to the startup file",
+                   ew.PATH_MARKER not in open(rc).read())
+        check("leaving the rest of the file alone", open(rc).read(), "# theirs\n")
+
+        # A launcher belonging to somebody else is not ours to remove.
+        os.environ["PATH"] = other + ":/usr/bin"
+        ew.uninstall([], purge=True)
+        check_true("a foreign launcher survives a purge",
+                   os.path.exists(os.path.join(other, ew.COMMAND)))
+    finally:
+        restore()
+
+
 def test_a_timer_that_will_never_fire_again_is_noticed():
     """
     A systemd timer can be enabled, active, and still never fire again — a
@@ -6364,6 +6554,7 @@ def main():
                  test_setup_lays_accounts_out_sensibly,
                  test_setup_and_init_refuse_the_obviously_wrong,
                  test_the_first_run_screen_says_the_things_that_stop_people,
+                 test_the_command_can_be_typed_after_installing,
                  test_a_timer_that_will_never_fire_again_is_noticed,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
