@@ -4848,11 +4848,100 @@ def test_the_wizard_asks_for_each_sign_in_once_and_no_more():
     finally:
         restore()
 
-    # Nobody signed in anywhere: every store is asked for, none skipped.
+    # Nobody signed in to Claude Code at all -- a machine where none of this
+    # has ever run. Nothing can be adopted, so the count is the full 2N with
+    # the pings and N without, and both have to be reachable: needing an
+    # existing login before you can set up a login would be a circle.
     restore, home, accounts = _switch_sandbox(pings=False)
     try:
-        check("with no login of their own, every account needs a store",
-              len(ew.sign_ins_needed(accounts, pings=False)), 2)
+        check("nothing is signed in, so nothing is recognised",
+              ew.current_account(accounts), None)
+        check("without the pings that is one sign-in per account",
+              len(ew.sign_ins_needed(accounts, pings=False)), len(accounts))
+    finally:
+        restore()
+
+    restore, home, accounts = _switch_sandbox(pings=False)
+    try:
+        # Ping directories absent as well: the state of a brand new machine.
+        needed = ew.sign_ins_needed(accounts, pings=True)
+        check("with the pings it is two per account", len(needed),
+              2 * len(accounts))
+        check("still grouped, so the browser changes identity twice not four "
+              "times", [a.name for _w, a, _d in needed], ["1", "1", "2", "2"])
+    finally:
+        restore()
+
+
+def test_the_installer_insists_on_claude_code_in_both_modes():
+    """
+    Both modes need the CLI, for different reasons: the pings run it, and a
+    parked login is *created* by running it and signing in. Installing without
+    it would write a configuration that cannot do anything yet, so it fails
+    early and says where to get it.
+
+    systemd is different — only the pings need it, so requiring it on a machine
+    that will never own a timer would turn a working setup into an error for a
+    component it never uses.
+    """
+    section("The installer insists on Claude Code")
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    home = tempfile.mkdtemp()
+    try:
+        for mode in ([], ["--no-pings"]):
+            label = " ".join(mode) or "with the pings"
+            # A PATH with python3 but no claude, and a HOME with none either.
+            result = subprocess.run(
+                ["bash", os.path.join(here, "install.sh")] + mode,
+                cwd=here, capture_output=True, text=True,
+                env={"HOME": home, "PATH": "/usr/bin:/bin"})
+            check("{}: refuses without the CLI".format(label),
+                  result.returncode, 1)
+            check_true("{}: says what is missing".format(label),
+                       "Claude Code CLI not found" in result.stderr)
+            check_true("{}: and where to get it".format(label),
+                       "claude.ai/download" in result.stderr)
+        check_true("the switch-only refusal explains why it needs it too",
+                   "signing in to an account is done by running claude" in
+                   subprocess.run(["bash", os.path.join(here, "install.sh"),
+                                   "--no-pings"], cwd=here, capture_output=True,
+                                  text=True,
+                                  env={"HOME": home, "PATH": "/usr/bin:/bin"}
+                                  ).stderr)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_the_first_switch_on_a_machine_that_has_never_run_claude_code():
+    """
+    Someone can install this before ever signing in to Claude Code — indeed
+    that is the ordinary case on a new laptop, where the store sign-in *is*
+    their first login. The first switch then has nothing to park and nothing to
+    back up, and has to create both files from nothing rather than assume they
+    are there.
+    """
+    section("The first switch on a machine that has never run Claude Code")
+
+    restore, home, accounts = _switch_sandbox(parked=("2",), pings=False)
+    try:
+        check("~/.claude does not exist yet",
+              os.path.exists(ew.USER_CONFIG_DIR), False)
+        check("nor does ~/.claude.json",
+              os.path.exists(ew.USER_CONFIG_JSON), False)
+
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("the first switch succeeds", code, 0)
+        check("it is signed in as the account switched to",
+              ew.account_identity(ew.user_login())["email"], "a2@example.com")
+        check("which is recognised from then on",
+              ew.current_account(accounts).name, "2")
+        check("and the store is empty, as after any switch",
+              os.path.exists(ew.credentials_path(ew.switch_store(accounts[1]))),
+              False)
+        check("nothing claims to have parked a login that was never there",
+              "Parked" in out, False)
     finally:
         restore()
 
@@ -5153,6 +5242,8 @@ def main():
                  test_running_sessions_are_looked_for_without_counting_our_own_pings,
                  test_a_machine_can_be_told_it_does_not_ping,
                  test_the_wizard_asks_for_each_sign_in_once_and_no_more,
+                 test_the_installer_insists_on_claude_code_in_both_modes,
+                 test_the_first_switch_on_a_machine_that_has_never_run_claude_code,
                  test_a_switch_only_machine_knows_which_account_it_is_on,
                  test_doctor_on_a_switch_only_machine_reports_only_what_applies,
                  test_setup_can_install_the_switcher_without_the_pings,

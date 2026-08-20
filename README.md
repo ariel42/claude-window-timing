@@ -139,6 +139,8 @@ cd claude-early-window
 ./install.sh
 ```
 
+Claude Code itself must already be installed — on every machine, including the ones that only switch, because signing in to an account *is* running `claude` and signing in. The installer stops and says so if it is missing. You do **not** need to be signed in to anything first.
+
 The wizard asks how many accounts you have and whether this machine should run the pings, shows the directories it will create, walks you through signing in to each, creates one background conversation per account, and starts a timer for each. Re-run it any time — adding an account, or changing your mind about the pings, is just running it again. It asks only for the sign-ins that are still missing, so a re-run costs nothing you have already done.
 
 For an unattended install: `./install.sh --accounts 2 -y`, and `--no-pings` on the machines that only switch.
@@ -147,7 +149,7 @@ Three things worth knowing:
 
 - **Signing in sends no message to Claude**, so it starts no usage window. There is no good or bad moment, and nothing to time.
 - **Sign in to each directory even if you already use that account elsewhere.** Each gets its own login rather than a copy of one, so a token refresh in a ping directory can never log you out of your own Claude Code.
-- **How many sign-ins that is.** One per ping directory, plus one per account you want to switch to — except the account you are already signed in as, which needs none, because that login moves into its own store the first time you switch away from it. On a machine running the pings for two accounts, that is three; on a machine that only switches, one. Two per account is the floor, not an accident: the ping directory refreshes that account's token every eight hours forever, your own Claude Code refreshes too, and rotation is strict — one login in both places means whichever refreshes second is signed out. Setup lists an account's sign-ins together so that a browser only has to change identity once per account, which is the part that actually costs time under SSO.
+- **How many sign-ins that is.** One per ping directory, plus one per account you want to switch to — except the account you are already signed in as, which needs none, because that login moves into its own store the first time you switch away from it. On a machine running the pings for two accounts, that is three; on a machine that only switches, one. If you have never signed in to Claude Code on this machine there is nothing to adopt, so it is two per account and one per account respectively — and that works: nothing here needs you to be signed in before you start. Two per account is the floor, not an accident: the ping directory refreshes that account's token every eight hours forever, your own Claude Code refreshes too, and rotation is strict — one login in both places means whichever refreshes second is signed out. Setup lists an account's sign-ins together so that a browser only has to change identity once per account, which is the part that actually costs time under SSO.
 
 You never have to be awake at a particular hour. The service works out where each window sits and spaces them itself, holding an account back when that is what it takes.
 
