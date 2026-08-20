@@ -2131,6 +2131,33 @@ def anchor_pending(account):
     return value if value and value not in ("n/a", "0") else ""
 
 
+def _system_local(epoch):
+    """
+    `epoch` as wall clock in the *system's* timezone, whatever TZ this process
+    was handed.
+
+    systemd reads an OnCalendar stamp in the system's zone, not in the
+    environment of whoever wrote it, so the two have to agree. They do when TZ
+    is unset, which is how the timer runs a ping. They do not for somebody who
+    runs a command by hand from a shell with TZ set to somewhere else, and the
+    anchor is then booked hours from where it was meant to be -- forward, and
+    the ping happens at the wrong moment, or backward, where an OnCalendar time
+    in the past simply never fires. Either way the one correction the schedule
+    relies on is silently absent.
+
+    Everything this tool *prints* stays in the reader's TZ, which is theirs to
+    set. This is not printed: it is an instruction to systemd.
+    """
+    saved = os.environ.pop("TZ", None)
+    try:
+        time.tzset()
+        return datetime.fromtimestamp(epoch)
+    finally:
+        if saved is not None:
+            os.environ["TZ"] = saved
+        time.tzset()
+
+
 def schedule_anchor(account, target_epoch):
     """
     Create a transient one-shot timer that starts the ping service at target_epoch.
@@ -2145,7 +2172,7 @@ def schedule_anchor(account, target_epoch):
     another anchor would end up trying to cancel its own parent.
     """
     cancel_anchor(account)
-    stamp = datetime.fromtimestamp(target_epoch).strftime("%Y-%m-%d %H:%M:%S")
+    stamp = _system_local(target_epoch).strftime("%Y-%m-%d %H:%M:%S")
     result = _run(
         ["systemd-run", "--user", "--collect",
          "--unit", account.anchor_unit,

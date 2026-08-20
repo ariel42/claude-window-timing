@@ -330,6 +330,47 @@ def test_anchor_scheduling():
     check("cancelling removes the unit", _anchor_timer_count(account), 0)
 
 
+def test_the_anchor_is_booked_in_the_zone_systemd_reads():
+    """
+    The anchor is a wall-clock instruction handed to systemd, which reads it in
+    the system's timezone -- not in the TZ of whoever wrote it. Built from
+    `datetime.fromtimestamp`, a process run with TZ set elsewhere books the
+    anchor hours away from the boundary it was aiming at, and an OnCalendar
+    time that has already passed never fires at all.
+
+    Checked against the machine's own answer rather than a fixed zone, so this
+    says the same thing wherever it runs.
+    """
+    section("The anchor is booked in the zone systemd reads")
+    epoch = time.time() + 1800
+    saved = os.environ.get("TZ")
+    try:
+        os.environ.pop("TZ", None)
+        time.tzset()
+        expected = datetime.fromtimestamp(epoch)
+        moved = 0
+        for zone in ("UTC", "America/New_York", "Asia/Tokyo"):
+            os.environ["TZ"] = zone
+            time.tzset()
+            check("TZ={} does not move the stamp".format(zone),
+                  ew._system_local(epoch), expected)
+            if datetime.fromtimestamp(epoch) != expected:
+                moved += 1
+        # Whatever this machine's own zone is, it cannot be all three of
+        # those, so an ordinary clock read did follow TZ even where the stamp
+        # did not. Counted rather than compared by name: "Etc/UTC" and "UTC"
+        # are the same zone under two spellings.
+        check_true("while an ordinary clock read did follow TZ", moved >= 1)
+        check_true("TZ is left exactly as it was found",
+                   os.environ.get("TZ") == "Asia/Tokyo")
+    finally:
+        if saved is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = saved
+        time.tzset()
+
+
 def _have_systemd():
     """
     Whether a transient unit can actually be created from here.
@@ -6607,7 +6648,9 @@ def main():
         ew.urllib.error.URLError("the test suite does not have a network"))
 
     for test in (test_refusal_text, test_next_window_start, test_guard_rails,
-                 test_anchor_scheduling, test_statusline_parsing,
+                 test_anchor_scheduling,
+                 test_the_anchor_is_booked_in_the_zone_systemd_reads,
+                 test_statusline_parsing,
                  test_an_impossible_usage_report_is_ignored,
                  test_a_checkpoint_from_another_directory_is_rebuilt,
                  test_schedule_carries_account_identity,
