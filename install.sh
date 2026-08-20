@@ -28,19 +28,31 @@ if [ ! -x "$CLAUDE_BIN" ]; then
     exit 1
 fi
 
-if ! command -v systemctl &>/dev/null; then
-    echo "ERROR: systemctl not found — this tool requires systemd." >&2
-    exit 1
-fi
+# systemd is what runs the pings. A machine that only switches accounts has no
+# timers, so requiring it there would turn a working setup into an error for a
+# component it never uses.
+WANTS_PINGS=1
+for arg in "$@"; do
+    [ "$arg" = "--no-pings" ] && WANTS_PINGS=0
+done
 
-# systemd-run creates the one-shot anchors that re-align each schedule with its
-# real window boundary. Without it the tool still pings on its fixed cadence; it
-# just cannot correct its phase after a missed ping, or hold an account back to
-# space the accounts out.
-if ! command -v systemd-run &>/dev/null; then
-    echo "WARNING: systemd-run not found — boundary anchoring and spacing will"
-    echo "         be disabled."
-    echo ""
+if [ "$WANTS_PINGS" = "1" ]; then
+    if ! command -v systemctl &>/dev/null; then
+        echo "ERROR: systemctl not found — running the pings requires systemd." >&2
+        echo "       To set this machine up for switching accounts only:" >&2
+        echo "           ./install.sh --no-pings" >&2
+        exit 1
+    fi
+
+    # systemd-run creates the one-shot anchors that re-align each schedule with
+    # its real window boundary. Without it the tool still pings on its fixed
+    # cadence; it just cannot correct its phase after a missed ping, or hold an
+    # account back to space the accounts out.
+    if ! command -v systemd-run &>/dev/null; then
+        echo "WARNING: systemd-run not found — boundary anchoring and spacing will"
+        echo "         be disabled."
+        echo ""
+    fi
 fi
 
 exec python3 "$SCRIPT_DIR/claude_early_window.py" setup "$@"

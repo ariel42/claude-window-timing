@@ -394,6 +394,22 @@ def load_accounts(path=None):
     return parse_accounts(data)
 
 
+def pings_here(path=None):
+    """
+    Whether this machine runs the pings. From accounts.json; defaults to yes.
+
+    Persisted rather than inferred, because everything downstream turns on it.
+    A machine that only switches accounts has no ping directories, no
+    checkpoints and no timers, and a `doctor` that reported all three as broken
+    would be worse than no `doctor` at all. Absent, the answer is yes: that is
+    what every install predating the flag was, and what the common case still
+    is.
+    """
+    path = path or ACCOUNTS_FILE
+    value = _read_json(path).get("pings", True)
+    return value is not False
+
+
 def find_account(accounts, name):
     """The named account, or raise ConfigError naming the ones that do exist."""
     for account in accounts:
@@ -2682,6 +2698,38 @@ def status(accounts):
 # and "it stopped helping" is all the user would otherwise see.
 
 def doctor(accounts):
+    # A machine that only switches has no ping directories, no checkpoints and
+    # no timers. Reporting all three as broken would bury the one finding that
+    # matters there -- the state of the parked logins -- under six errors
+    # describing a machine this was never meant to be.
+    pings = pings_here()
+    if not pings:
+        findings = switch_findings(accounts)
+        findings.extend(_stray_unit_findings(accounts))
+        if installed_units():
+            findings.append(Finding(
+                "error",
+                "This machine is configured not to ping, but its timers are "
+                "still installed",
+                "It is pinging anyway, which doubles what those accounts "
+                "consume for no benefit. Re-run ./install.sh --no-pings to "
+                "stop them, or ./install.sh --pings if this machine should be "
+                "the one doing it."))
+        if not parked_logins(accounts) and not switching_configured(accounts):
+            findings.append(Finding(
+                "warning",
+                "This machine switches accounts but has no logins parked",
+                "Run ./install.sh, or sign in as you need them: `{} switch` "
+                "offers the one it needs, when it needs it.".format(COMMAND)))
+        if not read_schedule():
+            findings.append(Finding(
+                "warning",
+                "No schedule.json here, so nothing knows which account to spend",
+                "Copy it from the machine running the pings; `{} which` reads "
+                "it and needs nothing else.".format(COMMAND)))
+        order = {"error": 0, "warning": 1}
+        return report_findings(sorted(findings, key=lambda f: order.get(f.level, 2)))
+
     findings = validate_accounts(accounts)
     now = time.time()
 
@@ -3176,6 +3224,18 @@ def current_account(accounts):
         for login in (account, switch_store(account)):
             if account_identity(login)["account_uuid"] == mine:
                 return account
+    # A machine that pings nothing has no ping directories to compare against,
+    # and nothing parked until the first switch — so on a fresh secondary
+    # machine the two loops above can see no identities at all. The pinging
+    # machine already publishes each account's UUID in schedule.json, which is
+    # the file the README has people copy across, so use it rather than telling
+    # somebody their own account is unrecognised.
+    for entry in (read_schedule() or {}).get("accounts", []):
+        if not isinstance(entry, dict) or entry.get("account_uuid") != mine:
+            continue
+        for account in accounts:
+            if account.name == str(entry.get("name")):
+                return account
     return None
 
 
@@ -3377,7 +3437,71 @@ def install_login(store):
     return dropped
 
 
-def switch_blockers(accounts, account):
+def prepare_store(store):
+    """
+    Give a store directory the little `.claude.json` a sign-in needs.
+
+    The same three keys a ping directory gets, for the same reason: a fresh
+    directory otherwise opens on onboarding and a trust prompt, and somebody
+    part-way through a switch should meet `/login` and nothing else. Merged
+    rather than overwritten, so re-running cannot discard an identity already
+    there.
+    """
+    if not os.path.isdir(store.config_dir):
+        os.makedirs(store.config_dir, 0o700)
+    config = _read_json(store.config_json)
+    for key, value in ping_config(store.config_dir).items():
+        if key == "projects":
+            entry = config.setdefault("projects", {}).setdefault(
+                store.config_dir, {})
+            entry["hasTrustDialogAccepted"] = True
+        else:
+            config.setdefault(key, value)
+    _write_atomically(store.config_json,
+                      json.dumps(config, indent=2, sort_keys=True),
+                      _existing_mode(store.config_json))
+
+
+def offer_sign_in(account, store):
+    """
+    Offer to run the one browser sign-in this switch is missing. True if done.
+
+    Printing a command and stopping is the wrong answer here: this is exactly
+    where somebody is when they discover they need it, and the alternative is
+    that they go and copy a credential from somewhere, which is the one mistake
+    that costs a login. Declining is free — the blocker below prints the
+    command anyway.
+    """
+    print("No login is parked for account {}.".format(account.display))
+    print()
+    print("Switching to it needs one browser sign-in, once on this machine.")
+    print("Give it its own sign-in rather than copying an existing one:")
+    print("refresh tokens rotate, so one login living in two directories has")
+    print("about eight hours before one of the two is signed out.")
+    print()
+    if not _ask_yes("Sign in to account {} now?".format(account.display)):
+        return False
+
+    prepare_store(store)
+    print()
+    print("Starting Claude Code in {}".format(store.config_dir))
+    print("Run /login, then /exit once it says you are signed in.")
+    print()
+    env = dict(os.environ)
+    env["CLAUDE_CONFIG_DIR"] = store.config_dir
+    # The same three that would silently outrank the login being created.
+    for var in _ACCOUNT_OVERRIDE_VARS:
+        env.pop(var, None)
+    try:
+        subprocess.call([CLAUDE_PATH], env=env, cwd=store.config_dir)
+    except OSError as e:
+        print("Could not start Claude Code: {}".format(e))
+        return False
+    print()
+    return bool(account_identity(store)["has_token"])
+
+
+def switch_blockers(accounts, account, usable=None):
     """
     Everything that should stop or interrupt a switch to `account`, worst first.
 
@@ -3466,8 +3590,8 @@ def switch_blockers(accounts, account):
             "anyway — it writes these files by rename — so nothing is lost that "
             "was not already going to be."))
 
-    state = read_state(account)
-    usable = account_availability(account, state, time.time())
+    if usable is None:
+        usable = account_availability(account, read_state(account), time.time())
     if usable.tier == WAITING:
         findings.append(Finding(
             "warning",
@@ -3484,13 +3608,17 @@ def switch_blockers(accounts, account):
     return findings
 
 
-def switch_account(accounts, name=None):
+def switch_account(accounts, name=None, sign_in=True):
     """
     Point the user's own Claude Code at one account. Returns an exit code.
 
     With no account named it follows `which`, which is the useful default: the
     reason to switch is almost always "this one is spent, give me the one that
     is not". Naming an account overrides that without argument.
+
+    `sign_in` is what makes the first switch to an account survivable rather
+    than a dead end; set it False for anything unattended, where a prompt would
+    hang and a spawned Claude Code would never be answered.
     """
     if len(accounts) < 2:
         sys.stderr.write(
@@ -3498,10 +3626,29 @@ def switch_account(accounts, name=None):
             "between.\nAdd another to accounts.json and re-run ./install.sh.\n")
         return 2
 
+    # Where the readings come from. On the pinging machine that is its own
+    # state; on any other it is the schedule that machine published, which is
+    # the same fallback `which` uses -- otherwise a bare `switch` on a laptop
+    # would choose from no information at all and pick the first account every
+    # time.
+    view = schedule_view(accounts)
+    if view:
+        known, states, avail, _ = view
+    else:
+        known = accounts
+        states = {a.name: read_state(a) for a in accounts}
+        avail = availabilities(known, states, time.time())
+
     if name:
         account = find_account(accounts, name)
     else:
-        account, _ = choose_account(accounts)
+        chosen, _ = choose_account(known, states, time.time(), avail)
+        try:
+            account = find_account(accounts, chosen.name)
+        except ConfigError:
+            # The schedule knows an account this machine's accounts.json does
+            # not. Its name is all the switch needs.
+            account = chosen
 
     current = current_account(accounts)
     if current is not None and current.name == account.name:
@@ -3509,7 +3656,13 @@ def switch_account(accounts, name=None):
             account.display))
         return 0
 
-    findings = switch_blockers(accounts, account)
+    # Before judging: the one missing piece a person can supply right now.
+    store = switch_store(account)
+    if (sign_in and not os.path.exists(credentials_path(store))
+            and sys.stdin.isatty() and not ASSUME_YES):
+        offer_sign_in(account, store)
+
+    findings = switch_blockers(accounts, account, avail.get(account.name))
     errors = [f for f in findings if f.level == "error"]
     for finding in findings:
         stream = sys.stderr if finding.level == "error" else sys.stdout
@@ -3560,8 +3713,8 @@ def switch_account(accounts, name=None):
               "this account on their next request, while still showing the "
               "old one.".format(len(sessions)))
 
-    state = read_state(account)
-    expiry = next_expiry(state, time.time())
+    expiry = next_expiry(states.get(account.name) or read_state(account),
+                         time.time())
     if expiry != float("inf"):
         print("  Account {}'s window ends {} (in {}).".format(
             account.name, fmt_time(expiry), fmt_delta(expiry - time.time())))
@@ -3637,7 +3790,18 @@ def switch_findings(accounts):
 #     the runtime's job; the worst that comes of ignoring the advice is that the
 #     tool spends a little longer getting the spacing right.
 
+# Set by `setup --yes`. A module global rather than an argument threaded through
+# every call, because the questions are asked from several places and a flag
+# that reached only some of them would hang the unattended install on the one
+# it missed.
+ASSUME_YES = False
+
+
 def _ask(prompt, default=""):
+    if ASSUME_YES:
+        # Echoed, so an unattended transcript still shows what was decided.
+        print("{} {}".format(prompt, default))
+        return default
     try:
         answer = input("{} ".format(prompt)).strip()
     except EOFError:
@@ -3653,8 +3817,49 @@ def _ask_yes(prompt, default=True):
     return answer.startswith("y")
 
 
-def setup(argv_accounts=None):
+def sign_ins_needed(accounts, pings):
+    """
+    Every directory on this machine still needing a browser sign-in.
+
+    Returns (what it is for, account, directory) triples. Two rules decide the
+    list, and both come from measurement rather than taste:
+
+      * Each directory that refreshes a token needs its **own** sign-in.
+        Refresh tokens rotate strictly — the token a refresh replaces is
+        rejected from that moment — so one login copied into two directories
+        has about eight hours before whichever refreshed last strips the other,
+        and the loser's next refresh empties its credentials file.
+
+      * The account you are already signed in as needs no store sign-in. Its
+        login is *moved* into the store the first time you switch away, which
+        keeps the one-live-copy rule intact. Copying it there now would break
+        exactly that rule.
+
+    Anything already signed in is skipped, so re-running to add an account asks
+    only for the new one.
+    """
+    needed = []
+    if pings:
+        for account in accounts:
+            if not account_identity(account)["has_token"]:
+                needed.append(("pings for account {}".format(account.display),
+                               account, account.config_dir))
+    mine = current_account(accounts)
+    for account in accounts:
+        store = switch_store(account)
+        if account_identity(store)["has_token"]:
+            continue
+        if mine is not None and mine.name == account.name:
+            continue
+        needed.append(("switching to account {}".format(account.display),
+                       account, store.config_dir))
+    return needed
+
+
+def setup(argv_accounts=None, pings=None, assume_yes=False):
     """The whole first-run experience. Safe to re-run at any time."""
+    global ASSUME_YES
+    ASSUME_YES = assume_yes
     print("Claude Code Early Window — setup")
     print("=" * 32)
     print()
@@ -3692,11 +3897,34 @@ def setup(argv_accounts=None):
             return 0
 
     accounts = _plan_accounts(existing if configured else [], count)
+
+    if pings is None:
+        print()
+        print("The pings belong on ONE machine. A usage window belongs to the")
+        print("account, server-side, so a second machine pinging the same")
+        print("accounts doubles what they consume and buys nothing at all.")
+        print()
+        print("Answer n on every other machine. It can still switch accounts,")
+        print("which needs no timers and spends nothing.")
+        print()
+        pings = _ask_yes("Run the pings from this machine?", default=pings_here())
+
     print()
     print("Layout:")
     for account in accounts:
-        print("  account {:<10} {}".format(account.name, account.config_dir))
-    if count > 1:
+        print("  account {:<10} {}".format(
+            account.name,
+            account.config_dir if pings else switch_store(account).config_dir))
+    if pings:
+        print()
+        print("Parked logins for switching go in {}/<account>.".format(
+            _tilde(SWITCH_ROOT)))
+    else:
+        print()
+        print("No timers on this machine: it switches accounts, it does not")
+        print("ping. Copy schedule.json here from the machine that does, and")
+        print("`{} which` will answer from it.".format(COMMAND))
+    if pings and count > 1:
         print()
         print("A fresh window will arrive every {}, instead of every {}."
               .format(fmt_delta(WINDOW_HOURS * 3600 / float(count)),
@@ -3705,7 +3933,7 @@ def setup(argv_accounts=None):
     if not _ask_yes("Go ahead?"):
         return 0
 
-    _write_accounts_file(accounts)
+    _write_accounts_file(accounts, pings=pings)
     print("Wrote {}".format(ACCOUNTS_FILE))
 
     # Must happen before the checkpoint check below, or an upgrade would look
@@ -3716,31 +3944,57 @@ def setup(argv_accounts=None):
             ", ".join(moved), accounts[0].state_dir))
 
     # ── Signing in ──────────────────────────────────────────────────────────
-    for account in accounts:
-        ensure_ping_config(account)
+    if pings:
+        for account in accounts:
+            ensure_ping_config(account)
 
-    missing = [a for a in accounts if not account_identity(a)["has_token"]]
-    if missing:
+    needed = sign_ins_needed(accounts, pings)
+    if needed:
+        mine = current_account(accounts)
         print()
         print("Sign in to each of these directories. They belong to this tool —")
         print("they are not where you work, and nothing you do in Claude Code")
         print("touches them. Signing in sends no message, so it starts no usage")
         print("window and there is no wrong time to do it.")
         print()
-        print("Sign in even if you already use that account elsewhere: each")
-        print("directory gets its own login rather than a copy of one, so a")
-        print("token refresh here can never log you out over there.")
-        for account in missing:
+        print("Sign in to each separately, even for the same account: each")
+        print("gets its own login rather than a copy of one, so a token refresh")
+        print("here can never log you out over there. Refresh tokens rotate, so")
+        print("a copy would have about eight hours before one of the two was")
+        print("signed out; two separate logins last as long as they both live.")
+        if mine is not None:
             print()
-            print("  Account {}:".format(account.display))
-            print("    {}    then /login".format(sign_in_command(account)))
+            print("Account {} needs no store of its own: you are signed in as it,"
+                  .format(mine.display))
+            print("and that login moves into its store the first time you switch")
+            print("away from it.")
+        elif not pings:
+            # Worth a sign-in, so worth saying before they start: without the
+            # published schedule this machine cannot tell which account it is
+            # already signed in as, and asks for a store it does not need.
+            print()
+            print("None of these is the account you are already signed in as —")
+            print("this machine cannot tell which that is. Copy schedule.json")
+            print("here from the machine running the pings and re-run setup,")
+            print("and it will recognise it and ask for one sign-in fewer.")
+        for what, _account, directory in needed:
+            print()
+            print("  For {}:".format(what))
+            print("    CLAUDE_CONFIG_DIR={} claude    then /login".format(
+                directory))
         print()
-        _ask("Press Enter once every account is signed in.")
+        print("That is {} browser sign-in{}, once on this machine.".format(
+            len(needed), "" if len(needed) == 1 else "s"))
+        print("Any you skip can be done later; `{} switch` offers the one it"
+              .format(COMMAND))
+        print("needs, when it needs it.")
+        print()
+        _ask("Press Enter when you are done.")
 
     # ── Checking ────────────────────────────────────────────────────────────
     print()
     print()
-    findings = validate_accounts(accounts)
+    findings = validate_accounts(accounts) if pings else []
     if findings:
         report_findings(findings)
         if any(f.level == "error" for f in findings):
@@ -3753,7 +4007,7 @@ def setup(argv_accounts=None):
 
     # ── Checkpoints ─────────────────────────────────────────────────────────
     built = []
-    for account in accounts:
+    for account in (accounts if pings else []):
         if os.path.exists(account.session_id_file) and \
            os.path.exists(account.checkpoint_backup) and \
            checkpoint_is_for_this_cwd(account):
@@ -3772,8 +4026,30 @@ def setup(argv_accounts=None):
         built.append(account)
 
     # ── Timers, then the launcher ───────────────────────────────────────────
-    print()
-    install_units(accounts)
+    if pings:
+        print()
+        install_units(accounts)
+    else:
+        # Somebody who just said this machine does not ping, on a machine that
+        # has been pinging, means it. Leaving the timers running would make the
+        # recorded answer a lie and quietly double what the accounts consume --
+        # the exact waste the question exists to prevent.
+        if installed_units():
+            print()
+            print("This machine is currently pinging, which is not what you")
+            print("just asked for. Leaving the timers running would double what")
+            print("these accounts consume for no benefit, so they should stop —")
+            print("the checkpoints and logs stay either way, so turning it back")
+            print("on later picks up where it left off.")
+            print()
+            if _ask_yes("Stop the timers on this machine?"):
+                for item in uninstall(accounts):
+                    print("  removed {}".format(item))
+            else:
+                print()
+                print("Left running. `{} doctor` will keep reporting this as an"
+                      .format(COMMAND))
+                print("error until the two agree.")
     print()
     write_entry_point()
     print("Wrote {}".format(os.path.join(BIN_DIR, COMMAND)))
@@ -3784,6 +4060,18 @@ def setup(argv_accounts=None):
     print()
     print("Done.")
     print()
+    if not pings:
+        print("This machine switches accounts; it does not ping. Copy")
+        print("schedule.json here from the machine that does, and both of")
+        print("these answer from it:")
+        print()
+        print("  {} which       which account to spend right now".format(COMMAND))
+        print("  {} switch      point your own Claude Code at it".format(COMMAND))
+        print()
+        print("Restart Claude Code after a switch. Sessions already running")
+        print("move to the new account on their next request while still")
+        print("showing the old one.")
+        return 0
     if len(accounts) > 1:
         print("The first ping for each account runs within a minute. From there")
         print("the service works out where each window sits, and holds an")
@@ -3833,11 +4121,15 @@ def _plan_accounts(existing, count):
     return accounts
 
 
-def _write_accounts_file(accounts):
+def _write_accounts_file(accounts, pings=True):
     document = {"accounts": [
         dict([("name", a.name), ("config_dir", _tilde(a.config_dir))]
              + ([("label", a.label)] if a.label else []))
         for a in accounts]}
+    # Only written when it is false, so an ordinary install's accounts.json is
+    # exactly what it always was and nobody has to wonder what a new key means.
+    if not pings:
+        document["pings"] = False
     tmp = ACCOUNTS_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(document, f, indent=2)
@@ -3986,6 +4278,22 @@ def install_units(accounts):
         print("  sudo loginctl enable-linger {}".format(USER))
 
 
+def installed_units():
+    """
+    Any unit file this tool has put in place, by name.
+
+    Looked up by prefix rather than by asking whether account N's timer exists:
+    the timers are one systemd *template* plus a drop-in per account, so
+    `claude-early-window@2.timer` is never a file on disk and checking for one
+    finds nothing on a machine that is pinging perfectly well.
+    """
+    try:
+        return sorted(f for f in os.listdir(UNIT_DIR)
+                      if f.startswith("claude-early-window"))
+    except (IOError, OSError):
+        return []
+
+
 def uninstall(accounts, purge=False):
     """
     Remove everything this tool installed, and nothing else.
@@ -4113,6 +4421,10 @@ def build_parser():
     switching.add_argument("account", nargs="?", metavar="ACCOUNT",
                            help="which account (default: the one `{} which` "
                                 "recommends)".format(COMMAND))
+    switching.add_argument("--no-sign-in", dest="sign_in", action="store_false",
+                           help="never offer to sign in, even when no login is "
+                                "parked — for scripts, where a prompt would "
+                                "hang")
 
     add("ping", "Send one ping. Spends a little quota, and starts a new window "
                 "if the last one has ended. This is what the timer runs.",
@@ -4134,8 +4446,22 @@ def build_parser():
                          help="apply the correction rather than describing it")
 
     add("doctor", "Check a deployed setup and say what is wrong.")
-    add("setup", "Create the ping directories, sign them in, and start their "
-                 "timers. Re-runnable.")
+    setup_ = add("setup", "Create the ping directories, sign them in, and start "
+                          "their timers. Re-runnable.")
+    setup_.add_argument("--accounts", type=int, metavar="N",
+                        help="how many accounts, instead of being asked")
+    pinging = setup_.add_mutually_exclusive_group()
+    pinging.add_argument("--no-pings", dest="pings", action="store_false",
+                         default=None,
+                         help="this machine only switches accounts; the pings "
+                              "run elsewhere. No timers, no checkpoints, and "
+                              "no quota spent here")
+    pinging.add_argument("--pings", dest="pings", action="store_true",
+                         default=None,
+                         help="run the pings here (the default), rather than "
+                              "being asked")
+    setup_.add_argument("-y", "--yes", action="store_true",
+                        help="take every default rather than prompting")
     add("check", "Validate the account configuration without changing anything.")
     add("accounts", "List the configured accounts.")
 
@@ -4310,7 +4636,8 @@ def cli(argv=None):
 
     # Setup writes the account list, so it must not require a valid one first.
     if command == "setup":
-        return setup()
+        return setup(argv_accounts=args.accounts, pings=args.pings,
+                     assume_yes=args.yes)
 
     try:
         accounts = load_accounts()
@@ -4343,7 +4670,7 @@ def cli(argv=None):
             view = schedule_view(accounts)
             return which(*view) if view else which(accounts)
         if command == "switch":
-            return switch_account(accounts, args.account)
+            return switch_account(accounts, args.account, sign_in=args.sign_in)
         if command == "log":
             return show_log(accounts, args.account, args.lines, args.follow)
         if command == "realign":

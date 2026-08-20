@@ -103,7 +103,7 @@ claude-window switch 2      # or a named one
 
 It moves two things together — the credential, which decides what you are billed for, and the identity block, which decides what Claude Code tells you that you are. It backs up what it replaces first. **Restart Claude Code afterwards.**
 
-Each account parks its login in `~/.claude-switch/<name>`, signed in once per machine:
+Each account parks its login in `~/.claude-switch/<name>`, signed in once per machine. `./install.sh` walks you through it, and `switch` offers the one it needs if you skipped it — or by hand:
 
 ```bash
 CLAUDE_CONFIG_DIR=~/.claude-switch/2 claude    # then /login
@@ -111,7 +111,7 @@ CLAUDE_CONFIG_DIR=~/.claude-switch/2 claude    # then /login
 
 The account you are signed in as right now needs no sign-in of its own: the first switch away from it parks the login you already have.
 
-**Give each one its own sign-in rather than a copy of an existing login.** Claude Code rotates refresh tokens, so two directories holding the same login take turns invalidating each other and one of them is signed out about eight hours later — long enough that nothing connects it to the copy. Two *separate* logins to one account coexist indefinitely, which is why the ping directories each get their own too.
+**Give each one its own sign-in rather than a copy of an existing login.** Claude Code rotates refresh tokens strictly: the moment one holder refreshes, the token it replaced is rejected outright. A copy therefore keeps working until its own access token runs out — about eight hours — and is then signed out, far enough from the copy that nothing connects the two. Two *separate* logins to one account coexist for as long as they both live, which is why the ping directories each get their own too.
 
 That is also why a switch **moves** a login rather than copying one: the store is a parking place, the copy in `~/.claude` is the only live one, and switching parks the outgoing login before installing the incoming one. `doctor` says so if it ever finds one login in two places.
 
@@ -139,12 +139,15 @@ cd claude-early-window
 ./install.sh
 ```
 
-The wizard asks how many accounts you have, shows the directories it will create, walks you through signing in to each, creates one background conversation per account, and starts a timer for each. Re-run it any time — adding or removing an account is just running it again.
+The wizard asks how many accounts you have and whether this machine should run the pings, shows the directories it will create, walks you through signing in to each, creates one background conversation per account, and starts a timer for each. Re-run it any time — adding an account, or changing your mind about the pings, is just running it again. It asks only for the sign-ins that are still missing, so a re-run costs nothing you have already done.
 
-Two things worth knowing:
+For an unattended install: `./install.sh --accounts 2 -y`, and `--no-pings` on the machines that only switch.
+
+Three things worth knowing:
 
 - **Signing in sends no message to Claude**, so it starts no usage window. There is no good or bad moment, and nothing to time.
 - **Sign in to each directory even if you already use that account elsewhere.** Each gets its own login rather than a copy of one, so a token refresh in a ping directory can never log you out of your own Claude Code.
+- **How many sign-ins that is.** One per ping directory, plus one per account you want to switch to — except the account you are already signed in as, which needs none, because that login moves into its own store the first time you switch away from it. On a machine running the pings for two accounts, that is three; on a machine that only switches, one.
 
 You never have to be awake at a particular hour. The service works out where each window sits and spaces them itself, holding an account back when that is what it takes.
 
@@ -259,15 +262,25 @@ Beyond that, the *scheduler* never asks which limit is in the way. For deciding 
 
 A usage window belongs to the **account**, so run the service on **one** always-on machine and every other machine benefits for free. A second copy would only double the consumption for no gain.
 
-Other machines need nothing at all. If you want the advice there too, put a checkout of this repository on the second machine, copy `accounts.json` and `schedule.json` into it, and run `claude-window which`. It answers from those files alone: no timers, no logins, no network call. The file carries each window's *phase*, which does not move between windows, so even a days-old copy still names the right account — along with each account's availability, which is the part only the pinging machine can see, and which does age. `which` says how old the file is.
+On every other machine, install it without the pings:
 
-`switch` works on those machines too, and is the reason to want it there: the pings run in one place, and every machine you actually type on can follow them. It needs nothing from the pinging machine — only its own parked logins, signed in once, on that machine.
+```bash
+./install.sh --no-pings
+```
+
+That creates no timers, builds no conversations and spends nothing. Copy `schedule.json` across from the pinging machine, and both `claude-window which` and `claude-window switch` answer from it: the pings run in one place, and every machine you actually type on follows them.
+
+Copy `schedule.json` **before** running the wizard if you can. It is how a machine that pings nothing recognises the account you are already signed in as — and recognising it saves one browser sign-in, because that login parks itself on your first switch instead of needing one of its own. Setup says so if it cannot find the file.
+
+`which` answers from that file alone: no timers, no logins, no network call. The file carries each window's *phase*, which does not move between windows, so even a days-old copy still names the right account — along with each account's availability, which is the part only the pinging machine can see, and which does age. `which` says how old the file is.
+
+Answering "no pings" on a machine that has been pinging offers to stop its timers, because a second pinger doubles what those accounts consume and buys nothing. `doctor` reports the mismatch until the two agree.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `./install.sh` | The setup wizard. Safe to re-run. |
+| `./install.sh [--no-pings] [--accounts N] [-y]` | The setup wizard. Safe to re-run; asks only for what is missing. `--no-pings` sets a machine up to switch accounts without running the pings. |
 | `claude-window` | Status. Typing it can never spend quota. |
 | `claude-window status [--json]` | What every account is doing, and which to use now. |
 | `claude-window which` | Just the recommendation, and what is unusable. |
@@ -318,7 +331,7 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 - **Do not use `/login` or `/logout` inside a ping directory.** That is how the tool knows which account it is pinging. Change accounts by editing `accounts.json` and re-running `./install.sh`.
 - A booked correction does not survive a reboot. Harmless: the next ordinary ping reads the reset times again and books another.
 - It relies on where Claude Code stores sessions and on the window reset time it reports. Both are internal details that a future release could change; the tests would notice, and `doctor` reports what it can verify.
-- Linux with systemd only. macOS and Windows are not supported.
+- Linux only. Running the pings needs systemd; `--no-pings` does not, but switching reads the credentials file Claude Code keeps on Linux, which macOS replaces with the Keychain. macOS and Windows are not supported either way.
 
 ## Where the pings run
 

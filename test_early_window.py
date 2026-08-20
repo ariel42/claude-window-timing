@@ -2189,6 +2189,15 @@ def test_the_json_report_is_a_contract():
     section("status --json is a contract")
     now = time.time()
     ew.STATE_ROOT = tempfile.mkdtemp()
+    # Hermetic on purpose: `switching` reports on the user's own files, and a
+    # test that read the developer's real ~/.claude would pass or fail
+    # depending on who ran it.
+    saved_user = (ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON, ew.SWITCH_ROOT,
+                  ew.SCHEDULE_FILE)
+    ew.USER_CONFIG_DIR = os.path.join(ew.STATE_ROOT, "home", ".claude")
+    ew.USER_CONFIG_JSON = os.path.join(ew.STATE_ROOT, "home", ".claude.json")
+    ew.SWITCH_ROOT = os.path.join(ew.STATE_ROOT, "home", ".claude-switch")
+    ew.SCHEDULE_FILE = os.path.join(ew.STATE_ROOT, "schedule.json")
     a = ew.Account("1", os.path.join(ew.STATE_ROOT, "cfg-1"), 0, "personal")
     b = ew.Account("2", os.path.join(ew.STATE_ROOT, "cfg-2"), 1, "work")
     a.ensure_state_dir(); b.ensure_state_dir()
@@ -2233,6 +2242,8 @@ def test_the_json_report_is_a_contract():
     # The integers are an implementation detail; a caller should never see one.
     check("tiers travel as words", [entries[n]["tier"] for n in ("1", "2")],
           ["usable", "waiting"])
+    (ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON, ew.SWITCH_ROOT,
+     ew.SCHEDULE_FILE) = saved_user
     check("and agree with the boolean beside them",
           [entries[n]["usable_now"] for n in ("1", "2")], [True, False])
     check_true("an account that cannot be used says why in words",
@@ -2925,7 +2936,7 @@ FAKE_CLAUDE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def _clean_install(answers, accounts=2, claude_control=None,
-                   home=None, repo=None, after=None):
+                   home=None, repo=None, after=None, setup_kwargs=None):
     """
     Run the wizard in a fresh home directory. Returns (exit code, home, repo,
     recorded systemd calls).
@@ -3013,7 +3024,7 @@ def _clean_install(answers, accounts=2, claude_control=None,
 
     try:
         try:
-            code = ew.setup()
+            code = ew.setup(**(setup_kwargs or {}))
         except SystemExit as exc:
             # init() exits rather than freezing a refusal into the checkpoint.
             code = exc.code if exc.code is not None else 0
@@ -3916,7 +3927,8 @@ def _snapshot_user_files():
     return out
 
 
-def _switch_sandbox(names=("1", "2"), signed_in_as=None, parked=(), now=None):
+def _switch_sandbox(names=("1", "2"), signed_in_as=None, parked=(), now=None,
+                    pings=True):
     """
     A home directory with ping directories, a signed-in ~/.claude, and stores.
 
@@ -3932,16 +3944,20 @@ def _switch_sandbox(names=("1", "2"), signed_in_as=None, parked=(), now=None):
     os.makedirs(home)
 
     saved = (ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON, ew.SWITCH_ROOT,
-             ew.STATE_ROOT)
+             ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.UNIT_DIR)
     ew.HOME = home
     ew.USER_CONFIG_DIR = os.path.join(home, ".claude")
     ew.USER_CONFIG_JSON = os.path.join(home, ".claude.json")
     ew.SWITCH_ROOT = os.path.join(home, ".claude-switch")
     ew.STATE_ROOT = os.path.join(root, "state")
+    ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
+    # Otherwise a test would read the units of whatever machine it runs on.
+    ew.UNIT_DIR = os.path.join(root, "units")
+    os.makedirs(ew.UNIT_DIR)
 
     def restore():
         (ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON, ew.SWITCH_ROOT,
-         ew.STATE_ROOT) = saved
+         ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.UNIT_DIR) = saved
         shutil.rmtree(root, ignore_errors=True)
 
     def write_login(directory, config_json, uuid_, email, refresh,
@@ -3969,10 +3985,12 @@ def _switch_sandbox(names=("1", "2"), signed_in_as=None, parked=(), now=None):
         account = ew.Account(name, os.path.join(home, ".claude-" + name), index,
                              "label" + name)
         accounts.append(account)
-        # The ping directory's own login: always distinct from the store's.
-        write_login(account.config_dir, account.config_json,
-                    "uuid-" + name, "a{}@example.com".format(name),
-                    "ping-refresh-" + name)
+        # The ping directory's own login: always distinct from the store's. A
+        # machine that does no pinging has no such directory at all.
+        if pings:
+            write_login(account.config_dir, account.config_json,
+                        "uuid-" + name, "a{}@example.com".format(name),
+                        "ping-refresh-" + name)
         if name in parked:
             store = ew.switch_store(account)
             write_login(store.config_dir, store.config_json,
@@ -4570,6 +4588,326 @@ def test_running_sessions_are_looked_for_without_counting_our_own_pings():
                    ew.Account("1", "/tmp/nonexistent", 0)))
 
 
+def test_a_machine_can_be_told_it_does_not_ping():
+    """
+    The pings belong on one machine; switching belongs on all of them. That
+    fact has to be recorded rather than inferred, because everything downstream
+    turns on it — a switch-only machine has no ping directories, no checkpoints
+    and no timers, and a `doctor` that called all three broken would bury the
+    one finding that matters there.
+    """
+    section("A machine can be told it does not ping")
+
+    root = tempfile.mkdtemp()
+    saved = ew.ACCOUNTS_FILE
+    try:
+        ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
+        with open(ew.ACCOUNTS_FILE, "w") as f:
+            json.dump({"accounts": [{"name": "1"}, {"name": "2"}]}, f)
+        check("an ordinary accounts.json means this machine pings",
+              ew.pings_here(), True)
+
+        with open(ew.ACCOUNTS_FILE, "w") as f:
+            json.dump({"pings": False,
+                       "accounts": [{"name": "1"}, {"name": "2"}]}, f)
+        check("the flag turns it off", ew.pings_here(), False)
+        check("and the accounts still parse",
+              [a.name for a in ew.load_accounts(ew.ACCOUNTS_FILE)], ["1", "2"])
+
+        os.remove(ew.ACCOUNTS_FILE)
+        check("no accounts.json at all still means pinging", ew.pings_here(), True)
+    finally:
+        ew.ACCOUNTS_FILE = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_the_wizard_asks_for_each_sign_in_once_and_no_more():
+    """
+    Each directory that refreshes a token needs its own sign-in, and the count
+    is the thing people judge this feature by. Two rules keep it as low as it
+    can honestly be: anything already signed in is skipped, so re-running to
+    add an account asks only for the new one; and the account you are already
+    signed in as needs no store, because that login is *moved* into its store
+    on the first switch away rather than copied into it now.
+    """
+    section("The wizard asks for each sign-in once")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1")
+    try:
+        needed = ew.sign_ins_needed(accounts, pings=True)
+        where = [d for _what, _a, d in needed]
+        check("the ping directories are already signed in, so are not asked for",
+              [d for d in where if ".claude-" in d and "switch" not in d], [])
+        check("only the store of the account not in use is asked for",
+              where, [ew.switch_store(accounts[1]).config_dir])
+
+        # Now park it, as a completed sign-in would.
+        store = ew.switch_store(accounts[1])
+        os.makedirs(store.config_dir, exist_ok=True)
+        with open(ew.credentials_path(store), "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r"}}, f)
+        check("re-running then asks for nothing",
+              ew.sign_ins_needed(accounts, pings=True), [])
+    finally:
+        restore()
+
+    # A machine that does not ping never asks for a ping directory. It also
+    # cannot recognise the account it is already signed in as until the
+    # schedule is copied across, so before that it asks for one store too many
+    # -- which is exactly why setup says so out loud.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", pings=False)
+    try:
+        where = [d for _w, _a, d in ew.sign_ins_needed(accounts, pings=False)]
+        check("with no schedule it asks for every store and no ping directory",
+              where, [ew.switch_store(a).config_dir for a in accounts])
+
+        now = time.time()
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"window_hours": 5, "written_at": now, "accounts": [
+                {"name": "1", "account_uuid": "uuid-1", "last_run": now - 60,
+                 "usable_now": True, "tier": "usable", "window_phase": 0}]}, f)
+        where = [d for _w, _a, d in ew.sign_ins_needed(accounts, pings=False)]
+        check("with the schedule copied across, one fewer",
+              where, [ew.switch_store(accounts[1]).config_dir])
+    finally:
+        restore()
+
+    # Nobody signed in anywhere: every store is asked for, none skipped.
+    restore, home, accounts = _switch_sandbox(pings=False)
+    try:
+        check("with no login of their own, every account needs a store",
+              len(ew.sign_ins_needed(accounts, pings=False)), 2)
+    finally:
+        restore()
+
+
+def test_a_switch_only_machine_knows_which_account_it_is_on():
+    """
+    A second machine has no ping directories and nothing parked until its first
+    switch, so it can see no identities of its own at all. The pinging machine
+    already publishes each account's UUID in schedule.json — the file the
+    README has people copy across — and without consulting it, the first switch
+    on a laptop would fail to park a login it could not name.
+    """
+    section("A switch-only machine knows which account it is on")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",),
+                                              pings=False)
+    try:
+        check("with nothing published, the account is unrecognised",
+              ew.current_account(accounts), None)
+
+        now = time.time()
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"window_hours": 5, "written_at": now, "accounts": [
+                {"name": "1", "label": "label1", "account_uuid": "uuid-1",
+                 "usable_now": True, "tier": "usable", "last_run": now - 60,
+                 "expires_at": now + 4 * 3600, "window_phase": 0,
+                 "used_percentage": 5},
+                {"name": "2", "label": "label2", "account_uuid": "uuid-2",
+                 "usable_now": True, "tier": "usable", "last_run": now - 60,
+                 "expires_at": now + 900, "window_phase": 0,
+                 "used_percentage": 5}]}, f)
+
+        found = ew.current_account(accounts)
+        check("the published schedule names it", found and found.name, "1")
+
+        # And a bare switch must choose from those readings rather than from
+        # the nothing this machine knows on its own.
+        out, err, code = _capture(lambda: ew.switch_account(accounts, None,
+                                                            sign_in=False))
+        check("a bare switch succeeds on a machine that pings nothing", code, 0)
+        check("and goes to the account whose window expires first",
+              ew.current_account(accounts).name, "2")
+    finally:
+        restore()
+
+
+def test_doctor_on_a_switch_only_machine_reports_only_what_applies():
+    """
+    Every ping-shaped check would fail here and none of them would mean
+    anything. What is worth saying is narrower: the parked logins, and whether
+    there is a schedule to read.
+    """
+    section("Doctor on a switch-only machine")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",),
+                                              pings=False)
+    saved = ew.ACCOUNTS_FILE
+    try:
+        ew.ACCOUNTS_FILE = os.path.join(home, "accounts.json")
+        with open(ew.ACCOUNTS_FILE, "w") as f:
+            json.dump({"pings": False, "accounts": [{"name": "1"},
+                                                    {"name": "2"}]}, f)
+        out, _, code = _capture(lambda: ew.doctor(accounts))
+        check_true("it says nothing about checkpoints",
+                   "checkpoint" not in out.lower())
+        check_true("nothing about timers", "timer" not in out.lower())
+        check_true("and nothing about ping directories not being signed in",
+                   "not signed in" not in out.lower())
+        check_true("but it does ask for the schedule it needs",
+                   "schedule.json" in out)
+
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"window_hours": 5, "written_at": time.time(),
+                       "accounts": [{"name": "1", "account_uuid": "uuid-1"}]}, f)
+        out, _, code = _capture(lambda: ew.doctor(accounts))
+        check("with a schedule and a parked login, it is happy", code, 0)
+        check_true("and says so", "Everything checks out" in out)
+    finally:
+        ew.ACCOUNTS_FILE = saved
+        restore()
+
+
+def test_setup_can_install_the_switcher_without_the_pings():
+    """
+    The whole point of the second machine: no timers, no checkpoints, and no
+    quota spent — while `switch` still works.
+    """
+    section("Setup without the pings")
+
+    calls_seen = []
+
+    def after(home, repo, calls):
+        calls_seen.extend(calls)
+
+    code, home, repo, calls = _clean_install(
+        "", setup_kwargs={"argv_accounts": 2, "pings": False,
+                          "assume_yes": True}, after=after)
+    check("setup succeeds without pinging", code, 0)
+
+    document = json.load(open(os.path.join(repo, "accounts.json")))
+    check("the mode is recorded for every later command",
+          document.get("pings"), False)
+    check("the accounts are still written",
+          [a["name"] for a in document["accounts"]], ["1", "2"])
+
+    check("no timer was created",
+          [c for c in calls if any("timer" in str(part) for part in c)], [])
+    check("no checkpoint was built",
+          os.path.exists(os.path.join(repo, "state", "1", "session_id.txt")),
+          False)
+    check_true("the launcher is still written",
+               os.path.exists(os.path.join(repo, "bin", "claude-window")))
+    # The sandbox pre-creates the ping directories to stand in for a sign-in,
+    # so their absence is not the thing to check. What setup would have added
+    # is the working directory a ping runs from, and it did not.
+    check("nothing prepared a directory for pinging out of",
+          os.path.isdir(os.path.join(home, ".claude-1", "pingcwd")), False)
+
+
+def test_turning_the_pings_off_actually_turns_them_off():
+    """
+    The failure this prevents was made for real while building it: answering
+    "this machine does not ping" recorded the answer and left the timers
+    running, so the machine reported one thing and did another -- and quietly
+    went on consuming the quota the question exists to save.
+    """
+    section("Turning the pings off turns them off")
+
+    def after(home, repo, calls):
+        del calls[:]                      # only what the second run does
+        saved = ew.ACCOUNTS_FILE
+        try:
+            ew.setup(argv_accounts=2, pings=False, assume_yes=True)
+        finally:
+            ew.ACCOUNTS_FILE = saved
+
+    code, home, repo, calls = _clean_install("2\ny\n\ny\n", after=after)
+    check("the first install succeeded", code, 0)
+
+    document = json.load(open(os.path.join(repo, "accounts.json")))
+    check("the machine now records that it does not ping",
+          document.get("pings"), False)
+    disabled = [c for c in calls if "disable" in c]
+    check("and every timer was disabled", len(disabled), 2)
+    check("the unit files are gone",
+          [f for f in os.listdir(os.path.join(home, ".config", "systemd", "user"))
+           if f.startswith("claude-early-window")], [])
+    check_true("the checkpoints are kept, so turning it back on is cheap",
+               os.path.exists(os.path.join(repo, "state", "1", "session_id.txt")))
+
+
+def test_doctor_catches_a_machine_pinging_when_it_says_it_does_not():
+    """The same mismatch, if it is ever reached by another route."""
+    section("Doctor catches pinging that should have stopped")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",),
+                                              pings=False)
+    saved = ew.ACCOUNTS_FILE
+    try:
+        ew.ACCOUNTS_FILE = os.path.join(home, "accounts.json")
+        with open(ew.ACCOUNTS_FILE, "w") as f:
+            json.dump({"pings": False, "accounts": [{"name": "1"},
+                                                    {"name": "2"}]}, f)
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"window_hours": 5, "written_at": time.time(),
+                       "accounts": [{"name": "1", "account_uuid": "uuid-1"}]}, f)
+        out, _, code = _capture(lambda: ew.doctor(accounts))
+        check("a clean switch-only machine is happy", code, 0)
+
+        open(os.path.join(ew.UNIT_DIR, accounts[1].timer_unit), "w").close()
+        out, _, code = _capture(lambda: ew.doctor(accounts))
+        check("a leftover timer is an error", code, 1)
+        check_true("that says what it costs",
+                   "doubles what those accounts consume" in out)
+        check_true("and how to fix it either way",
+                   "--no-pings" in out and "--pings" in out)
+    finally:
+        ew.ACCOUNTS_FILE = saved
+        restore()
+
+
+def test_setup_says_the_pings_belong_on_one_machine():
+    """
+    The one thing someone installing this on their third laptop needs to be
+    told, at the moment they are deciding.
+    """
+    section("Setup says where the pings belong")
+
+    buf = io.StringIO()
+    out, sys.stdout = sys.stdout, buf
+    held, sys.stdin = sys.stdin, io.StringIO("2\nn\ny\n\n")
+    saved = (ew.HOME, ew.ACCOUNTS_FILE, ew.SWITCH_ROOT, ew.STATE_ROOT,
+             ew.BIN_DIR, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON,
+             ew.SCHEDULE_FILE, ew.UNIT_DIR, ew._systemctl)
+    root = tempfile.mkdtemp()
+    try:
+        ew.HOME = os.path.join(root, "home")
+        # Answering "n" here tears down any timers it finds. Without these two
+        # that teardown runs against the machine the tests are running on --
+        # which is exactly how this test disabled a live install once.
+        ew.UNIT_DIR = os.path.join(root, "units")
+        ew._systemctl = lambda *a: type("Ok", (), {"returncode": 0,
+                                                   "stdout": ""})()
+        ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
+        ew.SWITCH_ROOT = os.path.join(ew.HOME, ".claude-switch")
+        ew.STATE_ROOT = os.path.join(root, "state")
+        ew.BIN_DIR = os.path.join(root, "bin")
+        ew.USER_CONFIG_DIR = os.path.join(ew.HOME, ".claude")
+        ew.USER_CONFIG_JSON = os.path.join(ew.HOME, ".claude.json")
+        ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
+        os.makedirs(ew.HOME)
+        ew.setup()
+    finally:
+        sys.stdout, sys.stdin = out, held
+        (ew.HOME, ew.ACCOUNTS_FILE, ew.SWITCH_ROOT, ew.STATE_ROOT, ew.BIN_DIR,
+         ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON, ew.SCHEDULE_FILE,
+         ew.UNIT_DIR, ew._systemctl) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+    said = buf.getvalue()
+    check_true("it says the pings belong on one machine", "ONE machine" in said)
+    check_true("and why a second one buys nothing",
+               "doubles" in said and "buys nothing" in said)
+    check_true("it says the other machines can still switch",
+               "still switch accounts" in said)
+    check_true("answering n explains what this machine is for",
+               "does not ping" in said)
+    check_true("and points at the file it needs",
+               "schedule.json" in said)
+
+
 def main():
     # Log somewhere disposable: several decisions are only visible in the log, so
     # the tests read it, and they should not scribble on the running tool's.
@@ -4635,7 +4973,15 @@ def main():
                  test_an_unknown_login_is_backed_up_rather_than_lost,
                  test_doctor_notices_a_store_going_stale,
                  test_only_one_function_writes_to_the_users_own_files,
-                 test_running_sessions_are_looked_for_without_counting_our_own_pings):
+                 test_running_sessions_are_looked_for_without_counting_our_own_pings,
+                 test_a_machine_can_be_told_it_does_not_ping,
+                 test_the_wizard_asks_for_each_sign_in_once_and_no_more,
+                 test_a_switch_only_machine_knows_which_account_it_is_on,
+                 test_doctor_on_a_switch_only_machine_reports_only_what_applies,
+                 test_setup_can_install_the_switcher_without_the_pings,
+                 test_turning_the_pings_off_actually_turns_them_off,
+                 test_doctor_catches_a_machine_pinging_when_it_says_it_does_not,
+                 test_setup_says_the_pings_belong_on_one_machine):
         test()
     # Nothing armed on the way out, whatever a test did or failed to do.
     for name in (TEST_PREFIX, TEST_PREFIX + "-a", TEST_PREFIX + "-b"):
