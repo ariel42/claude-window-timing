@@ -60,6 +60,30 @@ def section(title):
     print("\n{}".format(title))
 
 
+def _literal_value(node):
+    """
+    The value of a literal AST node, on every interpreter this tool supports.
+
+    `ast.Str` and its `.s` were how this was spelled until 3.8; they were
+    deprecated in 3.12 and removed in 3.14, so neither spelling alone reads
+    every version — and the 3.14 failure is the quiet kind, a `getattr` default
+    that turns a check of the source into a check of nothing.
+    """
+    if isinstance(node, ast.Constant):                   # 3.8 and later
+        return node.value
+    if node.__class__.__name__ in ("Str", "Bytes", "Num"):    # 3.6, 3.7
+        return getattr(node, "s", None)
+    return None
+
+
+def _string_literals(source):
+    """Every string literal in `source`."""
+    for node in ast.walk(ast.parse(source)):
+        value = _literal_value(node)
+        if isinstance(value, str):
+            yield value
+
+
 # Anchors are real transient systemd units, named after the account. A test that
 # borrows a plausible account name therefore schedules a real ping against the
 # user's real deployment — and one that forgets to cancel leaves it armed. Every
@@ -2655,7 +2679,7 @@ def test_an_unusable_account_is_still_pinged():
         for inner in ast.walk(node):
             if (isinstance(inner, ast.Call)
                     and getattr(inner.func, "id", "") == "_systemctl"
-                    and any(getattr(a, "s", None) == "disable"
+                    and any(_literal_value(a) == "disable"
                             for a in inner.args)):
                 stoppers.add(node.name)
     check("only the teardown paths ever disable a timer",
@@ -3624,6 +3648,92 @@ def test_every_command_describes_what_it_actually_does():
                "which" in actions)
     check_true("`install-command` says what it writes",
                ew.COMMAND in (actions["install-command"].description or ""))
+
+
+# Two shapes and nothing looser, because prose is full of words that follow a
+# command name: a backticked invocation, and a verb carrying flags. The module
+# writes the command as `{}` and formats COMMAND in, so that is substituted
+# first; the README spells it out and brackets its optional flags.
+_INVOCATION_RES = (
+    r"`{command}\s+([a-z][a-z-]*)((?:\s+\[?-{{1,2}}[a-z][a-z-]*\]?)*)",
+    r"{command}\s+([a-z][a-z-]*)((?:\s+\[?-{{1,2}}[a-z][a-z-]*\]?)+)",
+)
+
+
+def _suggested_invocations(text, command="claude-window"):
+    """Every `claude-window <verb> [flags]` this text tells somebody to type."""
+    text = text.replace("{}", command)
+    found = []
+    for pattern in _INVOCATION_RES:
+        for match in re.finditer(pattern.format(command=command), text):
+            found.append((match.group(1), match.group(2).split()))
+    return found
+
+
+def test_every_command_the_output_suggests_can_be_typed():
+    """
+    A suggestion is only advice if it works when pasted.
+
+    Both halves have gone wrong here. The README is written by hand and drifts
+    from the parser; and `which` went on offering a flag that had been replaced
+    by its opposite, so somebody following the advice got "unrecognized
+    arguments" from the command that had just given it.
+
+    So every invocation the tool prints, and every one the README documents, is
+    put to the parser here.
+    """
+    section("Every command the output suggests can be typed")
+    parser = ew.build_parser()
+    options = {}
+    for action in parser._actions:
+        for name, subparser in (getattr(action, "choices", None) or {}).items():
+            options[name] = set()
+            for option in subparser._actions:
+                options[name].update(option.option_strings)
+    # `help <command>` is rewritten by normalise_help rather than being a
+    # subparser of its own, so it is named here rather than looked up.
+    verbs = set(ew.known_commands(parser)) | {"help"}
+
+    def unusable(text):
+        """Everything in `text` that could not be typed, without duplicates."""
+        bad = []
+        for verb, flags in _suggested_invocations(text):
+            if verb not in verbs:
+                bad.append(verb)
+                continue
+            for flag in flags:
+                if flag.strip("[]") not in options.get(verb, ()):
+                    bad.append("{} {}".format(verb, flag.strip("[]")))
+        return sorted(set(bad))
+
+    # First that the reading works at all: a test that silently matched nothing
+    # would pass for ever while the thing it guards rotted.
+    check("a flag that no longer exists is caught",
+          unusable("run `{} which --fresh` to refresh"), ["which --fresh"])
+    check("and so is a command that never did",
+          unusable("run `{} rotate`"), ["rotate"])
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "claude_window_timing.py")) as f:
+        source = f.read()
+    printed = []
+    for literal in _string_literals(source):
+        printed.extend(_suggested_invocations(literal))
+    check_true("the tool does suggest commands, so this is not vacuous",
+               len(printed) > 20)
+    check("and every one of them can be typed",
+          sorted(set(v for v, _ in printed) - verbs), [])
+    check("flags included",
+          sorted(set("{} {}".format(v, f.strip("[]")) for v, flags in printed
+                     for f in flags
+                     if f.strip("[]") not in options.get(v, ()))), [])
+
+    with open(os.path.join(here, "README.md")) as f:
+        readme = f.read()
+    documented = _suggested_invocations(readme)
+    check_true("the README's command table was actually read",
+               len(set(v for v, _ in documented)) >= 10)
+    check("and documents only commands that exist", unusable(readme), [])
 
 
 def test_every_command_routes_to_the_thing_it_names():
@@ -6220,6 +6330,7 @@ def main():
                  test_accounts_file, test_claude_env,
                  test_the_command_surface,
                  test_every_command_describes_what_it_actually_does,
+                 test_every_command_the_output_suggests_can_be_typed,
                  test_every_command_routes_to_the_thing_it_names,
                  test_looking_at_the_schedule_does_not_change_it,
                  test_the_shell_scripts_call_commands_that_exist,
