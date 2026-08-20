@@ -6752,6 +6752,17 @@ def test_a_machine_that_does_not_ping_is_never_told_to_ping():
                    and "log" not in listed)
         check_true("switch and which are", "switch" in listed
                    and "which" in listed)
+
+        # And on a single-account install, `switch` answers "there is only one
+        # account". A suggestion that refuses is worse than one never made.
+        ew._write_accounts_file([accounts[0]], pings=True)
+        said, _, _ = _capture(lambda: ew.cli([]))
+        listed = said.split("Other commands:")[1]
+        check("with one account, nothing that needs two is offered",
+              [word for word in ("switch", "realign") if word in listed], [])
+        check_true("what is left still works here",
+                   "which" in listed and "doctor" in listed
+                   and "log" in listed)
     finally:
         (ew.ACCOUNTS_FILE, ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.UNIT_DIR,
          ew.SWITCH_ROOT, ew.ALIGNMENT_FILE, ew._systemctl, ew._run) = saved

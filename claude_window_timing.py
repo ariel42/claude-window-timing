@@ -694,7 +694,8 @@ def choose_account(accounts, states=None, now=None, avail=None):
                       if not pings_here() else
                       "no window information yet — run a ping first")
     if only:
-        return best, "the only account; its window ends {}".format(fmt_time(expiry))
+        return best, "the only account; its window ends {} (in {})".format(
+            fmt_time(expiry), fmt_delta(expiry - now))
     # "ends first" is a claim about the accounts it was chosen over, so it has to
     # be false when there was nothing to choose between: another account's window
     # may well end sooner and simply be unusable.
@@ -6277,11 +6278,21 @@ def cli(argv=None):
                 # rest exist. Naming a few beats pointing at `help`, which is
                 # only useful to someone who already suspects there is more.
                 print()
+                # Only what this machine can actually do: `switch` and
+                # `realign` both answer "there is only one account" on a
+                # single-account install, and a suggestion that refuses is
+                # worse than one that was never made.
+                offered = ["which"]
+                if len(accounts) > 1:
+                    offered.append("switch")
+                offered.append("doctor")
+                if pings_here():
+                    offered.append("log")
+                    if len(accounts) > 1:
+                        offered.append("realign")
+                offered.append("setup")
                 print("Other commands: {} — run `{} help` for all of "
-                      "them.".format(
-                          "which, switch, doctor, log, realign, setup"
-                          if pings_here() else "which, switch, doctor, setup",
-                          COMMAND))
+                      "them.".format(", ".join(offered), COMMAND))
             return code
         if command == "which":
             # A machine that pings nothing has no state of its own; a copy of
