@@ -116,10 +116,36 @@ def temp_account(name=TEST_PREFIX, index=0, config_dir=None):
 # Reading the reset time out of a refusal message
 # ---------------------------------------------------------------------------
 
+ZONE = "Asia/Jerusalem"
+
+
+def _pretend_timezone(name=ZONE):
+    """
+    Answer `_local_tz_name` with a fixed zone. Returns a restore function.
+
+    A refusal names the timezone Claude reported it in, and the parser declines
+    one that is not this machine's rather than guess at an offset — right, and
+    the reason these tests passed only where they were written: a clone running
+    in UTC failed nine checks that have nothing to do with time zones.
+
+    The expected epochs are built with a local `datetime`, and so is the
+    parser's answer, so pinning the *reported* zone to whatever this machine
+    calls local keeps the arithmetic identical wherever it runs.
+    """
+    original = ew._local_tz_name
+    ew._local_tz_name = lambda: name
+
+    def restore():
+        ew._local_tz_name = original
+
+    return restore
+
+
 def test_refusal_text():
     section("Refusal text -> (reset time, which limit)")
     now = datetime(2026, 8, 6, 16, 40, 0).timestamp()
     T = lambda *a: datetime(*a).timestamp()
+    restore = _pretend_timezone()
 
     check("5-hour refusal, time only",
           ew.parse_reset_from_text(
@@ -155,6 +181,17 @@ def test_refusal_text():
           ew.parse_reset_from_text("Bye! Have a good one.", now), None)
     check("empty text yields nothing", ew.parse_reset_from_text("", now), None)
 
+    # A machine whose own zone cannot be read: the comparison cannot be made,
+    # so it is not made. Declining every refusal there would throw away the
+    # only reading a rate-limited account ever produces.
+    ew._local_tz_name = lambda: ""
+    check("a machine with no zone name of its own does not decline",
+          ew.parse_reset_from_text(
+              "You've hit your session limit · resets 9pm (America/New_York)",
+              now),
+          (T(2026, 8, 6, 21, 0), "session"))
+    restore()
+
 
 # ---------------------------------------------------------------------------
 # Which moment to aim at, given two limits
@@ -183,8 +220,9 @@ def test_next_window_start():
     check("weekly full but resetting first -> aim at the window boundary",
           (got[0], got[2]), (FIVE, "5-hour window"))
 
-    weekly_text = "You've hit your weekly limit · resets Aug 10, 10pm (Asia/Jerusalem)"
-    session_text = "You've hit your session limit · resets 9:30pm (Asia/Jerusalem)"
+    restore = _pretend_timezone()
+    weekly_text = "You've hit your weekly limit · resets Aug 10, 10pm ({})".format(ZONE)
+    session_text = "You've hit your session limit · resets 9:30pm ({})".format(ZONE)
 
     got = ew.next_window_start({}, weekly_text, True)
     check("no statusLine at all: weekly refusal text is used, with a 7-day horizon",
@@ -202,6 +240,7 @@ def test_next_window_start():
           (None, None, ""))
     check("a successful ping never consults the refusal text",
           ew.next_window_start({}, weekly_text, False), (None, None, ""))
+    restore()
 
 
 # ---------------------------------------------------------------------------
@@ -2503,15 +2542,17 @@ def test_what_a_ping_records_from_how_it_went():
 
         # 2. It was refused. No statusLine figures at all, so the refusal text
         #    is the only source — and the account is unusable until it resets.
-        refusal = "You've hit your session limit · resets 9:30pm (%s)" % (
-            ew._local_tz_name() or "UTC")
+        # Pinned rather than read, so these two run everywhere: a machine
+        # whose zone name cannot be read used to skip them silently.
+        restore_zone = _pretend_timezone()
+        refusal = "You've hit your session limit · resets 9:30pm ({})".format(ZONE)
         state = ping_with({"completed": True, "limited": True, "text": refusal},
                           {})
-        if ew._local_tz_name():
-            check("a refusal with no statusLine falls back on its own text",
-                  state["limits_source"], "refusal-text")
-            check("and the account is unusable until exactly then",
-                  state["available_at"], state["boundary"])
+        restore_zone()
+        check("a refusal with no statusLine falls back on its own text",
+              state["limits_source"], "refusal-text")
+        check("and the account is unusable until exactly then",
+              state["available_at"], state["boundary"])
         check("a refusal is an answer, so nothing counts as a failure",
               state["consecutive_failures"], 0)
 
