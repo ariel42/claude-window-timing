@@ -261,6 +261,23 @@ def test_next_window_start():
           (None, None, ""))
     check("a successful ping never consults the refusal text",
           ew.next_window_start({}, weekly_text, False), (None, None, ""))
+
+    # A candidate no limit could reach is a misparse or a placeholder, not a
+    # very long window. It has to be dropped one at a time: `max` runs first,
+    # so a single nonsense candidate used to swallow every sane one beside it
+    # — and a refused account, whose only news is when it comes back, was
+    # marked unusable for a day on the strength of it.
+    daft = _refusal_text(now + 21 * 3600, "session")
+    check("a 5-hour reset a day away is not a target",
+          ew.next_window_start({}, daft, True), (None, None, ""))
+    got = ew.next_window_start(
+        {"five_hour": {"used_percentage": 100, "resets_at": now + 1800}},
+        daft, True)
+    check("and does not take the sane reading down with it",
+          (round(got[0] - now), got[2]), (1800, "5-hour window"))
+    weekly_daft = _refusal_text(now + 300 * 86400, "weekly")
+    check("the weekly limit is bounded by its own length too",
+          ew.next_window_start({}, weekly_daft, True), (None, None, ""))
     restore()
 
 
@@ -1446,32 +1463,45 @@ def test_an_impossible_usage_report_is_ignored():
     known = {"five_hour": {"resets_at": now + 3600, "used_percentage": 99}}
     placeholder = {"five_hour": {"resets_at": now + 4 * 3600, "used_percentage": 3}}
     why = ew.implausible_limits(placeholder, known, now)
-    check_true("a rollover before the known reset is rejected", bool(why))
+    check("a rollover before the known reset is rejected", sorted(why),
+          ["five_hour"])
     check_true("the reason names the impossible reset",
-               why and "has not passed yet" in why)
+               "has not passed yet" in why["five_hour"])
 
     # A genuine rollover, observed after the previous window actually ended.
     later = now + 3700
     check("a rollover after the known reset is believed",
           ew.implausible_limits({"five_hour": {"resets_at": later + 5 * 3600,
                                                "used_percentage": 0}},
-                                known, later), None)
+                                known, later), {})
 
     # An ordinary reading inside the same window, usage climbing.
     check("usage rising inside one window is believed",
           ew.implausible_limits({"five_hour": {"resets_at": now + 3600,
                                                "used_percentage": 40}},
-                                known, now), None)
+                                known, now), {})
 
     # Nothing to compare against yet.
     check("the first reading is always believed",
-          ew.implausible_limits(placeholder, {}, now), None)
+          ew.implausible_limits(placeholder, {}, now), {})
+
+    # One impossible figure condemns itself and nothing else. Judged as a
+    # whole reading, an impossible weekly reset threw away the 5-hour figure
+    # beside it — and a refused ping has nothing else to say when it comes
+    # back, so the account was marked unusable for a day instead of an hour.
+    mixed = {"five_hour": {"resets_at": now + 1800, "used_percentage": 100},
+             "seven_day": {"resets_at": now + 80 * 3600, "used_percentage": 20}}
+    both_known = {"five_hour": {"resets_at": now + 3600, "used_percentage": 99},
+                  "seven_day": {"resets_at": now + 72 * 3600,
+                                "used_percentage": 20}}
+    check("only the limit that contradicts itself is rejected",
+          sorted(ew.implausible_limits(mixed, both_known, now)), ["seven_day"])
 
     # The weekly limit is guarded on the same principle.
-    check_true("a weekly rollover before its reset is rejected",
-               bool(ew.implausible_limits(
-                   {"seven_day": {"resets_at": now + 72 * 3600}},
-                   {"seven_day": {"resets_at": now + 3600}}, now)))
+    check("a weekly rollover before its reset is rejected",
+          sorted(ew.implausible_limits(
+              {"seven_day": {"resets_at": now + 72 * 3600}},
+              {"seven_day": {"resets_at": now + 3600}}, now)), ["seven_day"])
 
 
 def test_schedule_carries_account_identity():
@@ -2667,6 +2697,30 @@ def test_what_a_ping_records_from_how_it_went():
               ew.UNKNOWN)
         check_true("and the log said the turn was never confirmed",
                    "did not confirm a completed turn" in open(account.log_file).read())
+
+        # A refusal that says nothing usable about when it comes back. It is
+        # still an answer -- the account will not serve a request -- and
+        # recording nothing left it reading as usable and getting recommended.
+        ew.write_state(account, {"last_run": now - 60})
+        state = ping_with({"completed": True, "limited": True,
+                           "text": "You've hit your limit."}, {})
+        check("a refusal with nothing to go on records the limit as spent",
+              state["rate_limits"]["five_hour"]["used_percentage"], 100)
+        check("without inventing a reset time it was not told",
+              "resets_at" in state["rate_limits"]["five_hour"], False)
+        avail = ew.account_availability(account, state, time.time())
+        check("so the account reads as waiting, not as usable",
+              ew.TIER_NAMES[avail.tier], "waiting")
+        check("bounded by the limit's own length, and marked a bound",
+              (round(avail.until - time.time()), avail.exact),
+              (ew.WINDOW_HOURS * 3600, False))
+        # A reset it already knew about is better than a bound, and survives.
+        ew.write_state(account, {"last_run": now - 60, "rate_limits": {
+            "five_hour": {"resets_at": now + 900, "used_percentage": 40}}})
+        state = ping_with({"completed": True, "limited": True,
+                           "text": "You've hit your limit."}, {})
+        check("a reset already known is kept over the bound",
+              state["rate_limits"]["five_hour"]["resets_at"], now + 900)
     finally:
         (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
          ew.restore_checkpoint, ew._systemctl, ew._run) = saved

@@ -1898,7 +1898,7 @@ ROLLOVER_SLACK_SEC = 60
 
 def implausible_limits(new, previous, now):
     """
-    Why `new` cannot be believed given `previous`, or None if it can.
+    Which of these readings cannot be believed, as {limit key: why}.
 
     A window cannot begin again before the end of the one before it. So a
     reading that reports a *later* reset time while the reset we already knew
@@ -1911,19 +1911,27 @@ def implausible_limits(new, previous, now):
     fourteen minutes before the same account correctly reported 99% with its
     real reset time. Believed, it moved the account's boundary three hours late
     and produced a recommendation to hold an account back for two hours.
+
+    Per limit, because the two arrive together but are independent
+    observations. Judged as one reading, an impossible weekly reset threw away
+    a perfectly good 5-hour one — and a refused ping needs that 5-hour figure
+    more than at any other moment, since it is the only thing that says when
+    the account comes back.
     """
+    problems = {}
     if not previous:
-        return None
+        return problems
     for key, name in _LIMIT_NAMES:
         was = (previous.get(key) or {}).get("resets_at")
         now_says = (new.get(key) or {}).get("resets_at")
         if not was or not now_says:
             continue
         if now_says > was and was > now + ROLLOVER_SLACK_SEC:
-            return ("{} claims to reset at {} but the reset already known, {}, "
-                    "has not passed yet".format(name, fmt_time(now_says),
-                                                fmt_time(was)))
-    return None
+            problems[key] = (
+                "{} claims to reset at {} but the reset already known, {}, "
+                "has not passed yet".format(name, fmt_time(now_says),
+                                            fmt_time(was)))
+    return problems
 
 
 def fmt_pct(used):
@@ -2058,7 +2066,7 @@ def _weekly_is_blocking(seven_day, refusal_text, was_limited):
     return bool(was_limited and "weekly" in (refusal_text or "").lower())
 
 
-def next_window_start(limits, refusal_text, was_limited):
+def next_window_start(limits, refusal_text, was_limited, now=None):
     """
     The earliest moment a ping can both get through *and* start a new window.
 
@@ -2092,9 +2100,17 @@ def next_window_start(limits, refusal_text, was_limited):
             else:
                 candidates.append((epoch, FIVE_HOUR_HORIZON, "5-hour window"))
 
-    if not candidates:
+    # Each candidate is bounded by the length of the limit it came from: a
+    # 5-hour window cannot reset 21 hours from now, and a reading that says so
+    # is a misparse or a placeholder rather than a very long window. Dropped
+    # here, one at a time, rather than at the anchor: `max` runs first, so one
+    # nonsense candidate used to swallow every sane one beside it and leave a
+    # refused account marked unusable for a day.
+    now = time.time() if now is None else now
+    sane = [c for c in candidates if c[0] <= now + c[1]]
+    if not sane:
         return None, None, ""
-    return max(candidates, key=lambda c: c[0])
+    return max(sane, key=lambda c: c[0])
 
 
 # ---------------------------------------------------------------------------
@@ -2784,18 +2800,23 @@ def ping(account, accounts=None):
     # exactly via the statusLine; a refused one says so in the refusal text.
     limits = read_statusline_limits(account)
     if limits:
-        why = implausible_limits(limits, state.get("rate_limits"), time.time())
-        if why:
-            log(account, "Ignoring this run's usage report: {}. Keeping the "
-                         "previous figures.".format(why))
-            limits = state.get("rate_limits") or {}
-        else:
-            state["rate_limits"] = limits
+        names = dict(_LIMIT_NAMES)
+        problems = implausible_limits(limits, state.get("rate_limits"),
+                                      time.time())
+        for key in sorted(problems):
+            log(account, "Ignoring this run's {} figure: {}. Keeping the "
+                         "previous one.".format(names[key], problems[key]))
+        believed = dict((k, v) for k, v in limits.items() if k not in problems)
+        if believed:
+            merged = dict(state.get("rate_limits") or {})
+            merged.update(believed)
+            state["rate_limits"] = merged
             state["limits_source"] = "statusline"
             # When, as well as where from. Without this a live reading taken
             # earlier leaves its own timestamp behind, and every later command
             # reports figures this ping had just refreshed as half an hour old.
             state["limits_read_at"] = time.time()
+        limits = state.get("rate_limits") or {}
 
     boundary, horizon, label = next_window_start(
         limits, result["text"], result["limited"])
@@ -2820,6 +2841,23 @@ def ping(account, accounts=None):
     elif result["limited"]:
         if boundary:
             state["available_at"] = boundary
+        else:
+            # Refused, and nothing in the reply says when it comes back: no
+            # statusLine figures, and no reset in the text that its own limit
+            # could plausibly reach. The refusal is still an answer, and
+            # recorded the way a refused live reading is -- a limit spent with
+            # no reset time, which reads as "back no later than" its own length
+            # rather than as an account worth recommending.
+            spent = dict(state.get("rate_limits") or {})
+            five = dict(spent.get("five_hour") or {})
+            if (five.get("resets_at") or 0) <= time.time():
+                five.pop("resets_at", None)
+            five["used_percentage"] = LIMIT_SPENT_PCT
+            spent["five_hour"] = five
+            state["rate_limits"] = spent
+            log(account, "Refused with no usable reset time — recording the "
+                         "5-hour limit as spent until something says "
+                         "otherwise.")
         state["consecutive_failures"] = 0            # it answered; it just said no
     else:
         # No answer at all says nothing about the account — that is a local
