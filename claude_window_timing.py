@@ -379,6 +379,21 @@ def parse_accounts(data):
         seen_names[name] = True
 
         account = Account(name, config_dir, index, entry.get("label") or "")
+        # Never the user's own directory. Everything a ping does happens inside
+        # the account's config directory -- an empty pingcwd, a .claude.json
+        # carrying the three keys a ping needs, a transcript per run -- and the
+        # promise this tool makes, on its front page, is that none of that ever
+        # lands in ~/.claude. A config_dir pointing there, directly or through
+        # a symlink, breaks exactly that and nothing downstream would notice:
+        # every check would pass, and the timer would be writing to the one
+        # directory it says it never touches.
+        if os.path.realpath(account.config_dir) == os.path.realpath(
+                USER_CONFIG_DIR):
+            raise ConfigError(
+                "account {!r} points at {}, which is your own Claude Code. "
+                "Give it a directory of its own — {} is the default — so that "
+                "nothing running on a timer ever writes there.".format(
+                    name, USER_CONFIG_DIR, ping_config_dir(name)))
         if account.config_dir in seen_dirs:
             raise ConfigError(
                 "accounts {!r} and {!r} share the config directory {} — they "
@@ -5818,6 +5833,54 @@ def installed_units():
         return []
 
 
+def uninstall_advice(accounts, purge):
+    """
+    What to say after an uninstall: what was kept, and what is not ours to
+    delete.
+
+    Its own function so that the one line here that could do real damage can be
+    tested directly. `rm -rf` on the directory somebody works in would be
+    followed — it is printed by the tool, in a list of other things to paste —
+    and it would take every conversation they have. Nothing that resolves to
+    the user's own directory is ever named there, whatever an account claims to
+    be configured with.
+    """
+    lines = [""]
+    if not purge:
+        lines.append("Kept: this directory's state/, accounts.json, "
+                     "schedule.json and bin/ — re-installing picks them up "
+                     "where they left off.")
+        lines.append("Remove them too with:  {} uninstall --purge".format(
+            COMMAND))
+        lines.append("")
+    lines.append("Your ~/.claude, ~/.claude.json and every conversation are "
+                 "untouched.")
+    # Parked logins are sign-ins the user performed, exactly like a ping
+    # directory's, so an uninstaller has no business removing them — and
+    # deleting the only live copy of a login is unrecoverable without a
+    # browser.
+    if switching_configured(accounts):
+        lines.append("Parked logins in {} are left alone; delete them "
+                     "yourself if you want them gone.".format(SWITCH_ROOT))
+    disposable = [a for a in accounts
+                  if os.path.realpath(a.config_dir)
+                  != os.path.realpath(USER_CONFIG_DIR)]
+    if disposable:
+        lines.append("The ping directories are left in place; delete them "
+                     "yourself if you want them gone:")
+        for account in disposable:
+            lines.append("  rm -rf {}".format(account.config_dir))
+    # `parse_accounts` refuses an account configured there, so this is a second
+    # lock on the same door: a symlink that started pointing at ~/.claude after
+    # the configuration was read would slip past the first.
+    kept = [a for a in accounts if a not in disposable]
+    if kept:
+        lines.append("Account {} lives in your own {}, which is yours and is "
+                     "left completely alone.".format(
+                         ", ".join(a.name for a in kept), USER_CONFIG_DIR))
+    return lines
+
+
 def uninstall(accounts, purge=False):
     """
     Remove everything this tool installed, and nothing else.
@@ -6338,39 +6401,8 @@ def cli(argv=None):
         if command == "uninstall":
             for item in uninstall(accounts, purge=args.purge):
                 print("  removed {}".format(item))
-            print()
-            if not args.purge:
-                print("Kept: this directory's state/, accounts.json, "
-                      "schedule.json and bin/ — re-installing picks them up "
-                      "where they left off.")
-                print("Remove them too with:  {} uninstall --purge".format(
-                    COMMAND))
-                print()
-            print("Your ~/.claude, ~/.claude.json and every conversation are "
-                  "untouched.")
-            # Parked logins are sign-ins the user performed, exactly like a ping
-            # directory's, so an uninstaller has no business removing them —
-            # and deleting the only live copy of a login is unrecoverable
-            # without a browser.
-            if switching_configured(accounts):
-                print("Parked logins in {} are left alone; delete them "
-                      "yourself if you want them gone.".format(SWITCH_ROOT))
-            disposable = [a for a in accounts
-                          if os.path.realpath(a.config_dir)
-                          != os.path.realpath(USER_CONFIG_DIR)]
-            if disposable:
-                print("The ping directories are left in place; delete them "
-                      "yourself if you want them gone:")
-                for account in disposable:
-                    print("  rm -rf {}".format(account.config_dir))
-            # Never, under any circumstances, suggest deleting the directory the
-            # user works in. An older layout put an account there, and that is
-            # exactly when this advice would be followed and be catastrophic.
-            kept = [a for a in accounts if a not in disposable]
-            if kept:
-                print("Account {} lives in your own {}, which is yours and is "
-                      "left completely alone.".format(
-                          ", ".join(a.name for a in kept), USER_CONFIG_DIR))
+            for line in uninstall_advice(accounts, args.purge):
+                print(line)
             return 0
         if command == "install-command":
             print("Wrote {}".format(write_entry_point()))

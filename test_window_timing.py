@@ -844,6 +844,53 @@ def test_the_accounts_file_itself():
                    "#1" in str(e) and "must be an object" in str(e))
 
 
+def test_no_account_may_be_the_users_own_directory():
+    """
+    The promise on the front page is that nothing running on a timer ever
+    writes to ~/.claude. One line of accounts.json could break it.
+
+    A ping works entirely inside its account's config directory: it creates an
+    empty pingcwd there, writes the three keys a ping needs into the
+    .claude.json beside it, and leaves a transcript per run. Point a
+    config_dir at ~/.claude and all of that lands in the directory this tool
+    says it never touches — with every check passing, because nothing else
+    looks at where the account lives.
+    """
+    section("No account may be the user's own directory")
+    saved = (ew.USER_CONFIG_DIR, ew.HOME)
+    root = tempfile.mkdtemp()
+    try:
+        ew.HOME = root
+        ew.USER_CONFIG_DIR = os.path.join(root, ".claude")
+        os.makedirs(ew.USER_CONFIG_DIR)
+
+        def refusal(config_dir):
+            try:
+                ew.parse_accounts({"accounts": [{"name": "1",
+                                                 "config_dir": config_dir}]})
+                return ""
+            except ew.ConfigError as e:
+                return str(e)
+
+        check_true("the user's own directory is refused outright",
+                   "your own Claude Code" in refusal(ew.USER_CONFIG_DIR))
+        check_true("and the message says where it should go instead",
+                   ew.ping_config_dir("1") in refusal(ew.USER_CONFIG_DIR))
+
+        # Through a symlink, too: the comparison is on what the path resolves
+        # to, not on how it was spelled.
+        link = os.path.join(root, "sneaky")
+        os.symlink(ew.USER_CONFIG_DIR, link)
+        check_true("a symlink to it is refused as well",
+                   "your own Claude Code" in refusal(link))
+
+        check("a directory of its own is what it always was",
+              refusal(os.path.join(root, ".claude-1")), "")
+    finally:
+        (ew.USER_CONFIG_DIR, ew.HOME) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_accounts_file():
     section("accounts.json is validated before anything acts on it")
     tmp = tempfile.mkdtemp()
@@ -4946,25 +4993,20 @@ def test_uninstall_removes_the_units_and_nothing_else():
                                                    "projects", "p", "c.jsonl")))
         check_true("it reports what it did", len(removed) > 4)
 
-        # An older layout put an account in the user's own directory. Advising
-        # `rm -rf` on it would be followed, and would destroy every
-        # conversation they have.
-        saved_user, saved_accounts = ew.USER_CONFIG_DIR, ew.ACCOUNTS_FILE
+        # `rm -rf` on the directory somebody works in would be followed — it
+        # is printed in a list of other things to paste — and it would take
+        # every conversation they have. `parse_accounts` refuses an account
+        # configured there at all now, so this is the second lock on the same
+        # door: an account object that resolves to the user's own directory
+        # however it got that way, which a symlink made after the
+        # configuration was read would still manage.
+        saved_user = ew.USER_CONFIG_DIR
         ew.USER_CONFIG_DIR = os.path.join(home, ".claude")
-        ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
         try:
-            with open(ew.ACCOUNTS_FILE, "w") as f:
-                json.dump({"accounts": [
-                    {"name": "1", "config_dir": os.path.join(home, ".claude")},
-                    {"name": "2", "config_dir": os.path.join(home, ".claude-2")},
-                ]}, f)
-            buf = io.StringIO()
-            out, sys.stdout = sys.stdout, buf
-            try:
-                ew.cli(["uninstall"])
-            finally:
-                sys.stdout = out
-            advice = buf.getvalue()
+            advice = "\n".join(ew.uninstall_advice(
+                [ew.Account("1", os.path.join(home, ".claude"), 0),
+                 ew.Account("2", os.path.join(home, ".claude-2"), 1)],
+                purge=False))
             check_true("the user's own directory is never offered for deletion",
                        "rm -rf " + ew.USER_CONFIG_DIR + "\n" not in advice)
             check_true("the ping directory beside it still is",
@@ -4972,7 +5014,7 @@ def test_uninstall_removes_the_units_and_nothing_else():
             check_true("and it says why the other one was left alone",
                        "which is yours" in advice)
         finally:
-            ew.USER_CONFIG_DIR, ew.ACCOUNTS_FILE = saved_user, saved_accounts
+            ew.USER_CONFIG_DIR = saved_user
     finally:
         ew.UNIT_DIR, ew.BIN_DIR, ew._systemctl, ew._run, ew.HOME = saved
 
@@ -7362,7 +7404,9 @@ def main():
                  test_pty_drain_tolerates_a_departed_child,
                  test_run_interactive_survives_an_immediate_exit,
                  test_account_paths, test_the_accounts_file_itself,
-                 test_accounts_file, test_claude_env,
+                 test_accounts_file,
+                 test_no_account_may_be_the_users_own_directory,
+                 test_claude_env,
                  test_the_command_surface,
                  test_every_command_describes_what_it_actually_does,
                  test_every_command_the_output_suggests_can_be_typed,
