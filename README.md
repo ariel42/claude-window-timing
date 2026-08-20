@@ -1,4 +1,4 @@
-# claude-early-window
+# claude-window-timing
 
 **Your Claude Code usage window starts when you send your first message — so if you start work at 9am, you wait until 2pm for a fresh one. This starts it for you at dawn.**
 
@@ -134,8 +134,8 @@ Worth being plain about, because it is unusual for a tool like this:
 ## Quick start
 
 ```bash
-git clone https://github.com/ariel42/claude-early-window
-cd claude-early-window
+git clone https://github.com/ariel42/claude-window-timing
+cd claude-window-timing
 ./install.sh
 ```
 
