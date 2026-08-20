@@ -3737,16 +3737,24 @@ def switch_findings(accounts):
     if not switching_configured(accounts):
         return []
     findings = []
+    # An empty store is only a gap when that account's login is somewhere else
+    # entirely. For the account you are signed in as it is the healthy state --
+    # its login is live in ~/.claude, which is the whole point of the store
+    # being a parking place and never a copy. Warning there would be advice to
+    # go and create a second login nobody needs.
+    live = current_account(accounts)
     for account in accounts:
         store = switch_store(account)
         if not os.path.isdir(store.config_dir):
             continue
         if not os.path.exists(credentials_path(store)):
-            findings.append(Finding(
-                "warning",
-                "Account {} has a switch directory but no login parked in "
-                "it".format(account.display),
-                "Sign in there once: {}".format(sign_in_command(store))))
+            if live is None or live.name != account.name:
+                findings.append(Finding(
+                    "warning",
+                    "Account {} has a switch directory but no login parked in "
+                    "it".format(account.display),
+                    "You cannot switch to it until there is one: {}".format(
+                        sign_in_command(store))))
             continue
         identity = account_identity(store)
         expires = identity["refresh_expires_at"]

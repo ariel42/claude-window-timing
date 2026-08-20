@@ -4464,6 +4464,31 @@ def test_doctor_notices_a_store_going_stale():
         check("a healthy store produces no findings",
               ew.switch_findings(accounts), [])
 
+        # The state every completed switch leaves behind, and the one this
+        # check got wrong first time: the store of the account you are signed
+        # in as is empty *because* its login is live in ~/.claude. Calling that
+        # a gap is advice to go and make a second login nobody needs.
+        os.makedirs(ew.switch_store(accounts[0]).config_dir, exist_ok=True)
+        check("an empty store for the account in use is not a finding",
+              ew.switch_findings(accounts), [])
+
+        # For any other account, an empty store really is a gap: there is
+        # nothing to switch to.
+        config = json.load(open(ew.USER_CONFIG_JSON))
+        config["oauthAccount"] = {"accountUuid": "uuid-2",
+                                  "emailAddress": "a2@example.com"}
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            json.dump(config, f)
+        findings = ew.switch_findings(accounts)
+        check("but an empty store for one you are not on is",
+              [f.level for f in findings], ["warning"])
+        check_true("naming the account you cannot reach",
+                   "label1" in findings[0].message)
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": "uuid-1",
+                                        "emailAddress": "a1@example.com"}}, f)
+        shutil.rmtree(ew.switch_store(accounts[0]).config_dir)
+
         store = ew.switch_store(accounts[1])
         creds = json.load(open(ew.credentials_path(store)))
         creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
