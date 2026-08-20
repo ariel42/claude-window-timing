@@ -2129,6 +2129,28 @@ def _systemctl(*args):
     return _run(["systemctl", "--user"] + list(args))
 
 
+# What `systemctl --user is-system-running` answers when there is a manager to
+# answer. Anything else -- "Failed to connect to bus", or nothing at all -- is
+# not a state, it is the absence of an answer.
+_MANAGER_STATES = ("running", "degraded", "initializing", "starting",
+                   "stopping", "maintenance", "offline", "unknown")
+
+
+def systemd_reachable():
+    """
+    Whether this process can reach the user's systemd manager.
+
+    `systemctl --user` finds the bus through XDG_RUNTIME_DIR. A login session
+    has it; cron, a container exec and `ssh host command` on some
+    distributions do not -- and without it every query fails in exactly the way
+    a missing timer does. Reported per account, that reads as "the timer for
+    account 1 is not enabled", twice, with a fix that fails the same way: a
+    diagnostic crying wolf about the one thing it is supposed to be trusted on.
+    """
+    return (_systemctl("is-system-running").stdout or "").strip().lower() \
+        in _MANAGER_STATES
+
+
 def cancel_anchor(account):
     """Clear any pending anchor so a new one can take its place."""
     for unit in (account.anchor_unit + ".timer", account.anchor_unit + ".service"):
@@ -3059,6 +3081,21 @@ def doctor(accounts):
 
     findings = validate_accounts(accounts)
     now = time.time()
+    # Whether anything here can see systemd at all. Every timer question below
+    # answers "no" when the bus is out of reach, which is a different thing
+    # entirely and has a different remedy.
+    reachable = systemd_reachable()
+    if not reachable:
+        findings.append(Finding(
+            "warning",
+            "Cannot reach your systemd user manager, so nothing here can say "
+            "whether the timers are running",
+            "`systemctl --user` finds the bus through XDG_RUNTIME_DIR, which "
+            "a login session sets and cron and `ssh host <command>` may not. "
+            "Everything else below is still checked. To ask about the "
+            "timers:\n"
+            "       XDG_RUNTIME_DIR=/run/user/{} {} doctor".format(
+                os.getuid(), COMMAND)))
 
     for account in accounts:
         state = read_state(account)
@@ -3084,7 +3121,9 @@ def doctor(accounts):
                 "Sign in again with: {}".format(sign_in_command(account))))
 
         enabled = _systemctl("is-enabled", account.timer_unit)
-        if (enabled.stdout or "").strip() != "enabled":
+        if not reachable:
+            pass                      # asked and answered above, once
+        elif (enabled.stdout or "").strip() != "enabled":
             findings.append(Finding(
                 "error", "The timer for account {} is not enabled".format(
                     account.name),
@@ -3144,11 +3183,13 @@ def doctor(accounts):
                 "on it."))
 
     findings.extend(unit_cli_findings())
+    findings.extend(linger_findings(pings))
     findings.extend(_launcher_findings())
     findings.extend(_user_account_findings(accounts))
     findings.extend(switch_findings(accounts))
     findings.extend(unit_target_findings())
-    findings.extend(_stray_unit_findings(accounts))
+    if reachable:
+        findings.extend(_stray_unit_findings(accounts))
 
     if len(accounts) > 1:
         _, total, _, settled = alignment_plan(
@@ -3334,6 +3375,37 @@ def unit_cli_findings():
     return []
 
 
+def linger_findings(pings):
+    """
+    Warn when the pings stop the moment the user logs out.
+
+    A user timer lives in the user's own systemd manager, and without lingering
+    that manager is torn down with their last session. So the tool whose whole
+    promise is "a window is already running when you sit down" stops at the end
+    of the working day and starts again when somebody logs in -- which is the
+    shape of every window it was meant to prevent.
+
+    Nothing here can fix it: `loginctl enable-linger` needs root, and a setup
+    wizard that asks for sudo is a setup wizard people stop trusting. Saying it
+    plainly, every time `doctor` runs, is the whole of what this can do. Setup
+    says it once, at the end, where it is easy to miss -- which is exactly how
+    the machine that prompted this check ended up without it.
+    """
+    if not pings:
+        return []
+    answer = (_run(["loginctl", "show-user", USER]).stdout or "")
+    if "Linger=" not in answer:
+        return []                     # no loginctl, or no such user: cannot tell
+    if "Linger=yes" in answer:
+        return []
+    return [Finding(
+        "error",
+        "Lingering is off, so the pings stop when you log out of this machine",
+        "A user timer belongs to your login session. Until this is on, the "
+        "windows are only kept rolling while you are logged in:\n"
+        "       sudo loginctl enable-linger {}".format(USER))]
+
+
 def _launcher_findings():
     """
     Warn when `claude-window` cannot be typed.
@@ -3481,6 +3553,11 @@ BIN_DIR = os.path.join(SCRIPT_DIR, "bin")
 # many containers, and the tool would install cleanly and then fail to run.
 _ENTRY_POINT = '''#!/usr/bin/env bash
 # Generated by claude-window-timing. Put this directory on your PATH.
+# `systemctl --user` finds its bus through this, and a login session is not the
+# only place this command gets run from -- cron and `ssh host <command>` have
+# no session at all. Defaulted rather than overridden, so a session that set it
+# somewhere else keeps its own.
+export XDG_RUNTIME_DIR="${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}"
 exec {python} {script} "$@"
 '''
 

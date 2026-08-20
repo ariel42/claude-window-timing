@@ -3195,6 +3195,85 @@ def test_the_command_can_be_typed_after_installing():
         restore()
 
 
+def test_the_pings_are_told_to_outlive_the_login():
+    """
+    The failure that waits until you log out.
+
+    A user timer belongs to the user's own systemd manager, and without
+    lingering that manager is torn down with the last session. Everything about
+    the install stays perfect and the pings simply stop at the end of the
+    working day — producing exactly the late-started window this tool exists to
+    prevent, on the morning after.
+
+    Setup says so once, at the end, where it is easy to miss. The machine that
+    prompted this test had been installed for an hour with `Linger=no` and
+    nothing had said a word.
+    """
+    section("The pings are told to outlive the login")
+    saved = ew._run
+    try:
+        ew._run = lambda cmd: type("R", (), {
+            "returncode": 0,
+            "stdout": "UID=1000\nUser=someone\nLinger=no\n"})()
+        findings = ew.linger_findings(pings=True)
+        check("a machine that pings without lingering is an error",
+              [(f.level, "Lingering is off" in f.message) for f in findings],
+              [("error", True)])
+        check_true("and the fix is the command, spelled out",
+                   "loginctl enable-linger" in findings[0].hint)
+        check("a machine that does not ping has nothing to keep alive",
+              ew.linger_findings(pings=False), [])
+
+        ew._run = lambda cmd: type("R", (), {
+            "returncode": 0, "stdout": "UID=1000\nLinger=yes\n"})()
+        check("with lingering on, nothing is said",
+              ew.linger_findings(pings=True), [])
+
+        # No loginctl, or a user it does not know: cannot tell, so say nothing.
+        # Inventing a fault is worse than missing one.
+        ew._run = lambda cmd: type("R", (), {"returncode": 1, "stdout": ""})()
+        check("no answer at all is not a fault", ew.linger_findings(pings=True), [])
+        ew._run = lambda cmd: ew._NoSystemd()
+        check("nor is a machine with no loginctl on it",
+              ew.linger_findings(pings=True), [])
+    finally:
+        ew._run = saved
+
+
+def test_the_launcher_can_reach_the_user_manager():
+    """
+    `claude-window` is not only typed in a terminal: cron runs it, `ssh host
+    claude-window doctor` runs it, and neither has a login session. Without
+    XDG_RUNTIME_DIR `systemctl --user` cannot find its bus, and every question
+    about the timers comes back exactly as it would for a timer that was never
+    installed.
+
+    The shell scripts have always defaulted it. The launcher they hand people
+    did not.
+    """
+    section("The launcher can reach the user manager")
+    saved = ew.BIN_DIR
+    try:
+        ew.BIN_DIR = tempfile.mkdtemp()
+        body = open(ew.write_entry_point()).read()
+        check_true("the launcher defaults XDG_RUNTIME_DIR",
+                   'XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"'
+                   in body)
+        check_true("without overriding a session that set its own",
+                   ":-" in body.split("XDG_RUNTIME_DIR=")[1])
+        check_true("and still execs the script with every argument",
+                   body.rstrip().endswith('"$@"'))
+        # It has to survive `bash -n` as well as reading well.
+        checked = subprocess.run(["bash", "-n", os.path.join(ew.BIN_DIR,
+                                                             ew.COMMAND)],
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+        check("the launcher is valid shell", checked.returncode, 0)
+    finally:
+        shutil.rmtree(ew.BIN_DIR, ignore_errors=True)
+        ew.BIN_DIR = saved
+
+
 def test_the_timer_is_told_where_the_cli_is():
     """
     The install that looks perfect and never pings once.
@@ -3355,10 +3434,13 @@ def test_doctor_notices_a_deployment_going_wrong():
             self.stdout, self.returncode = out, code
 
     def fake_systemctl(*args):
+        joined = " ".join(args)
         for key, reply in replies.items():
-            if key in " ".join(args):
+            if key in joined:
                 return reply
-        return Reply("")
+        # A manager that answers, unless a case below says otherwise: every
+        # timer question is meaningless when there is nothing to ask.
+        return Reply("running" if "is-system-running" in joined else "")
 
     ew._systemctl = fake_systemctl
     try:
@@ -3370,6 +3452,21 @@ def test_doctor_notices_a_deployment_going_wrong():
             finally:
                 sys.stdout = out
             return buf.getvalue()
+
+        # No bus, no answers. Every timer question fails exactly as a missing
+        # timer does, and reporting one per account -- with a fix that fails
+        # the same way -- is the diagnostic crying wolf about the one thing it
+        # exists to be trusted on.
+        replies = {"is-system-running": Reply("Failed to connect to bus: No "
+                                              "medium found", 1),
+                   "is-enabled": Reply("")}
+        said = doctor_says()
+        check_true("an unreachable user manager is named for what it is",
+                   "Cannot reach your systemd user manager" in said)
+        check("and no timer is called broken on the strength of it",
+              "is not enabled" in said, False)
+        check_true("with the way to ask properly",
+                   "XDG_RUNTIME_DIR=/run/user/" in said)
 
         replies = {"is-enabled": Reply("disabled")}
         said = doctor_says()
@@ -6804,6 +6901,8 @@ def main():
                  test_setup_and_init_refuse_the_obviously_wrong,
                  test_the_first_run_screen_says_the_things_that_stop_people,
                  test_the_command_can_be_typed_after_installing,
+                 test_the_pings_are_told_to_outlive_the_login,
+                 test_the_launcher_can_reach_the_user_manager,
                  test_the_timer_is_told_where_the_cli_is,
                  test_a_timer_that_will_never_fire_again_is_noticed,
                  test_nothing_touches_the_users_own_directory,
