@@ -1,5 +1,5 @@
 """
-Tests for claude_early_window.
+Tests for claude_window_timing.
 
 By default nothing here contacts Claude, spawns a session, or spends any of your
 usage window. The pieces that decide *when* to ping, *which account* to use, and
@@ -7,7 +7,7 @@ usage window. The pieces that decide *when* to ping, *which account* to use, and
 is silent — the tool keeps running and just drifts, picks the wrong account, or
 strands a conversation nobody can resume.
 
-    python3 test_early_window.py
+    python3 test_window_timing.py
 
 Nothing here needs a Claude account, a network, or systemd. Where a whole
 install has to be exercised, fake_claude.py stands in for the CLI and every
@@ -30,7 +30,7 @@ import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import claude_early_window as ew
+import claude_window_timing as ew
 
 
 FAILURES = []
@@ -550,8 +550,8 @@ def test_account_paths():
           ew._project_slug("/home/u/.claude-1/pingcwd"),
           "-home-u--claude-1-pingcwd")
     check("and a path without dots is unaffected",
-          ew._project_slug("/opt/dev/claude-early-window"),
-          "-opt-dev-claude-early-window")
+          ew._project_slug("/opt/dev/claude-window-timing"),
+          "-opt-dev-claude-window-timing")
 
     check_true("a ping runs inside its own account directory",
                second.ping_cwd.startswith(second.config_dir))
@@ -566,9 +566,9 @@ def test_account_paths():
                    getattr(first, attr) != getattr(second, attr))
 
     check("units are systemd template instances", second.service_unit,
-          "claude-early-window@2.service")
+          "claude-window-timing@2.service")
     check("timers match their service", second.timer_unit,
-          "claude-early-window@2.timer")
+          "claude-window-timing@2.timer")
     check_true("the anchor is not a template instance — it is transient",
                "@" not in second.anchor_unit)
     check_true("anchors are per account",
@@ -744,7 +744,7 @@ def test_the_status_line_writes_only_where_it_was_told():
     """
     section("The status line writes to the file it is given, and nowhere else")
     here = os.path.dirname(os.path.abspath(__file__))
-    script = os.path.join(here, "claude_early_window.py")
+    script = os.path.join(here, "claude_window_timing.py")
     live = os.path.join(here, "state")
 
     def snapshot(root):
@@ -2469,7 +2469,7 @@ def test_an_unusable_account_is_still_pinged():
     # stopped being usable. Timers are only ever disabled by the two functions
     # that tear down accounts the user removed or uninstalled.
     source = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "claude_early_window.py")).read()
+                               "claude_window_timing.py")).read()
     stoppers = set()
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.FunctionDef):
@@ -2691,7 +2691,7 @@ def test_upgrading_keeps_the_existing_checkpoint():
         for name, body in (("early_window_session_id.txt", "old-session"),
                            ("early_window_checkpoint.jsonl.bak", "{}\n"),
                            ("early_window_state.json", '{"boundary": 1}'),
-                           ("claude_early_window.log", "[x] hello\n")):
+                           ("claude_window_timing.log", "[x] hello\n")):
             with open(os.path.join(ew.SCRIPT_DIR, name), "w") as f:
                 f.write(body)
 
@@ -3032,7 +3032,7 @@ def test_nothing_touches_the_users_own_directory():
 
     # -- statically -------------------------------------------------------
     here = os.path.dirname(os.path.abspath(__file__))
-    source = open(os.path.join(here, "claude_early_window.py")).read()
+    source = open(os.path.join(here, "claude_window_timing.py")).read()
     allowed = {"USER_CONFIG_DIR  = os.path.join(HOME",
                "USER_CONFIG_JSON = os.path.join(HOME"}
     offenders = []
@@ -3149,22 +3149,22 @@ def test_a_clean_install_from_nothing():
 
     units = os.path.join(home, ".config", "systemd", "user")
     check_true("the unit template is written",
-               os.path.exists(os.path.join(units, "claude-early-window@.service")))
-    body = open(os.path.join(units, "claude-early-window@.service")).read()
+               os.path.exists(os.path.join(units, "claude-window-timing@.service")))
+    body = open(os.path.join(units, "claude-window-timing@.service")).read()
     check_true("and runs an explicit ping subcommand", "ping %i" in body)
     check_true("the second account is staggered so they do not collide",
                os.path.exists(os.path.join(
-                   units, "claude-early-window@2.timer.d", "stagger.conf")))
+                   units, "claude-window-timing@2.timer.d", "stagger.conf")))
     stagger = open(os.path.join(
-        units, "claude-early-window@2.timer.d", "stagger.conf")).read()
+        units, "claude-window-timing@2.timer.d", "stagger.conf")).read()
     check_true("and its drop-in restates the repeat interval",
                "OnUnitActiveSec" in stagger)
 
     enabled = [c for c in calls if c[:2] == ["systemctl", "enable"]]
     check("a timer is enabled per account", len(enabled), 2)
     check_true("both by name",
-               {c[2] for c in enabled} == {"claude-early-window@1.timer",
-                                           "claude-early-window@2.timer"})
+               {c[2] for c in enabled} == {"claude-window-timing@1.timer",
+                                           "claude-window-timing@2.timer"})
 
     check_true("the launcher is installed and executable",
                os.access(os.path.join(repo, "bin", ew.COMMAND), os.X_OK))
@@ -3218,10 +3218,10 @@ def test_install_uninstall_purge_and_install_again():
           first_checkpoint)
     check_true("uninstall disables every timer",
                all(any(c[:3] == ["systemctl", "disable", "--now"]
-                       and c[3] == "claude-early-window@{}.timer".format(n)
+                       and c[3] == "claude-window-timing@{}.timer".format(n)
                        for c in calls) for n in ("1", "2")))
     check("no unit file is left behind",
-          [n for n in os.listdir(units) if n.startswith("claude-early-window")],
+          [n for n in os.listdir(units) if n.startswith("claude-window-timing")],
           [])
     check_true("the checkpoint survives an ordinary uninstall",
                os.path.exists(os.path.join(repo, "state", "1", "session_id.txt")))
@@ -3238,7 +3238,7 @@ def test_install_uninstall_purge_and_install_again():
     for name in ("state", "accounts.json", "bin"):
         check_true("purge reports removing {}".format(name), name in removed)
     check("no unit file survives the purge either",
-          [n for n in os.listdir(units) if n.startswith("claude-early-window")],
+          [n for n in os.listdir(units) if n.startswith("claude-window-timing")],
           [])
 
     # The line purge does not cross. These directories hold logins the user
@@ -3261,7 +3261,7 @@ def test_install_uninstall_purge_and_install_again():
                os.access(os.path.join(repo, "bin", ew.COMMAND), os.X_OK))
     check_true("the units are back",
                os.path.exists(os.path.join(units,
-                                           "claude-early-window@.service")))
+                                           "claude-window-timing@.service")))
     check("and every timer is enabled again",
           len([c for c in calls if c[:2] == ["systemctl", "enable"]]), 2)
 
@@ -3300,15 +3300,15 @@ def test_three_accounts_install_and_space_correctly():
 
     enabled = sorted(c[2] for c in calls if c[:2] == ["systemctl", "enable"])
     check("three timers are enabled", enabled,
-          ["claude-early-window@{}.timer".format(n) for n in ("1", "2", "3")])
+          ["claude-window-timing@{}.timer".format(n) for n in ("1", "2", "3")])
 
     units = os.path.join(home, ".config", "systemd", "user")
     check_true("the first account has no stagger drop-in",
                not os.path.isdir(os.path.join(
-                   units, "claude-early-window@1.timer.d")))
+                   units, "claude-window-timing@1.timer.d")))
     offsets = []
     for name in ("2", "3"):
-        body = open(os.path.join(units, "claude-early-window@{}.timer.d".format(name),
+        body = open(os.path.join(units, "claude-window-timing@{}.timer.d".format(name),
                                  "stagger.conf")).read()
         offsets.append([l for l in body.splitlines() if l.startswith("OnActiveSec=") and l != "OnActiveSec="][0])
     check("each later account starts a minute after the last", offsets,
@@ -3351,8 +3351,8 @@ def test_removing_an_account_stops_its_timer():
     os.makedirs(wants)
     for name in ("1", "2", "3"):
         open(os.path.join(wants,
-                          "claude-early-window@{}.timer".format(name)), "w").close()
-    os.makedirs(os.path.join(units, "claude-early-window@3.timer.d"))
+                          "claude-window-timing@{}.timer".format(name)), "w").close()
+    os.makedirs(os.path.join(units, "claude-window-timing@3.timer.d"))
 
     saved = (ew.UNIT_DIR, ew._systemctl, ew._run, ew.HOME)
     seen = []
@@ -3377,22 +3377,22 @@ def test_removing_an_account_stops_its_timer():
 
     flat = [" ".join(c) for c in seen]
     check_true("the removed account's timer is disabled",
-               any("disable --now claude-early-window@3.timer" in c for c in flat))
+               any("disable --now claude-window-timing@3.timer" in c for c in flat))
     # A pending anchor is a transient unit with no file, so it survives a
     # disable and would restart the service it belongs to.
     check_true("and any anchor it left armed is stopped",
-               any("stop claude-early-window-anchor-3.timer" in c for c in flat))
+               any("stop claude-window-timing-anchor-3.timer" in c for c in flat))
     check_true("the accounts that remain are still enabled",
-               any("enable claude-early-window@1.timer" in c for c in flat)
-               and any("enable claude-early-window@2.timer" in c for c in flat))
+               any("enable claude-window-timing@1.timer" in c for c in flat)
+               and any("enable claude-window-timing@2.timer" in c for c in flat))
     check_true("and neither of them is disabled",
-               not any("disable --now claude-early-window@1.timer" in c
+               not any("disable --now claude-window-timing@1.timer" in c
                        for c in flat)
-               and not any("disable --now claude-early-window@2.timer" in c
+               and not any("disable --now claude-window-timing@2.timer" in c
                            for c in flat))
     check_true("the removed account's stagger drop-in is gone",
                not os.path.isdir(os.path.join(
-                   units, "claude-early-window@3.timer.d")))
+                   units, "claude-window-timing@3.timer.d")))
 
 
 def test_a_clean_install_refuses_a_refused_first_message():
@@ -3678,7 +3678,7 @@ def test_the_shell_scripts_call_commands_that_exist():
     for action in parser._actions:
         known.update(getattr(action, "choices", None) or {})
 
-    pattern = re.compile(r"claude_early_window\.py\"?\s+(--?[\w-]+|[\w-]+)")
+    pattern = re.compile(r"claude_window_timing\.py\"?\s+(--?[\w-]+|[\w-]+)")
     seen = 0
     for name in ("install.sh", "uninstall.sh"):
         body = open(os.path.join(here, name)).read()
@@ -3716,8 +3716,8 @@ def test_doctor_spots_residue_from_an_earlier_install():
 
         # Our own units failing is a different finding, made elsewhere; saying it
         # twice, and calling them foreign, would be worse than silence.
-        ew._systemctl = stub("claude-early-window@1.timer loaded failed failed x\n"
-                             "claude-early-window-anchor-2.timer loaded failed f\n")
+        ew._systemctl = stub("claude-window-timing@1.timer loaded failed failed x\n"
+                             "claude-window-timing-anchor-2.timer loaded failed f\n")
         check("our own units are not called foreign",
               ew._stray_unit_findings(accounts), [])
 
@@ -3767,10 +3767,10 @@ def test_uninstall_removes_the_units_and_nothing_else():
 
         # A deployment to tear down, including the single-account units an
         # install from before accounts.json would have left.
-        for name in ("claude-early-window@.service", "claude-early-window@.timer",
-                     "claude-early-window.service"):
+        for name in ("claude-window-timing@.service", "claude-window-timing@.timer",
+                     "claude-window-timing.service"):
             open(os.path.join(units, name), "w").close()
-        os.makedirs(os.path.join(units, "claude-early-window@2.timer.d"))
+        os.makedirs(os.path.join(units, "claude-window-timing@2.timer.d"))
         open(os.path.join(ew.BIN_DIR, ew.COMMAND), "w").close()
 
         # The user's own things, which must survive untouched.
@@ -3797,15 +3797,15 @@ def test_uninstall_removes_the_units_and_nothing_else():
 
         for name in ("1", "2"):
             check_true("account {}'s timer is disabled".format(name),
-                       any("disable --now claude-early-window@{}.timer".format(name)
+                       any("disable --now claude-window-timing@{}.timer".format(name)
                            in c for c in seen))
             # A pending anchor is transient and survives a disable, so it would
             # fire afterwards and restart the service.
             check_true("account {}'s anchor is stopped".format(name),
-                       any("stop claude-early-window-anchor-{}.timer".format(name)
+                       any("stop claude-window-timing-anchor-{}.timer".format(name)
                            in c for c in seen))
-        for name in ("claude-early-window@.service", "claude-early-window@.timer",
-                     "claude-early-window.service"):
+        for name in ("claude-window-timing@.service", "claude-window-timing@.timer",
+                     "claude-window-timing.service"):
             check_true("{} is removed".format(name),
                        not os.path.exists(os.path.join(units, name)))
         # Without --purge the launcher stays, so re-installing needs nothing
