@@ -14,9 +14,7 @@ echo "====================================="
 # Everything that needs judgement lives in the Python, where it is tested.
 python3 "$SCRIPT_DIR/claude_window_timing.py" uninstall "$@" || {
     echo "Could not read the account configuration; removing units by name." >&2
-    # Both spellings: this project was renamed, and the fallback exists for
-    # exactly the case where the Python cannot tell us which units are ours.
-    for prefix in claude-window-timing claude-early-window; do
+    for prefix in claude-window-timing; do
         systemctl --user list-units --all --plain --no-legend "${prefix}@*.timer" \
             2>/dev/null | sed -n "s/^\(${prefix}@[^.]*\.timer\).*/\1/p" \
             | while read -r unit; do systemctl --user disable --now "$unit" 2>/dev/null || true; done

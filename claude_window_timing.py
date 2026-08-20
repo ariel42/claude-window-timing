@@ -33,6 +33,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -423,51 +425,6 @@ def find_account(accounts, name):
 
 # ---------------------------------------------------------------------------
 # Upgrading from the single-account layout
-# ---------------------------------------------------------------------------
-#
-# The repository *is* the deployment: the units run the checked-out script in
-# place, so a `git pull` swaps the code under a running service with no restart
-# and no chance to say anything first. An upgrade that expected the user to move
-# files by hand would therefore find its state already gone — the next ping would
-# see no checkpoint, build a fresh one, and restart the window phase it had spent
-# days getting right.
-#
-# So this runs itself, before anything reads state, and it moves rather than
-# copies: leaving both copies would make it ambiguous which one is authoritative.
-
-_LEGACY_FILES = (
-    ("early_window_session_id.txt",       "session_id.txt"),
-    ("early_window_checkpoint.jsonl.bak", "checkpoint.jsonl.bak"),
-    ("early_window_state.json",           "state.json"),
-    ("early_window_statusline.jsonl",     "statusline.jsonl"),
-    # Not renamed with the rest: this is the name the file had, on machines
-    # that still have one. Rewriting it to today's name would look tidy and
-    # quietly break the migration it exists to perform.
-    ("claude_early_window.log",           "ping.log"),
-)
-
-
-def migrate_legacy_state(account):
-    """
-    Move a pre-multi-account install's files into the first account's state dir.
-
-    Returns what moved. Does nothing if the account already has a checkpoint —
-    the existing one always wins, so this can never overwrite a working setup,
-    and running it repeatedly is safe.
-    """
-    if os.path.exists(account.session_id_file):
-        return []
-    moved = []
-    for old_name, new_name in _LEGACY_FILES:
-        old = os.path.join(SCRIPT_DIR, old_name)
-        if not os.path.exists(old):
-            continue
-        account.ensure_state_dir()
-        shutil.move(old, os.path.join(account.state_dir, new_name))
-        moved.append(old_name)
-    return moved
-
-
 # ---------------------------------------------------------------------------
 # Which account to use right now
 # ---------------------------------------------------------------------------
@@ -1634,6 +1591,98 @@ def statusline_api_ms(account, records=None):
         records = statusline_records(account)
     return max([(r.get("cost") or {}).get("total_api_duration_ms") or 0
                 for r in records] or [0])
+
+
+# Where a live reading comes from. The statusLine figures everywhere else are
+# captured during a ping, so they are up to one interval old -- and the thing
+# most likely to have moved them since is the user's own work, which is exactly
+# what the recommendation is about to be made against. A reading taken now costs
+# one very small request against the account it asks about, so nothing takes one
+# unless asked.
+LIVE_URL = "https://api.anthropic.com/v1/messages"
+LIVE_MODEL = "claude-haiku-4-5-20251001"
+OAUTH_BETA = "oauth-2025-04-20"
+
+
+def read_live_limits(account):
+    """
+    Ask Claude what this account's limits are *now*, or return {}.
+
+    The rate-limit headers ride on a successful response, so this has to be a
+    real request: the smallest one that can be made, one token in and one out,
+    on the cheapest model. A refusal carries no headers at all, which is itself
+    an answer -- an account that refuses is spent, whatever the last ping said.
+
+    Returns the same shape the statusLine produces, so every caller downstream
+    is unchanged.
+    """
+    creds = (_read_json(credentials_path(account)).get("claudeAiOauth") or {})
+    token = creds.get("accessToken")
+    if not token:
+        return {}
+    body = json.dumps({"model": LIVE_MODEL, "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "."}]}).encode()
+    request = urllib.request.Request(LIVE_URL, data=body, headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + token,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": OAUTH_BETA,
+        "User-Agent": "{}/{}".format(COMMAND, "live")})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            headers = response.headers
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            # Refused: no headers, but the refusal is the reading. Nothing here
+            # can say when it comes back, so leave the reset time to the ping.
+            return {"five_hour": {"used_percentage": 100}}
+        return {}
+    except (urllib.error.URLError, OSError):
+        return {}
+
+    limits = {}
+    for key, prefix in (("five_hour", "5h"), ("seven_day", "7d")):
+        used = headers.get("anthropic-ratelimit-unified-{}-utilization".format(prefix))
+        resets = headers.get("anthropic-ratelimit-unified-{}-reset".format(prefix))
+        window = {}
+        if used is not None:
+            try:
+                window["used_percentage"] = round(float(used) * 100)
+            except ValueError:
+                pass
+        if resets is not None:
+            try:
+                window["resets_at"] = int(resets)
+            except ValueError:
+                pass
+        if window:
+            limits[key] = window
+    return limits
+
+
+def refresh_limits(accounts):
+    """
+    Take a live reading for every account and record it. Returns what it got.
+
+    Written back into state so that the next command -- and the next ping's
+    plausibility check -- start from the same picture the user was just shown.
+    """
+    taken = {}
+    for account in accounts:
+        limits = read_live_limits(account)
+        if not limits:
+            continue
+        taken[account.name] = limits
+        state = read_state(account)
+        merged = dict(state.get("rate_limits") or {})
+        for key, window in limits.items():
+            merged[key] = dict(merged.get(key) or {}, **window)
+        state["rate_limits"] = merged
+        state["limits_source"] = "live"
+        state["limits_read_at"] = time.time()
+        account.ensure_state_dir()
+        write_state(account, state)
+    return taken
 
 
 def read_statusline_limits(account):
@@ -3059,6 +3108,24 @@ def which(accounts, states=None, avail=None, published_at=None):
     # Everything above was computed from the last ping. Say so when that was long
     # enough ago to be a different story — an answer this confident should not
     # come from readings nobody has refreshed since the timer stopped.
+    # Say how old this is, always. The figures come from the last ping unless
+    # somebody asked for a live reading, and the likeliest thing to have moved
+    # them since is the reader's own work -- which is precisely what they are
+    # about to act on. A stale number that looks current is worse than no
+    # number.
+    read_at = max([(states[a.name].get("limits_read_at")
+                    or states[a.name].get("last_run") or 0)
+                   for a in accounts])
+    if read_at and not published_at:
+        source = ("a live reading"
+                  if any(states[a.name].get("limits_source") == "live"
+                         for a in accounts) else "the last ping")
+        print()
+        print("  Figures from {}, {} ago.{}".format(
+            source, fmt_delta(now - read_at),
+            "" if now - read_at < 120 else
+            "  `{} which --live` reads them now.".format(COMMAND)))
+
     freshest = max([states[a.name].get("last_run") or 0 for a in accounts])
     if published_at:
         # Where the answer came from matters here in a way it does not on the
@@ -4459,10 +4526,6 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
 
     # Must happen before the checkpoint check below, or an upgrade would look
     # like a fresh install and spend a ping rebuilding what it already has.
-    moved = migrate_legacy_state(accounts[0])
-    if moved:
-        print("Moved {} from the previous single-account layout into {}".format(
-            ", ".join(moved), accounts[0].state_dir))
 
     # ── Signing in ──────────────────────────────────────────────────────────
     if pings:
@@ -4672,11 +4735,9 @@ def _tilde(path):
 
 UNIT_DIR = os.path.join(HOME, ".config", "systemd", "user")
 
-# Every name this tool's units have gone by. The current one first; the rest
-# are older spellings that may still be installed on somebody's machine, and
-# that "is this machine pinging?" has to keep recognising -- otherwise an
-# upgrade looks like a machine that stopped pinging while it carries on.
-UNIT_PREFIXES = ("claude-window-timing", "claude-early-window")
+# What this tool's units are called. One generation: this project has never
+# been released under another name, so there is nothing older to recognise.
+UNIT_PREFIX = "claude-window-timing"
 
 _SERVICE_UNIT = """[Unit]
 Description=Claude Code Window Timing — ping for account %i
@@ -4824,7 +4885,7 @@ def installed_units():
     """
     try:
         return sorted(f for f in os.listdir(UNIT_DIR)
-                      if f.startswith(UNIT_PREFIXES))
+                      if f.startswith(UNIT_PREFIX))
     except (IOError, OSError):
         return []
 
@@ -4856,15 +4917,8 @@ def uninstall(accounts, purge=False):
                    account.anchor_unit + ".timer")
         removed.append("timer for account " + account.name)
 
-    # Current names first, then every name this tool has used before. An
-    # upgrade renames the units underneath somebody who never asked for it, so
-    # the old ones have to be swept up here or they linger for ever -- enabled,
-    # pointing at a script path that may not exist, and reported by `doctor` as
-    # something the user did.
     for name in ("claude-window-timing@.service", "claude-window-timing@.timer",
-                 "claude-window-timing.service", "claude-window-timing.timer",
-                 "claude-early-window@.service", "claude-early-window@.timer",
-                 "claude-early-window.service", "claude-early-window.timer"):
+                 "claude-window-timing.service", "claude-window-timing.timer"):
         path = os.path.join(UNIT_DIR, name)
         if os.path.exists(path):
             os.remove(path)
@@ -4951,8 +5005,16 @@ def build_parser():
     status = add("status", "What every account is doing, and which to use now.")
     status.add_argument("--json", action="store_true",
                         help="report it as JSON instead, for scripting")
+    status.add_argument("--live", action="store_true",
+                        help="read each account's limits from Claude now "
+                             "instead of using the last ping's figures. Costs "
+                             "one very small request per account")
 
-    add("which", "Say which account to use right now, and why.")
+    which_ = add("which", "Say which account to use right now, and why.")
+    which_.add_argument("--live", action="store_true",
+                        help="read the limits from Claude now instead of using "
+                             "the last ping's figures. Costs one very small "
+                             "request per account")
 
     switching = sub.add_parser(
         "switch",
@@ -5183,17 +5245,11 @@ def cli(argv=None):
 
     try:
         accounts = load_accounts()
-        # Before anything reads state: an upgrade must not look like a fresh
-        # install, or it would throw away a checkpoint that still works.
-        moved = migrate_legacy_state(accounts[0])
-        if moved:
-            sys.stderr.write(
-                "Moved {} from the previous single-account layout into "
-                "{}\n".format(", ".join(moved), accounts[0].state_dir))
-
         if command == "status":
             # getattr, because the bare invocation has no status subparser and
             # therefore none of its options.
+            if getattr(args, "live", False):
+                refresh_limits(accounts)
             if getattr(args, "json", False):
                 return status_json(accounts)
             code = status(accounts)
@@ -5207,6 +5263,8 @@ def cli(argv=None):
                       "run `{} help` for all of them.".format(COMMAND))
             return code
         if command == "which":
+            if getattr(args, "live", False):
+                refresh_limits(accounts)
             # A machine that pings nothing has no state of its own; a copy of
             # the pinging machine's schedule.json is all it needs to answer.
             view = schedule_view(accounts)

@@ -2693,60 +2693,6 @@ def test_the_first_run_screen_says_the_things_that_stop_people():
         ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE, ew.HOME, sys.stdin = saved
 
 
-def test_upgrading_keeps_the_existing_checkpoint():
-    """
-    The units run the checked-out script in place, so `git pull` swaps the code
-    under a running service. If an upgrade looked like a fresh install it would
-    build a new checkpoint and throw away a window phase that took days to settle.
-    """
-    section("Upgrading from the single-account layout")
-    ew.STATE_ROOT = tempfile.mkdtemp()
-    saved_dir, ew.SCRIPT_DIR = ew.SCRIPT_DIR, tempfile.mkdtemp()
-    try:
-        account = ew.Account("1", os.path.join(ew.STATE_ROOT, "cfg"), 0)
-        for name, body in (("early_window_session_id.txt", "old-session"),
-                           ("early_window_checkpoint.jsonl.bak", "{}\n"),
-                           ("early_window_state.json", '{"boundary": 1}'),
-                           # The name the log actually had. Renaming this with
-                           # the rest of the project made the test agree with a
-                           # rewritten constant instead of with history.
-                           ("claude_early_window.log", "[x] hello\n")):
-            with open(os.path.join(ew.SCRIPT_DIR, name), "w") as f:
-                f.write(body)
-
-        moved = ew.migrate_legacy_state(account)
-        check("every old file is accounted for", len(moved), 4)
-        check("the checkpoint id survives untouched",
-              open(account.session_id_file).read(), "old-session")
-        check("and so does the schedule it had worked out",
-              ew.read_state(account).get("boundary"), 1)
-        check_true("the log comes along too", os.path.exists(account.log_file))
-        # Moved, not copied: two copies would leave it ambiguous which is real.
-        check_true("nothing is left behind at the old location",
-                   not os.path.exists(os.path.join(ew.SCRIPT_DIR,
-                                                   "early_window_state.json")))
-
-        check("running it again does nothing", ew.migrate_legacy_state(account), [])
-
-        # setup() returns before cli()'s migration runs, so it has to do its own
-        # — otherwise the wizard sees "no checkpoint" and spends a ping
-        # rebuilding one that already exists.
-        import inspect
-        body = inspect.getsource(ew.setup)
-        check_true("the wizard migrates before it checks for a checkpoint",
-                   body.index("migrate_legacy_state")
-                   < body.index("session_id_file"))
-        # An account that already has a checkpoint must never be overwritten.
-        with open(os.path.join(ew.SCRIPT_DIR, "early_window_session_id.txt"), "w") as f:
-            f.write("stray")
-        check("a stray old file cannot displace a working checkpoint",
-              ew.migrate_legacy_state(account), [])
-        check("the working checkpoint is still the one in use",
-              open(account.session_id_file).read(), "old-session")
-    finally:
-        ew.SCRIPT_DIR = saved_dir
-
-
 def test_a_timer_that_will_never_fire_again_is_noticed():
     """
     A systemd timer can be enabled, active, and still never fire again — a
@@ -4134,6 +4080,85 @@ def test_an_interrupted_switch_never_leaves_a_login_in_two_places():
         restore()
 
 
+def test_a_live_reading_beats_a_cached_one():
+    """
+    Every figure the tool shows comes from the statusLine of the last ping, so
+    it is up to one interval old -- and the likeliest thing to have moved it
+    since is the reader's own work, which is exactly what the recommendation is
+    about to be made against. An account that has just been spent still read as
+    usable, and `which` recommended it.
+
+    Nothing here touches the network: the transport is replaced.
+    """
+    section("A live reading beats a cached one")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1")
+    real_open = ew.urllib.request.urlopen
+    try:
+        now = time.time()
+        for account in accounts:
+            account.ensure_state_dir()
+            ew.write_state(account, {
+                "last_run": now - 1500,
+                "rate_limits": {"five_hour": {"used_percentage": 12,
+                                              "resets_at": now + 3600}}})
+        check("the cached figure is what it was told",
+              (ew.read_state(accounts[0])["rate_limits"]["five_hour"]
+               ["used_percentage"]), 12)
+
+        class Response(object):
+            headers = {"anthropic-ratelimit-unified-5h-utilization": "0.97",
+                       "anthropic-ratelimit-unified-5h-reset": str(int(now + 900)),
+                       "anthropic-ratelimit-unified-7d-utilization": "0.40",
+                       "anthropic-ratelimit-unified-7d-reset": str(int(now + 86400))}
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        ew.urllib.request.urlopen = lambda *a, **k: Response()
+
+        limits = ew.read_live_limits(accounts[0])
+        check("a live reading converts the fraction to a percentage",
+              limits["five_hour"]["used_percentage"], 97)
+        check("and carries the reset time", limits["five_hour"]["resets_at"],
+              int(now + 900))
+        check("the weekly limit comes too",
+              limits["seven_day"]["used_percentage"], 40)
+
+        ew.refresh_limits(accounts)
+        state = ew.read_state(accounts[0])
+        check("it replaces the cached figure",
+              state["rate_limits"]["five_hour"]["used_percentage"], 97)
+        check("and records where it came from", state["limits_source"], "live")
+        check_true("and when", state.get("limits_read_at", 0) >= now)
+
+        # An account that refuses is spent, whatever the last ping believed.
+        def refuse(*a, **k):
+            raise ew.urllib.error.HTTPError("u", 429, "Too Many Requests", {}, None)
+        ew.urllib.request.urlopen = refuse
+        check("a refusal reads as spent",
+              ew.read_live_limits(accounts[0])["five_hour"]["used_percentage"], 100)
+
+        # Anything else leaves the cached figures alone rather than guessing.
+        def broken(*a, **k):
+            raise ew.urllib.error.URLError("no route to host")
+        ew.urllib.request.urlopen = broken
+        check("an unreachable network reads as nothing at all",
+              ew.read_live_limits(accounts[0]), {})
+        before = ew.read_state(accounts[1])["rate_limits"]
+        ew.refresh_limits([accounts[1]])
+        check("and leaves what was already known untouched",
+              ew.read_state(accounts[1])["rate_limits"], before)
+
+        # No token, no request: an unconfigured account must not be asked about.
+        os.remove(ew.credentials_path(accounts[1]))
+        ew.urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("asked Claude about an account with no login"))
+        check("an account with no login is never asked about",
+              ew.read_live_limits(accounts[1]), {})
+    finally:
+        ew.urllib.request.urlopen = real_open
+        restore()
+
+
 def test_the_schedule_is_treated_as_input_not_configuration():
     """
     `schedule.json` is copied between machines, so it arrives from elsewhere.
@@ -5321,45 +5346,6 @@ def test_the_installer_insists_on_claude_code_in_both_modes():
         shutil.rmtree(home, ignore_errors=True)
 
 
-def test_units_installed_under_the_old_name_are_still_recognised():
-    """
-    The project was renamed after it had been installed on real machines. An
-    upgrade therefore finds units called something this version no longer
-    writes -- and if it stops recognising them, a machine that is still pinging
-    every 30 minutes looks like one that is not, and uninstalling leaves them
-    behind enabled and pointing at a script path that may no longer exist.
-    """
-    section("Units installed under the old name")
-
-    restore, home, accounts = _switch_sandbox(signed_in_as="1")
-    try:
-        check("a machine with no units at all reports none",
-              ew.installed_units(), [])
-
-        for name in ("claude-early-window@.service", "claude-early-window@.timer"):
-            open(os.path.join(ew.UNIT_DIR, name), "w").close()
-        check("units under the old name are still seen",
-              ew.installed_units(),
-              ["claude-early-window@.service", "claude-early-window@.timer"])
-
-        open(os.path.join(ew.UNIT_DIR, "claude-window-timing@.timer"), "w").close()
-        check("alongside the current name",
-              len(ew.installed_units()), 3)
-
-        # And uninstalling sweeps up both spellings, not just today's.
-        saved = ew._systemctl
-        ew._systemctl = lambda *a: type("Ok", (), {"returncode": 0,
-                                                   "stdout": ""})()
-        try:
-            ew.uninstall(accounts)
-        finally:
-            ew._systemctl = saved
-        check("uninstall removes every generation of the name",
-              ew.installed_units(), [])
-    finally:
-        restore()
-
-
 def test_a_machine_without_systemd_can_still_install_the_switcher():
     """
     The prerequisite that has to wait for an answer.
@@ -5786,7 +5772,6 @@ def main():
                  test_setup_lays_accounts_out_sensibly,
                  test_setup_and_init_refuse_the_obviously_wrong,
                  test_the_first_run_screen_says_the_things_that_stop_people,
-                 test_upgrading_keeps_the_existing_checkpoint,
                  test_a_timer_that_will_never_fire_again_is_noticed,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
@@ -5797,6 +5782,7 @@ def main():
                  test_doctor_notices_a_deployment_going_wrong,
                  test_a_login_is_never_in_two_places_at_once,
                  test_an_interrupted_switch_never_leaves_a_login_in_two_places,
+                 test_a_live_reading_beats_a_cached_one,
                  test_the_schedule_is_treated_as_input_not_configuration,
                  test_the_refusals_fire_where_the_readme_says_to_switch,
                  test_switching_refuses_where_it_cannot_work,
@@ -5818,7 +5804,6 @@ def main():
                  test_a_machine_can_be_told_it_does_not_ping,
                  test_the_wizard_asks_for_each_sign_in_once_and_no_more,
                  test_the_installer_insists_on_claude_code_in_both_modes,
-                 test_units_installed_under_the_old_name_are_still_recognised,
                  test_a_machine_without_systemd_can_still_install_the_switcher,
                  test_the_first_switch_on_a_machine_that_has_never_run_claude_code,
                  test_a_switch_only_machine_knows_which_account_it_is_on,
