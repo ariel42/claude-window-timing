@@ -4432,6 +4432,41 @@ def test_a_live_reading_beats_a_cached_one():
               ew.read_live_limits(accounts[0])[0]["five_hour"]["used_percentage"],
               100)
 
+        # A refusal that carries the headers says *which* limit refused, and
+        # that is worth having: recorded as the 5-hour one, a spent weekly
+        # limit would read as back in five hours rather than in four days --
+        # and `which` would recommend it the moment the wrong clock ran out.
+        def refuse_naming_the_limit(*a, **k):
+            raise ew.urllib.error.HTTPError(
+                "u", 429, "Too Many Requests",
+                {"anthropic-ratelimit-unified-5h-utilization": "0.30",
+                 "anthropic-ratelimit-unified-7d-utilization": "1.0",
+                 "anthropic-ratelimit-unified-7d-reset":
+                     str(int(now) + 4 * 86400)},
+                None)
+        ew.urllib.request.urlopen = refuse_naming_the_limit
+        refused, problem = ew.read_live_limits(accounts[0])
+        check("a refusal that names the limit is believed over the guess",
+              refused["seven_day"]["used_percentage"], 100)
+        check("and nothing is invented about the limit that did not refuse",
+              refused["five_hour"]["used_percentage"], 30)
+        blocked = ew.account_availability(
+            accounts[0], {"rate_limits": refused, "available_at": now}, now)
+        check("so the account is out until the weekly limit returns, not for 5 hours",
+              blocked.until, int(now) + 4 * 86400)
+        check("and that is an observed time, not a bound", blocked.exact, True)
+
+        # Headers that claim nothing is spent do not outrank the refusal
+        # itself: a request really was turned away.
+        def refuse_saying_nothing(*a, **k):
+            raise ew.urllib.error.HTTPError(
+                "u", 429, "Too Many Requests",
+                {"anthropic-ratelimit-unified-5h-utilization": "0.20"}, None)
+        ew.urllib.request.urlopen = refuse_saying_nothing
+        check("a refusal is spent even where its headers disagree",
+              ew.read_live_limits(accounts[0])[0]["five_hour"]["used_percentage"],
+              100)
+
         # Anything else leaves the cached figures alone rather than guessing.
         def broken(*a, **k):
             raise ew.urllib.error.URLError("no route to host")

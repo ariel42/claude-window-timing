@@ -1652,25 +1652,56 @@ def statusline_api_ms(account, records=None):
 # Where a live reading comes from. The statusLine figures everywhere else are
 # captured during a ping, so they are up to one interval old -- and the thing
 # most likely to have moved them since is the user's own work, which is exactly
-# what the recommendation is about to be made against. A reading taken now costs
-# one very small request against the account it asks about, so nothing takes one
-# unless asked.
+# what the recommendation is about to be made against. So `which` and `status`
+# take one by default. It costs one very small request against each account it
+# asks about; `--no-live` skips it, and the bare `claude-window` never takes
+# one, because the command people type idly must stay free.
 LIVE_URL = "https://api.anthropic.com/v1/messages"
 LIVE_MODEL = "claude-haiku-4-5-20251001"
 OAUTH_BETA = "oauth-2025-04-20"
 
 
+def _limits_from_headers(headers):
+    """
+    The rate-limit figures a response carries, in the statusLine's own shape.
+
+    Anything missing or unparseable is left out rather than guessed at, so an
+    answer that carries only half the picture contributes only that half.
+    """
+    limits = {}
+    for key, prefix in (("five_hour", "5h"), ("seven_day", "7d")):
+        used = headers.get(
+            "anthropic-ratelimit-unified-{}-utilization".format(prefix))
+        resets = headers.get(
+            "anthropic-ratelimit-unified-{}-reset".format(prefix))
+        window = {}
+        if used is not None:
+            try:
+                window["used_percentage"] = round(float(used) * 100)
+            except (TypeError, ValueError):
+                pass
+        if resets is not None:
+            try:
+                window["resets_at"] = int(resets)
+            except (TypeError, ValueError):
+                pass
+        if window:
+            limits[key] = window
+    return limits
+
+
 def read_live_limits(account):
     """
-    Ask Claude what this account's limits are *now*, or return {}.
+    Ask Claude what this account's limits are *now*, as (limits, problem).
 
     The rate-limit headers ride on a successful response, so this has to be a
     real request: the smallest one that can be made, one token in and one out,
-    on the cheapest model. A refusal carries no headers at all, which is itself
-    an answer -- an account that refuses is spent, whatever the last ping said.
+    on the cheapest model. A refusal is an answer too -- an account that refuses
+    is spent, whatever the last ping said.
 
-    Returns the same shape the statusLine produces, so every caller downstream
-    is unchanged.
+    `limits` has the same shape the statusLine produces, so every caller
+    downstream is unchanged, and is {} when nothing could be read; `problem` is
+    a sentence saying why, or "".
     """
     creds = (_read_json(credentials_path(account)).get("claudeAiOauth") or {})
     token = creds.get("accessToken")
@@ -1689,9 +1720,22 @@ def read_live_limits(account):
             headers = response.headers
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            # Refused: no headers, but the refusal is the reading. Nothing here
-            # can say when it comes back, so leave the reset time to the ping.
-            return {"five_hour": {"used_percentage": 100}}, ""
+            # Refused, which is itself the reading: whatever the last ping
+            # believed, a real request is being turned away right now.
+            #
+            # A refusal may or may not carry the rate-limit headers. Where it
+            # does they are worth having, because they name *which* limit
+            # refused and when it comes back -- and a weekly limit reported as
+            # the 5-hour one would have the account read as usable again five
+            # hours from now, days early. Where it does not, all that is known
+            # is that something is spent, and the 5-hour limit is the one that
+            # nearly always is.
+            refused = _limits_from_headers(e.headers or {})
+            if not any((window.get("used_percentage") or 0) >= LIMIT_SPENT_PCT
+                       for window in refused.values()):
+                refused["five_hour"] = dict(refused.get("five_hour") or {},
+                                            used_percentage=LIMIT_SPENT_PCT)
+            return refused, ""
         detail = ""
         try:
             detail = e.read()[:200].decode("utf8", "replace")
@@ -1706,29 +1750,21 @@ def read_live_limits(account):
                         "probably been retired, and LIVE_MODEL needs "
                         "updating [HTTP {}]".format(LIVE_MODEL, e.code))
         if e.code in (401, 403):
-            return {}, "this account's login was rejected [HTTP {}]".format(e.code)
+            # Worth the extra sentence: the ordinary cause is not a login gone
+            # bad but an access token that expired between pings -- they last
+            # about eight hours, and a machine that was asleep can wake with a
+            # stale one. The next ping renews it. `doctor` asks the CLI itself
+            # whether the login still works, which is the question this cannot
+            # answer.
+            return {}, ("this account's saved token was rejected [HTTP {}] — "
+                        "usually one that expired between pings, which the "
+                        "next ping renews".format(e.code))
         return {}, "Claude answered HTTP {}{}".format(
             e.code, ": " + detail if detail else "")
     except (urllib.error.URLError, OSError) as e:
         return {}, "could not reach Claude: {}".format(e)
 
-    limits = {}
-    for key, prefix in (("five_hour", "5h"), ("seven_day", "7d")):
-        used = headers.get("anthropic-ratelimit-unified-{}-utilization".format(prefix))
-        resets = headers.get("anthropic-ratelimit-unified-{}-reset".format(prefix))
-        window = {}
-        if used is not None:
-            try:
-                window["used_percentage"] = round(float(used) * 100)
-            except ValueError:
-                pass
-        if resets is not None:
-            try:
-                window["resets_at"] = int(resets)
-            except ValueError:
-                pass
-        if window:
-            limits[key] = window
+    limits = _limits_from_headers(headers)
     if not limits:
         return {}, ("Claude answered, but sent no rate-limit headers — the "
                     "reading cannot be taken this way any more")
