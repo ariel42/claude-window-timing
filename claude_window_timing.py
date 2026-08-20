@@ -2425,8 +2425,11 @@ def run_interactive(account, extra_args, prompt_text, session_id,
     Returns {"completed": bool, "limited": bool, "text": str}.
     """
     if not os.path.isfile(CLAUDE_PATH):
-        log(account, f"ERROR: Claude CLI not found at {CLAUDE_PATH}. "
-            "Install Claude Code from https://claude.ai/download")
+        log(account, "ERROR: Claude CLI not found at {}. If Claude Code is "
+                     "installed but lives somewhere only your shell knows "
+                     "about — an nvm or npm install does — re-run "
+                     "./install.sh from that shell so the timer is told where."
+                     .format(CLAUDE_PATH))
         return {"completed": False, "limited": False, "text": ""}
 
     # Start each run with a clean statusLine capture so stale readings from the
@@ -3122,6 +3125,7 @@ def doctor(accounts):
                 "The machine clock may be wrong; every schedule here depends "
                 "on it."))
 
+    findings.extend(unit_cli_findings())
     findings.extend(_launcher_findings())
     findings.extend(_user_account_findings(accounts))
     findings.extend(switch_findings(accounts))
@@ -3280,6 +3284,36 @@ def _user_account_findings(accounts):
         "Your own Claude Code is signed in as {}, which is not one of the "
         "accounts being pinged".format(identity.get("emailAddress") or theirs[:8]),
         "You are getting no benefit from this tool at all. " + fix)]
+
+
+def unit_cli_findings():
+    """
+    Whether the environment the timer runs with can find the Claude CLI.
+
+    The blind spot this closes: every other check here runs from the user's own
+    shell, where `claude` is on PATH because their startup files put it there.
+    The timer has none of that, and a ping that cannot find the CLI writes one
+    line to a log nobody reads, leaves the run counted as finished, and answers
+    every other question exactly as a healthy install does -- `doctor` said
+    "Everything checks out" while not one ping in an hour had got through.
+    """
+    body = _read_text(os.path.join(UNIT_DIR, "claude-window-timing@.service"))
+    for line in body.splitlines():
+        if not line.startswith("Environment=PATH="):
+            continue
+        directories = line.split("=", 2)[2].split(os.pathsep)
+        for directory in directories:
+            candidate = os.path.join(directory, "claude")
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return []
+        return [Finding(
+            "error",
+            "The timer cannot find the Claude CLI, so every ping is failing",
+            "Its PATH is {}, and there is no `claude` in any of it — an nvm or "
+            "npm install lives somewhere only your shell knows about. Re-run "
+            "./install.sh from a shell where `claude` works and it will record "
+            "where.".format(line.split("=", 2)[2]))]
+    return []
 
 
 def _launcher_findings():
@@ -5327,7 +5361,7 @@ Type=oneshot
 WorkingDirectory={script_dir}
 ExecStart={python} {script} ping %i
 # PATH so the script can locate the claude CLI; HOME comes from the user manager.
-Environment=PATH={home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH={path}
 
 [Install]
 WantedBy=default.target
@@ -5352,6 +5386,30 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 """
+
+
+def unit_path():
+    """
+    The PATH a ping runs with: the usual directories, plus the CLI's own.
+
+    A timer inherits none of the shell setup that makes `claude` findable. An
+    npm or nvm install puts it under ~/.nvm/versions/node/<version>/bin, which
+    only ~/.bashrc adds to PATH -- so setup, run from that shell, finds the CLI
+    and builds the checkpoint, and then every ping for ever after cannot find
+    it. The install looks perfect and nothing works, which is the failure this
+    tool exists to notice rather than to have.
+
+    Resolved here, in the environment the user is installing from, where the
+    CLI has just been proven to exist. Its *directory* rather than the binary
+    alone, because an npm-installed launcher can begin `#!/usr/bin/env node`
+    and needs node beside it.
+    """
+    entries = [os.path.join(HOME, ".local", "bin"), "/usr/local/sbin",
+               "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+    directory = os.path.dirname(os.path.abspath(CLAUDE_PATH))
+    if directory and directory not in entries:
+        entries.insert(0, directory)
+    return os.pathsep.join(entries)
 
 
 def installed_instances():
@@ -5408,7 +5466,7 @@ def install_units(accounts):
     with open(os.path.join(UNIT_DIR, "claude-window-timing@.service"), "w") as f:
         f.write(_SERVICE_UNIT.format(script_dir=SCRIPT_DIR, script=script,
                                      python=sys.executable or "/usr/bin/python3",
-                                     home=HOME))
+                                     path=unit_path()))
     with open(os.path.join(UNIT_DIR, "claude-window-timing@.timer"), "w") as f:
         f.write(_TIMER_UNIT.format(interval=INTERVAL_MIN))
 

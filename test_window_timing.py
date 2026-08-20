@@ -3174,6 +3174,91 @@ def test_the_command_can_be_typed_after_installing():
         restore()
 
 
+def test_the_timer_is_told_where_the_cli_is():
+    """
+    The install that looks perfect and never pings once.
+
+    A timer inherits none of the shell setup that makes `claude` findable. An
+    npm or nvm install puts the CLI under ~/.nvm/versions/node/<version>/bin,
+    which only ~/.bashrc adds to PATH — so setup, run from that shell, finds it
+    and builds the checkpoint, and then every ping for ever after logs "Claude
+    CLI not found" and stops. Reported from a real second machine, where the
+    install had been running for an hour, the log said that thirty times, and
+    `doctor` said "Everything checks out".
+
+    Two halves: the unit is told where the CLI is, and `doctor` says so when
+    the unit it finds cannot reach one.
+    """
+    section("The timer is told where the Claude CLI is")
+    saved = (ew.UNIT_DIR, ew.CLAUDE_PATH, ew.HOME, ew._systemctl, ew._run,
+             ew.STATE_ROOT)
+    root = tempfile.mkdtemp()
+
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+
+    try:
+        ew.UNIT_DIR = os.path.join(root, "units")
+        os.makedirs(ew.UNIT_DIR)
+        ew.HOME = os.path.join(root, "home")
+        ew.STATE_ROOT = os.path.join(root, "state")
+        ew._systemctl = lambda *a: Ok()
+        ew._run = lambda cmd: Ok()
+
+        # Where nvm puts it, and nothing else does.
+        nvm = os.path.join(ew.HOME, ".nvm", "versions", "node", "v22.12.0", "bin")
+        os.makedirs(nvm)
+        cli = os.path.join(nvm, "claude")
+        with open(cli, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(cli, 0o755)
+        ew.CLAUDE_PATH = cli
+
+        check_true("the CLI's own directory is on the unit's PATH",
+                   nvm in ew.unit_path().split(os.pathsep))
+        check_true("the ordinary directories are still there",
+                   "/usr/bin" in ew.unit_path().split(os.pathsep))
+
+        account = ew.Account("1", os.path.join(root, "cfg-1"), 0)
+        _capture(lambda: ew.install_units([account]))
+        unit = os.path.join(ew.UNIT_DIR, "claude-window-timing@.service")
+        body = open(unit).read()
+        check_true("and the unit that gets written carries it", nvm in body)
+        check("so doctor has nothing to report", ew.unit_cli_findings(), [])
+
+        # The unit an older install left behind: a fixed PATH, and no CLI in it.
+        with open(unit, "w") as f:
+            f.write(body.replace(
+                "Environment=PATH=" + ew.unit_path(),
+                "Environment=PATH=/usr/local/bin:/usr/bin:/bin"))
+        findings = ew.unit_cli_findings()
+        check("a timer that cannot reach the CLI is an error", len(findings), 1)
+        check("and an error, not a warning", findings[0].level, "error")
+        check_true("that says every ping is failing",
+                   "every ping is failing" in findings[0].message)
+        check_true("prints the PATH it looked in",
+                   "/usr/local/bin:/usr/bin:/bin" in findings[0].hint)
+        check_true("and names the fix, which is where the CLI gets recorded",
+                   "./install.sh" in findings[0].hint)
+
+        # A CLI that is there but not executable is not a CLI.
+        os.chmod(cli, 0o644)
+        with open(unit, "w") as f:
+            f.write(body)
+        check("an unexecutable CLI on the PATH counts as absent",
+              len(ew.unit_cli_findings()), 1)
+        os.chmod(cli, 0o755)
+
+        # Nothing installed at all is not this check's business.
+        os.remove(unit)
+        check("no unit, nothing to say", ew.unit_cli_findings(), [])
+    finally:
+        (ew.UNIT_DIR, ew.CLAUDE_PATH, ew.HOME, ew._systemctl, ew._run,
+         ew.STATE_ROOT) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_a_timer_that_will_never_fire_again_is_noticed():
     """
     A systemd timer can be enabled, active, and still never fire again — a
@@ -6694,6 +6779,7 @@ def main():
                  test_setup_and_init_refuse_the_obviously_wrong,
                  test_the_first_run_screen_says_the_things_that_stop_people,
                  test_the_command_can_be_typed_after_installing,
+                 test_the_timer_is_told_where_the_cli_is,
                  test_a_timer_that_will_never_fire_again_is_noticed,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
