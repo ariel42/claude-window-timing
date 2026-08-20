@@ -6298,6 +6298,10 @@ def main():
     # wants the real thing has to say so.
     suite_root = tempfile.mkdtemp(prefix="window-timing-tests-")
     home = os.path.join(suite_root, "home")
+    # Including HOME itself. Anything derived from it -- a ping directory, a
+    # switch store, the bin directories a launcher can be linked into -- then
+    # lands inside the sandbox rather than in the home of whoever ran this.
+    ew.HOME = home
     ew.STATE_ROOT = os.path.join(suite_root, "state")
     ew.ACCOUNTS_FILE = os.path.join(suite_root, "accounts.json")
     ew.SCHEDULE_FILE = os.path.join(suite_root, "schedule.json")
