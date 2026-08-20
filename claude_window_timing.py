@@ -620,8 +620,7 @@ def account_availability(account, state, now):
         return Availability(WAITING, until, note, exact)
 
     if state.get("consecutive_failures", 0) >= UNHEALTHY_AFTER:
-        return Availability(UNKNOWN, None, "its pings keep failing — cannot tell",
-                            True)
+        return Availability(UNKNOWN, None, "its pings keep failing", True)
 
     return Availability(USABLE, None, "", True)
 
@@ -721,6 +720,11 @@ def describe_availability(state, avail, now):
         return "unusable until {}{} — {}".format(
             "" if avail.exact else "no later than ",
             fmt_time(avail.until), avail.note)
+    if avail.tier == UNKNOWN:
+        # Not "unusable": nothing here knows that. The headline above offers
+        # this account as a guess, and a list calling it unusable in the same
+        # breath contradicts it.
+        return "cannot tell — {}".format(avail.note)
     return "unusable — {}".format(avail.note)
 
 
@@ -961,8 +965,20 @@ def participation(account, state, now):
     # recorded phase is fiction. `available_at` is written on every ping that
     # succeeded, so a value older than a whole window means exactly that.
     proven = state.get("available_at")
-    if not proven or proven <= now - WINDOW_HOURS * 3600:
-        return False, "no ping has got through for a whole window"
+    if not proven:
+        # Never, rather than not lately. On a fresh install this is the whole
+        # story, and "for a whole window" invites somebody to wait one out.
+        # The pointer to `doctor` is added only once the pings have actually
+        # been failing: an account whose first ping is still minutes away is
+        # not a fault, and sending somebody to a command with nothing to say
+        # is how a diagnostic loses its authority.
+        if state.get("consecutive_failures", 0) >= UNHEALTHY_AFTER:
+            return False, "no ping has ever got through — see `{} doctor`".format(
+                COMMAND)
+        return False, "no ping has got through yet"
+    if proven <= now - WINDOW_HOURS * 3600:
+        return False, "nothing has got through since {}".format(
+            fmt_time(proven))
 
     return True, ""
 
@@ -2945,6 +2961,8 @@ def status(accounts):
                 "" if usable.exact else "no later than ",
                 fmt_time(usable.until), fmt_delta(usable.until - now),
                 usable.note))
+        elif usable.tier == UNKNOWN:
+            print("  Usable        : cannot tell — {}".format(usable.note))
         elif usable.tier != USABLE:
             print("  Usable        : no — {}".format(usable.note))
 
@@ -5965,8 +5983,8 @@ def cli(argv=None):
                 # rest exist. Naming a few beats pointing at `help`, which is
                 # only useful to someone who already suspects there is more.
                 print()
-                print("Other commands: which, doctor, log, realign, setup — "
-                      "run `{} help` for all of them.".format(COMMAND))
+                print("Other commands: which, switch, doctor, log, realign, "
+                      "setup — run `{} help` for all of them.".format(COMMAND))
             return code
         if command == "which":
             # A machine that pings nothing has no state of its own; a copy of

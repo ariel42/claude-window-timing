@@ -1835,8 +1835,8 @@ def test_what_it_says_in_every_state_it_can_be_in():
     line, verdict = headline_for(unknown, count=2)
     check("nothing known to work is offered as a guess, not a verdict",
           line, "Nothing is known to be usable — try account 1")
-    check("and the verdict admits it", verdict,
-          "unusable — its pings keep failing — cannot tell")
+    check("and the verdict admits it rather than calling it unusable", verdict,
+          "cannot tell — its pings keep failing")
 
     # The spacing report when there is nothing to space. Account 2's weekly
     # limit outlasts its own window, so it will not start one.
@@ -2131,6 +2131,27 @@ def test_phase_is_lost_only_when_pings_cannot_get_through():
                not holds(state(3600, -(ew.WINDOW_HOURS * 3600 + 60))))
     check_true("but one that answered within the window keeps it",
                holds(state(3600, -(ew.WINDOW_HOURS * 3600 - 60))))
+
+    # Two different silences, and telling somebody the wrong one wastes their
+    # afternoon. An account that has answered before and stopped is waited
+    # out; one that has never answered at all is a setup that has never
+    # worked, and no amount of waiting fixes it.
+    quiet = state(3600, -(ew.WINDOW_HOURS * 3600 + 60))
+    check("an account that fell silent says when it last answered",
+          ew.participation(account, quiet, now)[1],
+          "nothing has got through since {}".format(
+              ew.fmt_time(quiet["available_at"])))
+    check("one whose first ping has not landed yet says only that",
+          ew.participation(account, state(3600), now)[1],
+          "no ping has got through yet")
+    # Once they have been failing, there is something for `doctor` to say, and
+    # this is where somebody is when they need telling.
+    check("one whose pings keep failing is sent to the command that explains",
+          ew.participation(account,
+                           dict(state(3600),
+                                consecutive_failures=ew.UNHEALTHY_AFTER),
+                           now)[1],
+          "no ping has ever got through — see `{} doctor`".format(ew.COMMAND))
 
     # The reason no waiting fixes. Its files say no request can succeed, so no
     # boundary of its own is worth reserving a slot for.
@@ -4166,6 +4187,10 @@ def test_every_command_routes_to_the_thing_it_names():
         check("the bare command reports status", code, 0)
         check_true("and names the other commands, which nothing else does",
                    "Other commands:" in said)
+        # `switch` is half of what this tool does, and the bare command is
+        # where somebody finds out it exists.
+        check_true("switch among them", "switch" in said.split(
+            "Other commands:")[1])
 
         code, said, _ = run(["status"])
         check("status succeeds", code, 0)
