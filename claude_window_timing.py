@@ -3313,8 +3313,16 @@ def doctor(accounts):
                     COMMAND, INTERVAL_MIN,
                     fmt_time(state.get("live_problem_at") or 0))))
 
+        # A hold is the tool deliberately not pinging, for as long as it takes
+        # to line the windows up -- hours, when `realign --confirm` asked for
+        # it. Counting those skipped pings as silence turns the one command
+        # that says what is wrong into one that complains about what it was
+        # just told to do.
+        hold = active_hold(state, now)
         last_run = state.get("last_run")
-        if last_run and now - last_run > 3 * INTERVAL_MIN * 60:
+        if hold:
+            pass
+        elif last_run and now - last_run > 3 * INTERVAL_MIN * 60:
             findings.append(Finding(
                 "warning", "Account {} has not pinged since {}".format(
                     account.name, fmt_time(last_run)),

@@ -3773,6 +3773,21 @@ def test_doctor_notices_a_deployment_going_wrong():
         check_true("with the way to ask properly",
                    "XDG_RUNTIME_DIR=/run/user/" in said)
 
+        # A hold is the tool deliberately not pinging, for as long as lining
+        # the windows up takes. Counting those skipped pings as silence made
+        # `doctor` complain about what `realign --confirm` had just been told
+        # to do.
+        held = dict(ew.read_state(account))
+        held["hold"] = {"from": time.time() - 3600,
+                        "until": time.time() + 3600,
+                        "reason": "realigning, on your say-so"}
+        ew.write_state(account, held)
+        check("a held account is not reported as silent",
+              "has not pinged since" in doctor_says(), False)
+        ew.write_state(account, {"last_run": time.time() - 10 * ew.INTERVAL_MIN * 60})
+        check_true("while one that is simply silent still is",
+                   "has not pinged since" in doctor_says())
+
         replies = {"is-enabled": Reply("disabled")}
         said = doctor_says()
         check_true("a timer that is not enabled is an error with the fix",
@@ -4766,6 +4781,24 @@ def test_the_shell_scripts_call_commands_that_exist():
             check_true("{} invokes `{}`, which exists".format(name, token),
                        token in known)
     check_true("both scripts were actually inspected", seen >= 2)
+
+    # The version check has to run on the version it exists to reject. An
+    # f-string is a syntax error before 3.6, so writing one there means the
+    # interpreter refuses to parse the check and the user gets a traceback
+    # instead of the sentence saying what is wrong.
+    body = open(os.path.join(here, "install.sh")).read()
+    start = body.index("import sys")
+    snippet = body[start:body.index("EOF", start)]
+    check_true("the Python version check is really about the version",
+               "version_info" in snippet and "(3, 6)" in snippet)
+    try:
+        compile(snippet, "install.sh version check", "exec")
+        broke = ""
+    except SyntaxError as e:
+        broke = str(e)
+    check("and it compiles as a program", broke, "")
+    check("using nothing newer than the version it demands",
+          [token for token in ('f"', "f'", ":=") if token in snippet], [])
 
 
 def test_doctor_spots_residue_from_an_earlier_install():

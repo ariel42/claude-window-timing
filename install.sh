@@ -14,10 +14,14 @@ if ! command -v python3 &>/dev/null; then
     echo "ERROR: python3 not found. Install Python 3.6 or later." >&2
     exit 1
 fi
+# Written without an f-string on purpose: this is the one piece of Python here
+# that has to run on the version it is about to reject. An f-string is a syntax
+# error before 3.6, so the interpreter would refuse to parse the check and the
+# user would get a traceback instead of the sentence explaining what is wrong.
 python3 - <<'EOF'
 import sys
 if sys.version_info < (3, 6):
-    print(f"ERROR: Python 3.6+ required (found {sys.version})", file=sys.stderr)
+    sys.stderr.write("ERROR: Python 3.6+ required (found %s)\n" % sys.version)
     sys.exit(1)
 EOF
 
