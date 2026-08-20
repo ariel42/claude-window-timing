@@ -2662,6 +2662,10 @@ def ping(account, accounts=None):
         else:
             state["rate_limits"] = limits
             state["limits_source"] = "statusline"
+            # When, as well as where from. Without this a live reading taken
+            # earlier leaves its own timestamp behind, and every later command
+            # reports figures this ping had just refreshed as half an hour old.
+            state["limits_read_at"] = time.time()
 
     boundary, horizon, label = next_window_start(
         limits, result["text"], result["limited"])
@@ -3195,14 +3199,16 @@ def _read_text(path):
         return ""
 
 
-def which(accounts, states=None, avail=None, published_at=None):
+def which(accounts, states=None, avail=None, published_at=None, live=False):
     """
     Say which account to use, and why.
 
-    Advice only: nothing here switches accounts, and running it can never spend
-    quota. `states` and `avail` arrive filled in when the answer is coming from
-    a schedule published by another machine rather than from this one's own
-    state files — see `schedule_view`.
+    Advice only: nothing here switches accounts. `states` and `avail` arrive
+    filled in when the answer is coming from a schedule published by another
+    machine rather than from this one's own state files — see `schedule_view`.
+
+    `live` says whether a live reading was taken before this ran, which decides
+    only one thing: whether to offer one.
     """
     now = time.time()
     states = {a.name: read_state(a) for a in accounts} if states is None \
@@ -3241,26 +3247,34 @@ def which(accounts, states=None, avail=None, published_at=None):
                 ("   <- use this" if avail[chosen.name].tier == USABLE
                  else "   <- first back") if account is chosen else ""))
 
-    # Everything above was computed from the last ping. Say so when that was long
-    # enough ago to be a different story — an answer this confident should not
-    # come from readings nobody has refreshed since the timer stopped.
-    # Say how old this is, always. The figures come from the last ping unless
-    # somebody asked for a live reading, and the likeliest thing to have moved
-    # them since is the reader's own work -- which is precisely what they are
-    # about to act on. A stale number that looks current is worse than no
-    # number.
-    read_at = max([(states[a.name].get("limits_read_at")
-                    or states[a.name].get("last_run") or 0)
-                   for a in accounts])
-    if read_at and not published_at:
+    # Say how old the figures are, always. They come from the last ping unless a
+    # live reading was taken, and the likeliest thing to have moved them since is
+    # the reader's own work -- which is precisely what they are about to act on.
+    # A stale number that looks current is worse than no number.
+    #
+    # Reported by the *oldest* of them, and by the weaker of the two sources: a
+    # set of readings is only as current as its stalest member, and the answer
+    # rests on all of them at once, since each account is kept or skipped on
+    # the strength of its own. Summarising by the freshest would describe the
+    # one account nobody was worried about.
+    stamps = [((states[a.name].get("limits_read_at")
+                or states[a.name].get("last_run") or 0), a.name)
+              for a in accounts]
+    stamps = [stamp for stamp in stamps if stamp[0]]
+    if stamps and not published_at:
+        read_at = min(stamps)[0]
         source = ("a live reading"
-                  if any(states[a.name].get("limits_source") == "live"
-                         for a in accounts) else "the last ping")
+                  if all(states[name].get("limits_source") == "live"
+                         for _, name in stamps) else "the last ping")
+        # Offering a reading is only useful to someone who did not just take
+        # one: `--no-live` is the way to arrive here with figures worth
+        # refreshing, and pointing anybody else at the command they have this
+        # second run would be a loop rather than advice.
+        offer = ("" if live or now - read_at < 120 else
+                 "  `{} which` reads them from Claude now.".format(COMMAND))
         print()
         print("  Figures from {}, {} ago.{}".format(
-            source, fmt_delta(now - read_at),
-            "" if now - read_at < 120 else
-            "  `{} which --live` reads them now.".format(COMMAND)))
+            source, fmt_delta(now - read_at), offer))
 
     freshest = max([states[a.name].get("last_run") or 0 for a in accounts])
     if published_at:

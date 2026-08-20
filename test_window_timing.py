@@ -1753,6 +1753,69 @@ def test_what_it_says_in_every_state_it_can_be_in():
                "doctor" in ew.choose_account([one], {one.name: fresh}, now)[1])
 
 
+def test_the_age_of_the_figures_is_never_overstated():
+    """
+    `which` ends by saying how old its numbers are, which is the reader's only
+    guard against acting on a stale one.
+
+    With several accounts there are several ages, and summarising by the
+    freshest describes the one account nobody was worried about: the answer
+    rests on all of them at once, since each account is kept or skipped on the
+    strength of its own figures. So the oldest is what gets reported, and the
+    source is only called live when every one of them is.
+
+    The offer to take a reading is the other half. It is worth making to
+    somebody who passed `--no-live`, and nonsense to anybody else — a run that
+    read the limits live has already done all there is to do, and pointing that
+    reader at the command they are running is a loop.
+    """
+    section("How old the figures are, said without flattering them")
+    now = time.time()
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    accounts = [ew.Account("1", os.path.join(ew.STATE_ROOT, "cfg-1"), 0),
+                ew.Account("2", os.path.join(ew.STATE_ROOT, "cfg-2"), 1)]
+    for account, state in zip(accounts, (
+            {"last_run": now - 1500, "available_at": now - 1500,
+             "limits_read_at": now - 1500, "limits_source": "statusline",
+             "rate_limits": {"five_hour": {"resets_at": now + 4 * HOUR,
+                                           "used_percentage": 40}}},
+            {"last_run": now - 60, "available_at": now - 60,
+             "limits_read_at": now - 60, "limits_source": "live",
+             "rate_limits": {"five_hour": {"resets_at": now + 2 * HOUR,
+                                           "used_percentage": 30}}})):
+        account.ensure_state_dir()
+        ew.write_state(account, state)
+
+    said, _, _ = _capture(lambda: ew.which(accounts, live=False))
+    check_true("the oldest reading is the one reported",
+               "0h25m00s ago" in said)
+    check_true("and one live account does not make the set live",
+               "from the last ping" in said)
+    check_true("with the offer to read them now",
+               "`{} which` reads them from Claude now".format(ew.COMMAND)
+               in said)
+
+    said, _, _ = _capture(lambda: ew.which(accounts, live=True))
+    check_true("a run that already read them live offers nothing further",
+               "reads them from Claude now" not in said)
+
+    for account in accounts:
+        state = ew.read_state(account)
+        state["limits_read_at"] = now - 5
+        state["limits_source"] = "live"
+        ew.write_state(account, state)
+    said, _, _ = _capture(lambda: ew.which(accounts, live=True))
+    check_true("and when every account was read live, it says so",
+               "from a live reading, 0h00m05s ago" in said)
+
+    # An account nobody has pinged yet has no age to report, and must not be
+    # counted as one: that would date the whole set to the epoch.
+    ew.write_state(accounts[0], {})
+    said, _, _ = _capture(lambda: ew.which(accounts, live=False))
+    check_true("an account with no readings at all is not counted as ancient",
+               "1970" not in said and "Figures from" in said)
+
+
 def test_the_status_display_shows_the_unusual_parts():
     """
     Most of `status` only appears when something is worth saying — a run of
@@ -2381,6 +2444,12 @@ def test_what_a_ping_records_from_how_it_went():
               state["rate_limits"]["five_hour"]["resets_at"], now + 600)
         check("names the statusLine as where that came from",
               state["limits_source"], "statusline")
+        # A live reading taken earlier leaves its own timestamp in state. Not
+        # replacing it here made every later command report figures this ping
+        # had just refreshed as up to half an hour old, and offer to refresh
+        # what it had.
+        check_true("and dates them, so nothing reports them as older than they are",
+                   abs(state["limits_read_at"] - time.time()) < 5)
         check("and the boundary it implies", round(state["boundary"] - now), 600)
         check_true("availability is proved by the ping itself, dated now",
                    abs(state["available_at"] - time.time()) < 5)
@@ -6012,6 +6081,7 @@ def main():
                  test_an_account_the_schedule_has_never_heard_of,
                  test_a_login_that_stopped_working_is_reported,
                  test_what_it_says_in_every_state_it_can_be_in,
+                 test_the_age_of_the_figures_is_never_overstated,
                  test_the_status_display_shows_the_unusual_parts,
                  test_spacing_optimiser,
                  test_phase_is_lost_only_when_pings_cannot_get_through,
