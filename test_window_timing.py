@@ -5264,6 +5264,27 @@ def test_an_interrupted_switch_never_leaves_a_login_in_two_places():
     finally:
         restore()
 
+    # And two stores holding one grant, which is what copying a credential
+    # from the first store to the second looks like -- the obvious shortcut
+    # when setting the second account up, and the one that signs somebody out
+    # eight hours later.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                              parked=("1", "2"))
+    try:
+        first = ew.switch_store(accounts[0])
+        second = ew.switch_store(accounts[1])
+        shutil.copyfile(ew.credentials_path(first), ew.credentials_path(second))
+        errors = [f for f in ew.switch_findings(accounts)
+                  if f.level == "error" and "same login parked" in f.message]
+        check("one login in two stores is an error", len(errors), 1)
+        check_true("naming both accounts",
+                   "1 (label1)" in errors[0].message
+                   and "2 (label2)" in errors[0].message)
+        check_true("and how to give one of them its own",
+                   second.config_dir in errors[0].hint)
+    finally:
+        restore()
+
 
 def test_a_spent_account_is_never_recommended():
     """

@@ -5093,6 +5093,28 @@ def switch_findings(accounts):
     if not switching_configured(accounts):
         return []
     findings = []
+    # One grant in one place is the rule the whole design rests on, and it is
+    # checked here against the live login and against each account's ping
+    # directory. Two *stores* holding the same grant was the gap: that is one
+    # login copied from one store to another -- the obvious thing to do when
+    # setting up the second account -- and the two would take turns
+    # invalidating each other until one of them was signed out.
+    grants = {}
+    for account in accounts:
+        grant = login_fingerprint(switch_store(account))
+        if grant:
+            grants.setdefault(grant, []).append(account)
+    for shared in grants.values():
+        if len(shared) > 1:
+            findings.append(Finding(
+                "error",
+                "Accounts {} have the same login parked".format(
+                    " and ".join(a.display for a in shared)),
+                "That is one login copied, not two logins. Refresh tokens "
+                "rotate, so they will take turns invalidating each other until "
+                "one is signed out. Sign in again in {} so it has its own: "
+                "{}".format(switch_store(shared[-1]).config_dir,
+                            sign_in_command(switch_store(shared[-1])))))
     # An empty store is only a gap when that account's login is somewhere else
     # entirely. For the account you are signed in as it is the healthy state --
     # its login is live in ~/.claude, which is the whole point of the store
