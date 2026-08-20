@@ -1,16 +1,19 @@
 # claude-window-timing
 
-**Your Claude Code usage window starts when you send your first message — so if you start work at 9am, you wait until 2pm for a fresh one. This starts it for you at dawn.**
+**Claude Code's 5-hour window starts when you send your first message, not at a fixed hour. Sit down at 9:00 and you are waiting until 14:00 for a fresh one — and if you burn through it at 11:30, you stop.**
 
-A small background service that keeps your 5-hour windows rolling around the clock. You sit down to an almost-untouched window, and the next one arrives sooner. With more than one Claude subscription, it spaces their windows evenly through the day so a fresh one is never far away, and tells you which account to spend next.
+This puts that timing back under your control. It starts your window before you arrive, keeps one running around the clock, and — with more than one subscription — holds their windows apart so a fresh one is never far away, tells you which to spend, and moves you there in a single command.
 
-It does this without touching your Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing in the background goes near `~/.claude`. One command you run by hand, `claude-window switch`, points your own Claude Code at whichever account still has quota. About 4,400 lines of Python standard library and a systemd timer — no dependencies, no daemon, and no network calls of its own.
+- **A window already running when you sit down.** A background ping opens it at dawn, so 9:00 finds you with a nearly untouched window rather than one you have just started. Your next fresh window arrives at 11:40 instead of 14:00. The pings themselves cost nothing — Claude serves them from its prompt cache, and [cache reads are not deducted from your limit](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+- **Hit the limit, keep working.** `claude-window switch` points your own Claude Code at an account that still has quota. No logging out, no browser, no losing your place — and it refuses when it would not actually work.
+- **A fresh window every 5/N hours instead of every 5.** Two subscriptions are held 2h30m apart, three 1h40m. Not more quota — quota that arrives when you need it, instead of all at once and then not for hours.
+- **A straight answer to which account to spend.** The window that expires first, skipping any account that cannot serve a request at all — a spent weekly limit, a lapsed plan, an expired sign-in.
+
+It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 4,400 lines of Python standard library and a systemd timer — no dependencies, no daemon, and no network calls of its own.
 
 ---
 
 ## The problem
-
-Claude Code gives you a **5-hour usage window**. The clock does not start at a fixed time of day — it starts the moment you send your first message.
 
 Begin work at 9:00 with no earlier usage, and your window runs 9:00–14:00. Burn through it by 11:30 and you wait two and a half hours doing nothing. The window started late because *you* did, and the rest of your day inherits that: every window that day is anchored to the moment you happened to sit down.
 
@@ -34,26 +37,6 @@ Same morning, with it running:
 | Wait for a **fresh** window | 5 hours | 2 hours 40 minutes |
 
 Same capacity, less waiting. Where the window happens to sit when you arrive is luck — sometimes it just reset, sometimes it is about to. Averaged over many days that is **about 2.5 hours of waiting instead of a flat 5**.
-
-## What makes it different
-
-There are three familiar ways to attack this, and this tool is none of them.
-
-**A cron job that sends a message.** The obvious version, and the one most people reach for. It knows nothing about where your window boundary actually is, so it drifts: miss one ping — a suspended laptop, a dropped network, a limit you spent yourself — and the next window starts late, and *every* window after it inherits that late start, with nothing to pull it back. The natural way to write one is `claude --print`, which under a subscription login has a [reported problem where it can be billed as API usage](https://github.com/anthropics/claude-code/issues/43333). And nothing about it is arranged around the prompt cache, so it pays for pings that could have been free.
-
-**A usage monitor.** Tells you how much of your window is left, which is worth knowing and completely orthogonal: it observes the window, it does not start one earlier.
-
-**A wrapper, proxy or router that switches accounts for you.** These sit in front of the CLI and multiplex your requests. They work, at the price of putting a third party in the path of every request you make, and of a config directory that is no longer just yours. `claude-window switch` is not one of these: it hands Claude Code a different login and gets out of the way, so there is nothing left running to fail, and a failure while switching costs a backup file rather than your session.
-
-What this one does instead:
-
-- **It aims at the window boundary, not at the clock.** Claude Code reports exactly when your current window ends. The tool reads that, books a ping for 30 seconds after it, and so starts the next window the instant the last one closes. One correction repairs a schedule that a missed ping knocked out of step — this is the part that makes it hold up over weeks instead of days. ([Staying on schedule](#staying-on-schedule).)
-- **The pings are engineered to be free.** Every ping replays one identical saved conversation from a directory whose contents never change, so Claude serves it from cache, and 30 minutes sits comfortably inside the ~1-hour cache lifetime while dividing 5 hours evenly. All three facts are load-bearing; none is a coincidence ([why 30 minutes](#why-30-minutes), [where the pings run](#where-the-pings-run)).
-- **It runs several subscriptions as one supply.** Windows spaced 5/N hours apart, kept spaced automatically, and a straight answer to "which account should I use right now" that skips any account that cannot serve a request. ([More than one subscription](#more-than-one-subscription).)
-- **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. Nothing that runs on a timer ever writes to `~/.claude` or `~/.claude.json`. The one thing that does is `claude-window switch`, only when you run it, to two files, after copying both somewhere safe — and a test names the single function allowed to write there and fails the day a second one appears.
-- **It refuses to bill you by surprise.** Pings run in interactive mode rather than `--print`, and `ANTHROPIC_API_KEY` is stripped from the environment so a ping can never land on a pay-as-you-go account.
-- **It says when it is broken.** Most failures here are silent — a timer that will never fire again, a login that expired, two accounts that are secretly the same account. `claude-window doctor` names them.
-- **It is small enough to read.** Standard library only, one file, no service to trust and nothing running unless a timer fires. Every design decision that could fail quietly is written down at the point in the source where it applies.
 
 ## More than one subscription
 
@@ -120,6 +103,26 @@ Three things worth knowing before you rely on it:
 - **It is one dial for the whole machine.** Credentials are re-read per request, so every session already open moves to the new account on its next turn — including the one you ran the command from. `/status` and `/usage` in those sessions report the new account too, so nothing is left disagreeing. That is convenient when you meant it and surprising when you did not: there is no per-session version of this that does not put software in the path of every request, which is a much worse trade.
 - **The first request on the new account re-sends whatever you resume**, because the prompt cache belongs to the account you left. That is the same cost as signing out and back in by hand: roughly a percentage point of the new window per 27,000 tokens of conversation. Switch at a break, and start a fresh session where you can — a new conversation pays almost nothing, a resumed one pays for its whole history.
 - **It refuses when it would not work.** No parked login, one that expired, one signed in as the wrong account, one that is a copy of a login something else is already refreshing, or an `ANTHROPIC_API_KEY`-style override that outranks the saved login entirely — each stops the switch and says which it was. There is no `--force`, because nothing it refuses would have worked.
+
+## What makes it different
+
+There are three familiar ways to attack this, and this tool is none of them.
+
+**A cron job that sends a message.** The obvious version, and the one most people reach for. It knows nothing about where your window boundary actually is, so it drifts: miss one ping — a suspended laptop, a dropped network, a limit you spent yourself — and the next window starts late, and *every* window after it inherits that late start, with nothing to pull it back. The natural way to write one is `claude --print`, which under a subscription login has a [reported problem where it can be billed as API usage](https://github.com/anthropics/claude-code/issues/43333). And nothing about it is arranged around the prompt cache, so it pays for pings that could have been free.
+
+**A usage monitor.** Tells you how much of your window is left, which is worth knowing and completely orthogonal: it observes the window, it does not start one earlier.
+
+**A wrapper, proxy or router that switches accounts for you.** These sit in front of the CLI and multiplex your requests. They work, at the price of putting a third party in the path of every request you make, and of a config directory that is no longer just yours. `claude-window switch` is not one of these: it hands Claude Code a different login and gets out of the way, so there is nothing left running to fail, and a failure while switching costs a backup file rather than your session.
+
+What this one does instead:
+
+- **It aims at the window boundary, not at the clock.** Claude Code reports exactly when your current window ends. The tool reads that, books a ping for 30 seconds after it, and so starts the next window the instant the last one closes. One correction repairs a schedule that a missed ping knocked out of step — this is the part that makes it hold up over weeks instead of days. ([Staying on schedule](#staying-on-schedule).)
+- **The pings are engineered to be free.** Every ping replays one identical saved conversation from a directory whose contents never change, so Claude serves it from cache, and 30 minutes sits comfortably inside the ~1-hour cache lifetime while dividing 5 hours evenly. All three facts are load-bearing; none is a coincidence ([why 30 minutes](#why-30-minutes), [where the pings run](#where-the-pings-run)).
+- **It runs several subscriptions as one supply.** Windows spaced 5/N hours apart, kept spaced automatically, and a straight answer to "which account should I use right now" that skips any account that cannot serve a request. ([More than one subscription](#more-than-one-subscription).)
+- **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. Nothing that runs on a timer ever writes to `~/.claude` or `~/.claude.json`. The one thing that does is `claude-window switch`, only when you run it, to two files, after copying both somewhere safe — and a test names the single function allowed to write there and fails the day a second one appears.
+- **It refuses to bill you by surprise.** Pings run in interactive mode rather than `--print`, and `ANTHROPIC_API_KEY` is stripped from the environment so a ping can never land on a pay-as-you-go account.
+- **It says when it is broken.** Most failures here are silent — a timer that will never fire again, a login that expired, two accounts that are secretly the same account. `claude-window doctor` names them.
+- **It is small enough to read.** Standard library only, one file, no service to trust and nothing running unless a timer fires. Every design decision that could fail quietly is written down at the point in the source where it applies.
 
 ## What it does *not* do
 
