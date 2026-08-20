@@ -4325,6 +4325,49 @@ def test_switching_says_what_it_will_and_will_not_fix():
     finally:
         restore()
 
+    # What a switch says about sessions already open. Measured behaviour, and
+    # not what was assumed: they follow it completely -- credentials are
+    # re-read per request, and /status and /usage read the identity when run
+    # rather than from the startup snapshot. Telling people to restart sent
+    # them to do something with no effect.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    real_scan, real_env = ew.running_claude_sessions, os.environ.get("CLAUDECODE")
+    try:
+        ew.running_claude_sessions = lambda: [4242]
+        os.environ.pop("CLAUDECODE", None)
+        out, _, _ = _capture(lambda: ew.switch_account(accounts, "2",
+                                                       sign_in=False))
+        check_true("it says open sessions follow the switch",
+                   "moves to this account on its next request" in out)
+        check_true("and that their own status agrees",
+                   "/status and /usage there report the new one" in out)
+        check("it no longer tells anyone to restart",
+              "estart" in out, False)
+        check("and does not claim to be typing in one",
+              "typing in" in out, False)
+    finally:
+        ew.running_claude_sessions = real_scan
+        if real_env is not None:
+            os.environ["CLAUDECODE"] = real_env
+        restore()
+
+    # Run from inside Claude Code, the most common case, it says so.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        ew.running_claude_sessions = lambda: [4242]
+        os.environ["CLAUDECODE"] = "1"
+        out, _, _ = _capture(lambda: ew.switch_account(accounts, "2",
+                                                       sign_in=False))
+        check_true("it names the session the command was run from",
+                   "including the one you are typing in" in out)
+    finally:
+        ew.running_claude_sessions = real_scan
+        if real_env is None:
+            os.environ.pop("CLAUDECODE", None)
+        else:
+            os.environ["CLAUDECODE"] = real_env
+        restore()
+
     # Nothing to do is not an error.
     restore, home, accounts = _switch_sandbox(signed_in_as="2", parked=("2",))
     try:

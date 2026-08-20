@@ -3721,15 +3721,23 @@ def switch_account(accounts, name=None, sign_in=True):
                   len(dropped), "" if len(dropped) == 1 else "s"))
 
     print()
-    print("  Restart Claude Code to pick this up.")
+    # Measured rather than assumed, and not what was assumed first: a session
+    # that was already open follows the switch completely. Credentials are
+    # re-read per request, and /status and /usage read the identity when you
+    # run them rather than from the snapshot taken at startup -- so both the
+    # requests and the display move. Nothing needs restarting, and saying it
+    # did sent people to do something with no effect.
     sessions = running_claude_sessions()
+    inside = " — including the one you are typing in" if os.environ.get(
+        "CLAUDECODE") else ""
     if len(sessions) == 1:
-        print("  One Claude Code session is already running. It moves to this "
-              "account on its next request, while still showing the old one.")
+        print("  One Claude Code session is already running{}. It moves to "
+              "this account on its next request; /status and /usage there "
+              "report the new one.".format(inside))
     elif sessions:
-        print("  {} Claude Code sessions are already running. They move to "
-              "this account on their next request, while still showing the "
-              "old one.".format(len(sessions)))
+        print("  {} Claude Code sessions are already running{}. They move to "
+              "this account on their next request; /status and /usage there "
+              "report the new one.".format(len(sessions), inside))
 
     expiry = next_expiry(states.get(account.name) or read_state(account),
                          time.time())
@@ -4105,9 +4113,8 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
         print("  {} which       which account to spend right now".format(COMMAND))
         print("  {} switch      point your own Claude Code at it".format(COMMAND))
         print()
-        print("Restart Claude Code after a switch. Sessions already running")
-        print("move to the new account on their next request while still")
-        print("showing the old one.")
+        print("Sessions already open follow a switch on their next request,")
+        print("so there is nothing to restart.")
         return 0
     if len(accounts) > 1:
         print("The first ping for each account runs within a minute. From there")
@@ -4454,7 +4461,7 @@ def build_parser():
         help="Point your own Claude Code at one account's login.",
         description="Point your own Claude Code at one account's login. This is "
                     "the only command that writes to ~/.claude, and it backs up "
-                    "what it replaces. Restart Claude Code afterwards.")
+                    "what it replaces. Sessions already open follow it.")
     switching.add_argument("account", nargs="?", metavar="ACCOUNT",
                            help="which account (default: the one `{} which` "
                                 "recommends)".format(COMMAND))

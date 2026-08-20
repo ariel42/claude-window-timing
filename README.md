@@ -101,7 +101,7 @@ claude-window switch        # the account `which` recommends
 claude-window switch 2      # or a named one
 ```
 
-It moves two things together — the credential, which decides what you are billed for, and the identity block, which decides what Claude Code tells you that you are. It backs up what it replaces first. **Restart Claude Code afterwards.**
+It moves two things together — the credential, which decides what you are billed for, and the identity block, which decides what Claude Code tells you that you are. It backs up what it replaces first. **Sessions you already have open follow it**, so there is nothing to restart.
 
 Each account parks its login in `~/.claude-switch/<name>`, signed in once per machine. `./install.sh` walks you through it, and `switch` offers the one it needs if you skipped it — or by hand:
 
@@ -117,7 +117,7 @@ That is also why a switch **moves** a login rather than copying one: the store i
 
 Three things worth knowing before you rely on it:
 
-- **It is one dial for the whole machine.** Credentials are re-read per request, so sessions already running move to the new account on their next turn — while still displaying the old one until they restart. There is no per-session version of this that does not put software in the path of every request, which is a much worse trade.
+- **It is one dial for the whole machine.** Credentials are re-read per request, so every session already open moves to the new account on its next turn — including the one you ran the command from. `/status` and `/usage` in those sessions report the new account too, so nothing is left disagreeing. That is convenient when you meant it and surprising when you did not: there is no per-session version of this that does not put software in the path of every request, which is a much worse trade.
 - **The first request on the new account re-sends whatever you resume**, because the prompt cache belongs to the account you left. That is the same cost as signing out and back in by hand: roughly a percentage point of the new window per 27,000 tokens of conversation. Switch at a break, and start a fresh session where you can — a new conversation pays almost nothing, a resumed one pays for its whole history.
 - **It refuses when it would not work.** No parked login, one that expired, one signed in as the wrong account, one that is a copy of a login something else is already refreshing, or an `ANTHROPIC_API_KEY`-style override that outranks the saved login entirely — each stops the switch and says which it was. There is no `--force`, because nothing it refuses would have worked.
 
