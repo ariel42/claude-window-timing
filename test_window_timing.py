@@ -4080,6 +4080,85 @@ def test_an_interrupted_switch_never_leaves_a_login_in_two_places():
         restore()
 
 
+def test_a_spent_account_is_never_recommended():
+    """
+    One decision, used by every command that has an opinion: `which`, `status`,
+    `status --json` and `switch` all rank through `choose_account`. What it must
+    never do is prefer an account that cannot serve a request, however soon its
+    window turns over -- "back first" is not the same as "usable".
+
+    The gap this covers: a limit reported fully spent with no reset time beside
+    it read as *usable*, which is exactly the shape a refusal takes, because a
+    429 carries no headers at all.
+    """
+    section("A spent account is never recommended")
+
+    root = tempfile.mkdtemp()
+    saved = ew.STATE_ROOT
+    try:
+        ew.STATE_ROOT = root
+        now = time.time()
+        spent = ew.Account("1", os.path.join(root, "c1"), 0, "spent")
+        usable = ew.Account("2", os.path.join(root, "c2"), 1, "usable")
+        for a in (spent, usable):
+            a.ensure_state_dir()
+
+        # The spent one resets much sooner -- the tempting, wrong answer.
+        states = {
+            "1": {"last_run": now - 60, "available_at": now - 60,
+                  "rate_limits": {"five_hour": {"used_percentage": 100,
+                                                "resets_at": now + 300}}},
+            "2": {"last_run": now - 60, "available_at": now - 60,
+                  "rate_limits": {"five_hour": {"used_percentage": 10,
+                                                "resets_at": now + 4 * 3600}}},
+        }
+        accounts = [spent, usable]
+        chosen, reason = ew.choose_account(accounts, states, now)
+        check("the usable account wins despite resetting far later",
+              chosen.name, "2")
+        check("tier outranks urgency in the sort key",
+              ew.rank_account(spent, states["1"], now)[0], ew.WAITING)
+
+        # The same, with no reset time at all -- the shape of a refusal.
+        states["1"]["rate_limits"] = {"five_hour": {"used_percentage": 100}}
+        av = ew.account_availability(spent, states["1"], now)
+        check("spent with no reset time is still not usable",
+              ew.TIER_NAMES[av.tier], "waiting")
+        check("and says so honestly rather than inventing a time",
+              "nothing says when it returns" in
+              ew.describe_availability(states["1"], av, now), True)
+        check("it is still not recommended",
+              ew.choose_account(accounts, states, now)[0].name, "2")
+
+        # Every command that has an opinion goes through the same function.
+        # status_json reads state from disk rather than taking it, so put the
+        # fixture where it will look.
+        for name, state in states.items():
+            ew.write_state(ew.find_account(accounts, name), state)
+        for command, fn in (("which", lambda: ew.which(accounts, states)),
+                            ("status_json", lambda: ew.status_json(accounts))):
+            out, _, _ = _capture(fn)
+            check_true("{} points at the usable account".format(command),
+                       '"account": "2"' in out or "Use account 2" in out)
+
+        # But the rotation keeps its slot: the usual cause is the 5-hour limit,
+        # which clears at this account's own boundary. Dropping it would
+        # re-space every other account around a hole that closes by itself.
+        mixed = {"last_run": now - 60, "available_at": now - 60,
+                 "rate_limits": {"five_hour": {"used_percentage": 40,
+                                               "resets_at": now + 900},
+                                 "seven_day": {"used_percentage": 100}}}
+        av = ew.account_availability(spent, mixed, now)
+        check("a blocker with no end still makes it unusable",
+              ew.TIER_NAMES[av.tier], "waiting")
+        check("and the end really is unknown", av.until, None)
+        check("yet it keeps its place in the spacing",
+              ew.participation(spent, mixed, now)[0], True)
+    finally:
+        ew.STATE_ROOT = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_a_live_reading_beats_a_cached_one():
     """
     Every figure the tool shows comes from the statusLine of the last ping, so
@@ -4115,7 +4194,8 @@ def test_a_live_reading_beats_a_cached_one():
             def __exit__(self, *a): return False
         ew.urllib.request.urlopen = lambda *a, **k: Response()
 
-        limits = ew.read_live_limits(accounts[0])
+        limits, problem = ew.read_live_limits(accounts[0])
+        check("a good reading reports no problem", problem, "")
         check("a live reading converts the fraction to a percentage",
               limits["five_hour"]["used_percentage"], 97)
         check("and carries the reset time", limits["five_hour"]["resets_at"],
@@ -4135,25 +4215,72 @@ def test_a_live_reading_beats_a_cached_one():
             raise ew.urllib.error.HTTPError("u", 429, "Too Many Requests", {}, None)
         ew.urllib.request.urlopen = refuse
         check("a refusal reads as spent",
-              ew.read_live_limits(accounts[0])["five_hour"]["used_percentage"], 100)
+              ew.read_live_limits(accounts[0])[0]["five_hour"]["used_percentage"],
+              100)
 
         # Anything else leaves the cached figures alone rather than guessing.
         def broken(*a, **k):
             raise ew.urllib.error.URLError("no route to host")
         ew.urllib.request.urlopen = broken
-        check("an unreachable network reads as nothing at all",
-              ew.read_live_limits(accounts[0]), {})
+        limits, problem = ew.read_live_limits(accounts[0])
+        check("an unreachable network reads as nothing at all", limits, {})
+        check_true("and says so rather than failing quietly",
+                   "could not reach Claude" in problem)
         before = ew.read_state(accounts[1])["rate_limits"]
         ew.refresh_limits([accounts[1]])
         check("and leaves what was already known untouched",
               ew.read_state(accounts[1])["rate_limits"], before)
 
+        # A live reading is only taken where it cannot start a window. Any
+        # billed request starts one if none is running, and choosing that
+        # moment is the whole job of the anchoring machinery -- a status
+        # command must not move it.
+        gone = {"last_run": now - 60,
+                "rate_limits": {"five_hour": {"used_percentage": 20,
+                                              "resets_at": now - 60}}}
+        check("an account between windows is not probed",
+              ew.probe_is_safe(gone, now), False)
+        running = {"last_run": now - 60,
+                   "rate_limits": {"five_hour": {"used_percentage": 20,
+                                                 "resets_at": now + 900}}}
+        check("one with a window running is", ew.probe_is_safe(running, now), True)
+        check("and one that has never reported is not",
+              ew.probe_is_safe({}, now), False)
+
+        ew.write_state(accounts[0], gone)
+        ew.urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("probed an account that would have started a window"))
+        ew.refresh_limits([accounts[0]])
+        check("so refresh_limits skips it entirely",
+              ew.read_state(accounts[0])["rate_limits"]["five_hour"]
+              ["used_percentage"], 20)
+
+        # A failure is announced, written down, and reported by doctor -- never
+        # a silent fall back to figures half an hour old.
+        ew.write_state(accounts[0], running)
+        def broken_probe(*a, **k):
+            raise ew.urllib.error.HTTPError("u", 404, "Not Found", {},
+                                            io.BytesIO(
+                                                ("model " + ew.LIVE_MODEL +
+                                                 " not found").encode()))
+        ew.urllib.request.urlopen = broken_probe
+        out, err, _ = _capture(lambda: ew.refresh_limits([accounts[0]]))
+        check_true("a retired probe model is named on sight",
+                   "was rejected" in err and ew.LIVE_MODEL in err)
+        check_true("and written to the account's log",
+                   "live reading failed" in open(accounts[0].log_file).read())
+        recorded = ew.read_state(accounts[0]).get("live_problem", "")
+        check_true("and recorded so it outlives the moment",
+                   "was rejected" in recorded)
+
         # No token, no request: an unconfigured account must not be asked about.
         os.remove(ew.credentials_path(accounts[1]))
         ew.urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("asked Claude about an account with no login"))
-        check("an account with no login is never asked about",
-              ew.read_live_limits(accounts[1]), {})
+        limits, problem = ew.read_live_limits(accounts[1])
+        check("an account with no login is never asked about", limits, {})
+        check_true("and the reason names the directory",
+                   accounts[1].config_dir in problem)
     finally:
         ew.urllib.request.urlopen = real_open
         restore()
@@ -5731,6 +5858,13 @@ def main():
     os.makedirs(ew.UNIT_DIR)
     os.makedirs(ew.USER_CONFIG_DIR)
 
+    # No test may reach the network. A live reading is a real request against a
+    # real account, so a test that made one would spend the developer's quota
+    # and pass or fail on whether their wifi was up. Anything that wants to
+    # exercise the live path replaces this locally.
+    ew.urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
+        ew.urllib.error.URLError("the test suite does not have a network"))
+
     for test in (test_refusal_text, test_next_window_start, test_guard_rails,
                  test_anchor_scheduling, test_statusline_parsing,
                  test_an_impossible_usage_report_is_ignored,
@@ -5782,6 +5916,7 @@ def main():
                  test_doctor_notices_a_deployment_going_wrong,
                  test_a_login_is_never_in_two_places_at_once,
                  test_an_interrupted_switch_never_leaves_a_login_in_two_places,
+                 test_a_spent_account_is_never_recommended,
                  test_a_live_reading_beats_a_cached_one,
                  test_the_schedule_is_treated_as_input_not_configuration,
                  test_the_refusals_fire_where_the_readme_says_to_switch,

@@ -76,13 +76,11 @@ Two questions, in that order. **Can this account serve a request at all?** and o
 
 So an account is skipped, and told to wait, when any of this is true: its 5-hour limit is reported spent, its weekly limit is reported spent, a ping came back refused, its sign-in has expired, or it is on no paid plan. Accounts that cannot serve are ranked by when they come back, and one that needs *you* — a lapsed subscription, a login that ran out — ranks below one that will recover on its own.
 
-**How fresh those figures are.** They come from the last ping, so they can be up to 30 minutes old — and the likeliest thing to have moved them since is your own work, which is exactly what the recommendation is about to be made against. `which` says how old its numbers are, and `--live` reads them from Claude instead:
+**How fresh those figures are.** `which` and `status` read them from Claude when you run them, because the alternative — the last ping's numbers — can be half an hour old, and the likeliest thing to have moved them since is your own work. That is exactly what the recommendation is about to be made against, so an account you spent ten minutes ago used to read as usable and get recommended.
 
-```bash
-claude-window which --live
-```
+It costs one very small request per account, and only for accounts whose window is already running. An account between windows is never probed: any billed request would *start* a window, and choosing that moment is the whole job of the anchoring machinery — a status command has no business moving it. Those accounts keep the last ping's figure, with its age on screen.
 
-That costs one very small request per account, which is why it is not the default: typing `claude-window` on its own can never spend anything. A refusal counts as an answer — an account that will not serve a request is spent, whatever the last ping believed.
+`--no-live` skips the reading; the bare `claude-window` never takes one. A refusal counts as an answer — an account that will not serve a request is spent, whatever the last ping believed. And if a reading cannot be taken, it says so loudly, writes it to the account's log and keeps reporting it in `doctor`, rather than quietly falling back to stale numbers.
 
 One subtlety is worth stating, because it is the case a simpler tool gets wrong: a ping getting through is not proof that an account is usable. Pings are cache reads and are exempt from the rate limit, so one can sail through an account whose limit is spent and whose next real request would be refused. The reported percentages are believed over the ping.
 
@@ -303,9 +301,9 @@ Answering "no pings" on a machine that has been pinging offers to stop its timer
 |---|---|
 | `./install.sh [--no-pings] [--accounts N] [-y]` | The setup wizard. Safe to re-run; asks only for what is missing. `--no-pings` sets a machine up to switch accounts without running the pings. |
 | `claude-window setup` | The same wizard, once the launcher exists. Takes the same options. |
-| `claude-window` | Status. Typing it can never spend quota. |
-| `claude-window status [--json] [--live]` | What every account is doing, and which to use now. |
-| `claude-window which [--live]` | Just the recommendation, and what is unusable. `--live` reads the limits from Claude now rather than from the last ping. |
+| `claude-window` | Status. The bare form never spends anything. |
+| `claude-window status [--json] [--no-live]` | What every account is doing, and which to use now. |
+| `claude-window which [--no-live]` | Just the recommendation, and what is unusable. Reads the limits from Claude unless you pass `--no-live`. |
 | `claude-window switch [2] [--no-sign-in]` | Point your own Claude Code at an account. The only command that writes to `~/.claude`. |
 | `claude-window doctor` | Check the setup and say what is wrong. |
 | `claude-window realign [--confirm]` | Show, then optionally apply, a spacing correction. |

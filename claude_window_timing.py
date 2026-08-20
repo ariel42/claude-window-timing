@@ -527,8 +527,15 @@ def spent_limits(state, now):
     for key, name in _LIMIT_NAMES:
         window = limits.get(key) or {}
         resets = window.get("resets_at")
-        if (resets and resets > now
-                and (window.get("used_percentage") or 0) >= LIMIT_SPENT_PCT):
+        if (window.get("used_percentage") or 0) < LIMIT_SPENT_PCT:
+            continue
+        if resets is None:
+            # Spent, and nothing says when it comes back -- which is exactly
+            # what a refusal looks like when no reset time was ever recorded: a
+            # 429 carries no headers at all. Skipping it for want of a
+            # timestamp would recommend an account that is certain to refuse.
+            spent.append((name, None))
+        elif resets > now:
             spent.append((name, resets))
     return spent
 
@@ -586,7 +593,12 @@ def account_availability(account, state, now):
         blockers.append((resets, "its {} limit is spent".format(name)))
 
     if blockers:
-        until, note = max(blockers)         # back only when the last one clears
+        # Back only when the last one clears -- and an unknown return time is
+        # the latest of all, because nothing here can promise it has passed.
+        if any(until is None for until, _note in blockers):
+            note = next(note for until, note in blockers if until is None)
+            return Availability(WAITING, None, note)
+        until, note = max(blockers)
         return Availability(WAITING, until, note)
 
     if state.get("consecutive_failures", 0) >= UNHEALTHY_AFTER:
@@ -686,6 +698,9 @@ def describe_availability(state, avail, now):
             return "no window information yet"
         return "usable — window ends in {}".format(fmt_delta(expiry - now))
     if avail.tier == WAITING:
+        if avail.until is None:
+            return "unusable — {}, and nothing says when it returns".format(
+                avail.note)
         return "unusable until {} — {}".format(fmt_time(avail.until), avail.note)
     return "unusable — {}".format(avail.note)
 
@@ -896,8 +911,16 @@ def participation(account, state, now):
         # Nothing it does on its own brings this back, so no future boundary of
         # its own is worth reserving a slot for.
         return False, avail.note
-    if avail.tier == WAITING and avail.until > boundary:
+    if avail.tier == WAITING and avail.until is not None \
+            and avail.until > boundary:
         return False, "{}, which outlasts its current window".format(avail.note)
+    # An unknown return time deliberately does *not* drop it. The usual cause is
+    # a refusal carrying no reset header, and a refusal is almost always the
+    # 5-hour limit -- which clears at exactly this account's boundary, so its
+    # slot is still worth holding. Dropping it would re-space every other
+    # account around a hole that closes by itself, and re-spacing costs hours
+    # of dead window. Being pessimistic is right for "which account should I
+    # spend"; it is wrong here.
 
     # Proof of life, and the reason a phase can be believed at all. A phase says
     # where this account's boundary falls; that claim is only as good as the last
@@ -1438,13 +1461,26 @@ def build_claude_env(account):
 # Logging
 # ---------------------------------------------------------------------------
 
-def log(account, msg):
+def log_quietly(account, msg):
+    """
+    Append to the account's log without printing.
+
+    `log` prints as well, which is right during a ping -- the run's output *is*
+    the log -- and wrong anywhere a command's stdout means something. A warning
+    written this way from a read-only command corrupted `status --json`, which
+    is a documented machine-readable contract; the test for that contract is
+    what caught it.
+    """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {msg}"
+    line = "[{}] {}".format(timestamp, msg)
     account.ensure_state_dir()
     with open(account.log_file, "a") as f:
         f.write(line + "\n")
-    print(line)
+    return line
+
+
+def log(account, msg):
+    print(log_quietly(account, msg))
 
 
 def rotate_log(account):
@@ -1619,7 +1655,7 @@ def read_live_limits(account):
     creds = (_read_json(credentials_path(account)).get("claudeAiOauth") or {})
     token = creds.get("accessToken")
     if not token:
-        return {}
+        return {}, "there is no login in {}".format(account.config_dir)
     body = json.dumps({"model": LIVE_MODEL, "max_tokens": 1,
                        "messages": [{"role": "user", "content": "."}]}).encode()
     request = urllib.request.Request(LIVE_URL, data=body, headers={
@@ -1635,10 +1671,26 @@ def read_live_limits(account):
         if e.code == 429:
             # Refused: no headers, but the refusal is the reading. Nothing here
             # can say when it comes back, so leave the reset time to the ping.
-            return {"five_hour": {"used_percentage": 100}}
-        return {}
-    except (urllib.error.URLError, OSError):
-        return {}
+            return {"five_hour": {"used_percentage": 100}}, ""
+        detail = ""
+        try:
+            detail = e.read()[:200].decode("utf8", "replace")
+        except Exception:
+            pass
+        if e.code in (400, 404) and LIVE_MODEL in detail:
+            # The one failure this design knows it is exposed to: the probe
+            # names a model, and model names are retired. Say so in as many
+            # words, because the alternative is a tool that quietly goes back
+            # to reporting half-hour-old figures as if they were current.
+            return {}, ("the model this probe uses ({}) was rejected — it has "
+                        "probably been retired, and LIVE_MODEL needs "
+                        "updating [HTTP {}]".format(LIVE_MODEL, e.code))
+        if e.code in (401, 403):
+            return {}, "this account's login was rejected [HTTP {}]".format(e.code)
+        return {}, "Claude answered HTTP {}{}".format(
+            e.code, ": " + detail if detail else "")
+    except (urllib.error.URLError, OSError) as e:
+        return {}, "could not reach Claude: {}".format(e)
 
     limits = {}
     for key, prefix in (("five_hour", "5h"), ("seven_day", "7d")):
@@ -1657,23 +1709,67 @@ def read_live_limits(account):
                 pass
         if window:
             limits[key] = window
-    return limits
+    if not limits:
+        return {}, ("Claude answered, but sent no rate-limit headers — the "
+                    "reading cannot be taken this way any more")
+    return limits, ""
+
+
+def probe_is_safe(state, now):
+    """
+    Whether asking this account for a reading can be done without side effects.
+
+    Any billed request starts a 5-hour window if none is running -- so probing
+    an account between windows would start one, at a moment nothing chose. That
+    is precisely what the anchoring machinery exists to decide, and a status
+    command has no business moving it. Where a window is already running the
+    probe cannot start anything; it just reports.
+
+    An account whose window has ended keeps its cached figure, which is honest:
+    the figure is stale, the age is on screen, and the next ping refreshes it
+    within the interval anyway.
+
+    The reset time is read raw rather than through `next_expiry`, which rolls a
+    stale reading forward on the assumption that windows tile back to back.
+    That assumption is the tool's *intent* and the right one for judging phase,
+    but here it would answer "a window is running" for an account that has not
+    been heard from in days -- which is exactly the account a probe would start
+    one on.
+    """
+    recorded = ((state.get("rate_limits") or {}).get("five_hour")
+                or {}).get("resets_at")
+    return bool(recorded) and recorded > now
 
 
 def refresh_limits(accounts):
     """
-    Take a live reading for every account and record it. Returns what it got.
+    Take a live reading for every account it is safe to ask. Returns what it got.
 
     Written back into state so that the next command -- and the next ping's
     plausibility check -- start from the same picture the user was just shown.
     """
-    taken = {}
+    taken, now = {}, time.time()
     for account in accounts:
-        limits = read_live_limits(account)
-        if not limits:
-            continue
-        taken[account.name] = limits
         state = read_state(account)
+        if not probe_is_safe(state, now):
+            continue
+        limits, problem = read_live_limits(account)
+        if problem:
+            # Loud on the way past, and recorded so `doctor` keeps saying it
+            # after the moment has scrolled by. A live reading that silently
+            # falls back to half-hour-old figures is the failure this whole
+            # option exists to prevent.
+            sys.stderr.write("WARNING: no live reading for account {}: {}\n"
+                             .format(account.display, problem))
+            log_quietly(account, "WARNING: live reading failed: {}".format(problem))
+            state["live_problem"] = problem
+            state["live_problem_at"] = time.time()
+            account.ensure_state_dir()
+            write_state(account, state)
+            continue
+        state.pop("live_problem", None)
+        state.pop("live_problem_at", None)
+        taken[account.name] = limits
         merged = dict(state.get("rate_limits") or {})
         for key, window in limits.items():
             merged[key] = dict(merged.get(key) or {}, **window)
@@ -2870,6 +2966,17 @@ def doctor(accounts):
                 "Each unfinished run may have skipped a boundary anchor. See "
                 + account.log_file))
 
+        problem = state.get("live_problem")
+        if problem:
+            findings.append(Finding(
+                "warning",
+                "Account {}: the last live reading failed — {}".format(
+                    account.name, problem),
+                "`{} which` is falling back to the figures from the last ping, "
+                "which can be up to {} minutes old. Recorded {}.".format(
+                    COMMAND, INTERVAL_MIN,
+                    fmt_time(state.get("live_problem_at") or 0))))
+
         last_run = state.get("last_run")
         if last_run and now - last_run > 3 * INTERVAL_MIN * 60:
             findings.append(Finding(
@@ -3921,8 +4028,11 @@ def switch_blockers(accounts, account, usable=None):
         findings.append(Finding(
             "warning",
             "Account {} is not usable yet — {}".format(account.display, usable.note),
-            "It comes back {}. Switching now is harmless; the first request "
-            "before then is simply refused.".format(fmt_time(usable.until))))
+            ("It comes back {}. ".format(fmt_time(usable.until))
+             if usable.until is not None
+             else "Nothing here says when it comes back. ") +
+            "Switching now is harmless; the first request before then is "
+            "simply refused."))
     elif usable.tier == NEEDS_ACTION:
         findings.append(Finding(
             "warning",
@@ -5005,16 +5115,14 @@ def build_parser():
     status = add("status", "What every account is doing, and which to use now.")
     status.add_argument("--json", action="store_true",
                         help="report it as JSON instead, for scripting")
-    status.add_argument("--live", action="store_true",
-                        help="read each account's limits from Claude now "
-                             "instead of using the last ping's figures. Costs "
-                             "one very small request per account")
+    status.add_argument("--no-live", dest="live", action="store_false",
+                        help="use the last ping's figures instead of reading "
+                             "the limits from Claude now")
 
     which_ = add("which", "Say which account to use right now, and why.")
-    which_.add_argument("--live", action="store_true",
-                        help="read the limits from Claude now instead of using "
-                             "the last ping's figures. Costs one very small "
-                             "request per account")
+    which_.add_argument("--no-live", dest="live", action="store_false",
+                        help="use the last ping's figures instead of reading "
+                             "the limits from Claude now")
 
     switching = sub.add_parser(
         "switch",
@@ -5248,7 +5356,9 @@ def cli(argv=None):
         if command == "status":
             # getattr, because the bare invocation has no status subparser and
             # therefore none of its options.
-            if getattr(args, "live", False):
+            # Not on the bare invocation: `claude-window` with no argument is
+            # what people type idly, and it stays free.
+            if args.command is not None and getattr(args, "live", True):
                 refresh_limits(accounts)
             if getattr(args, "json", False):
                 return status_json(accounts)
@@ -5263,7 +5373,7 @@ def cli(argv=None):
                       "run `{} help` for all of them.".format(COMMAND))
             return code
         if command == "which":
-            if getattr(args, "live", False):
+            if getattr(args, "live", True):
                 refresh_limits(accounts)
             # A machine that pings nothing has no state of its own; a copy of
             # the pinging machine's schedule.json is all it needs to answer.
