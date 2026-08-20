@@ -308,9 +308,9 @@ Uninstalling stops the timers and removes every unit, and by default leaves this
 
 | File | Purpose |
 |---|---|
-| `claude_early_window.py` | The whole tool. |
+| `claude_window_timing.py` | The whole tool. |
 | `install.sh` / `uninstall.sh` | Prerequisite checks, then the wizard; and the teardown. |
-| `test_early_window.py` | Over 720 checks. `python3 test_early_window.py`. |
+| `test_window_timing.py` | Over 720 checks. `python3 test_window_timing.py`. |
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 

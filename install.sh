@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — check the prerequisites, then hand over to the setup wizard.
 #
-# Everything interesting lives in claude_early_window.py: accounts, checkpoints,
+# Everything interesting lives in claude_window_timing.py: accounts, checkpoints,
 # systemd units and the launcher. Keeping the shell script to the checks it is
 # actually good at means one implementation of the setup logic, and one that can
 # be tested.
@@ -36,4 +36,4 @@ if [ ! -x "$CLAUDE_BIN" ]; then
     exit 1
 fi
 
-exec python3 "$SCRIPT_DIR/claude_early_window.py" setup "$@"
+exec python3 "$SCRIPT_DIR/claude_window_timing.py" setup "$@"
