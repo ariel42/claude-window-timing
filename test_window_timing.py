@@ -3665,6 +3665,33 @@ def test_every_command_routes_to_the_thing_it_names():
               sorted(json.loads(run(["status", "--json"])[1])),
               ["accounts", "generated_at", "published_at", "switching", "use"])
 
+        # A live reading is a real request against a real account. Who takes
+        # one is therefore part of the dispatch, and the case that matters is
+        # `--json`: it is the interface something polls in a loop, and a
+        # reading per account per poll is a bill nobody meant to run up.
+        readings = []
+        real_refresh = ew.refresh_limits
+        ew.refresh_limits = lambda accounts: readings.append(
+            len(accounts)) or {}
+        try:
+            run([])
+            check("the bare command never reads the limits", readings, [])
+            run(["status", "--json"])
+            check("and neither does the scripting interface", readings, [])
+            run(["status", "--json", "--live"])
+            check("unless it is asked to", readings, [2])
+            del readings[:]
+            run(["status"])
+            check("a person running status gets a reading", readings, [2])
+            del readings[:]
+            run(["which"])
+            check("and so does which", readings, [2])
+            del readings[:]
+            run(["which", "--no-live"])
+            check("--no-live skips it", readings, [])
+        finally:
+            ew.refresh_limits = real_refresh
+
         code, said, _ = run(["which"])
         check("which succeeds", code, 0)
         check_true("and answers the question it is named after", "Use account" in said)
@@ -4459,6 +4486,25 @@ def test_a_live_reading_beats_a_cached_one():
         recorded = ew.read_state(accounts[0]).get("live_problem", "")
         check_true("and recorded so it outlives the moment",
                    "was rejected" in recorded)
+
+        # A machine that only switches never takes a reading. It has no ping
+        # directory to read a login from, and it is not the authority on these
+        # accounts either -- `which` there answers from the schedule the
+        # pinging machine published.
+        saved_accounts = ew.ACCOUNTS_FILE
+        try:
+            ew.ACCOUNTS_FILE = os.path.join(home, "accounts.json")
+            with open(ew.ACCOUNTS_FILE, "w") as f:
+                json.dump({"pings": False, "accounts": [
+                    {"name": a.name, "config_dir": a.config_dir}
+                    for a in accounts]}, f)
+            ew.write_state(accounts[0], running)
+            ew.urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("a switch-only machine asked Claude for a reading"))
+            check("a machine that does not ping reads nothing",
+                  ew.refresh_limits(accounts), {})
+        finally:
+            ew.ACCOUNTS_FILE = saved_accounts
 
         # No token, no request: an unconfigured account must not be asked about.
         os.remove(ew.credentials_path(accounts[1]))

@@ -80,7 +80,7 @@ So an account is skipped, and told to wait, when any of this is true: its 5-hour
 
 It costs one very small request per account, and only for accounts whose window is already running. An account between windows is never probed: any billed request would *start* a window, and choosing that moment is the whole job of the anchoring machinery — a status command has no business moving it. Those accounts keep the last ping's figure, with its age on screen.
 
-`--no-live` skips the reading; the bare `claude-window` never takes one. A refusal counts as an answer — an account that will not serve a request is spent, whatever the last ping believed. And if a reading cannot be taken, it says so loudly, writes it to the account's log and keeps reporting it in `doctor`, rather than quietly falling back to stale numbers.
+`--no-live` skips the reading. The bare `claude-window` never takes one, and neither does `status --json` — a scripting interface is the thing something polls in a loop, and a reading per account per poll is a bill nobody meant to run up. Add `--live` there when you want one. A refusal counts as an answer — an account that will not serve a request is spent, whatever the last ping believed. And if a reading cannot be taken, it says so loudly, writes it to the account's log and keeps reporting it in `doctor`, rather than quietly falling back to stale numbers.
 
 One subtlety is worth stating, because it is the case a simpler tool gets wrong: a ping getting through is not proof that an account is usable. Pings are cache reads and are exempt from the rate limit, so one can sail through an account whose limit is spent and whose next real request would be refused. The reported percentages are believed over the ping.
 
@@ -291,7 +291,7 @@ That creates no timers, builds no conversations and spends nothing. Copy `schedu
 
 Copy `schedule.json` **before** running the wizard if you can. It is how a machine that pings nothing recognises the account you are already signed in as — and recognising it saves one browser sign-in, because that login parks itself on your first switch instead of needing one of its own. Setup says so if it cannot find the file.
 
-`which` answers from that file alone: no timers, no logins, no network call. The file carries each window's *phase*, which does not move between windows, so even a days-old copy still names the right account — along with each account's availability, which is the part only the pinging machine can see, and which does age. `which` says how old the file is.
+`which` answers from that file alone: no timers, no logins, no network call — a machine that does not ping never reads a limit from Claude, because it has no login of its own to ask with and the pinging machine has already looked. The file carries each window's *phase*, which does not move between windows, so even a days-old copy still names the right account — along with each account's availability, which is the part only the pinging machine can see, and which does age. `which` says how old the file is.
 
 Answering "no pings" on a machine that has been pinging offers to stop its timers, because a second pinger doubles what those accounts consume and buys nothing. `doctor` reports the mismatch until the two agree.
 
@@ -302,8 +302,8 @@ Answering "no pings" on a machine that has been pinging offers to stop its timer
 | `./install.sh [--no-pings] [--accounts N] [-y]` | The setup wizard. Safe to re-run; asks only for what is missing. `--no-pings` sets a machine up to switch accounts without running the pings. |
 | `claude-window setup` | The same wizard, once the launcher exists. Takes the same options. |
 | `claude-window` | Status. The bare form never spends anything. |
-| `claude-window status [--json] [--no-live]` | What every account is doing, and which to use now. |
-| `claude-window which [--no-live]` | Just the recommendation, and what is unusable. Reads the limits from Claude unless you pass `--no-live`. |
+| `claude-window status [--json] [--no-live] [--live]` | What every account is doing, and which to use now. `--json` reads nothing from Claude unless you add `--live`. |
+| `claude-window which [--no-live] [--live]` | Just the recommendation, and what is unusable. Reads the limits from Claude unless you pass `--no-live`. |
 | `claude-window switch [2] [--no-sign-in]` | Point your own Claude Code at an account. The only command that writes to `~/.claude`. |
 | `claude-window doctor` | Check the setup and say what is wrong. |
 | `claude-window realign [--confirm]` | Show, then optionally apply, a spacing correction. |

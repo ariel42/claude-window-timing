@@ -1767,8 +1767,15 @@ def refresh_limits(accounts):
 
     Written back into state so that the next command -- and the next ping's
     plausibility check -- start from the same picture the user was just shown.
+
+    Nothing is read on a machine that does not ping. A reading is taken with
+    the ping directory's own login, and there is no such directory there; that
+    machine is not the authority on these accounts either, since `which` and
+    `switch` both answer from the schedule the pinging machine published.
     """
     taken, now = {}, time.time()
+    if not pings_here():
+        return taken
     for account in accounts:
         state = read_state(account)
         if not probe_is_safe(state, now):
@@ -5154,17 +5161,32 @@ def build_parser():
                                    COMMAND))
         return child
 
+    def add_live(command, default_note):
+        """
+        The `--live` / `--no-live` pair, defaulting to neither.
+
+        Both are needed, and the default has to be undecidable from the flags
+        alone: `status --json` is the interface something polls, and a reading
+        per account per poll is a bill nobody meant to run up — so it does not
+        take one unless asked. `--live` is how it is asked.
+        """
+        group = command.add_mutually_exclusive_group()
+        group.add_argument("--no-live", dest="live", action="store_false",
+                           default=None,
+                           help="use the last ping's figures instead of "
+                                "reading the limits from Claude now")
+        group.add_argument("--live", dest="live", action="store_true",
+                           default=None,
+                           help="read the limits from Claude now ({})".format(
+                               default_note))
+
     status = add("status", "What every account is doing, and which to use now.")
     status.add_argument("--json", action="store_true",
                         help="report it as JSON instead, for scripting")
-    status.add_argument("--no-live", dest="live", action="store_false",
-                        help="use the last ping's figures instead of reading "
-                             "the limits from Claude now")
+    add_live(status, "the default, except with --json")
 
     which_ = add("which", "Say which account to use right now, and why.")
-    which_.add_argument("--no-live", dest="live", action="store_false",
-                        help="use the last ping's figures instead of reading "
-                             "the limits from Claude now")
+    add_live(which_, "the default")
 
     switching = sub.add_parser(
         "switch",
@@ -5419,9 +5441,15 @@ def cli(argv=None):
         if command == "status":
             # getattr, because the bare invocation has no status subparser and
             # therefore none of its options.
-            # Not on the bare invocation: `claude-window` with no argument is
-            # what people type idly, and it stays free.
-            if args.command is not None and getattr(args, "live", True):
+            live = getattr(args, "live", None)
+            if live is None:
+                # Neither flag given. A person gets a reading; the bare
+                # `claude-window` does not, because it is what people type
+                # idly and it stays free; and `--json` does not, because a
+                # scripting interface is the thing something polls in a loop.
+                live = args.command is not None and not getattr(args, "json",
+                                                                False)
+            if live:
                 refresh_limits(accounts)
             if getattr(args, "json", False):
                 return status_json(accounts)
@@ -5436,12 +5464,16 @@ def cli(argv=None):
                       "run `{} help` for all of them.".format(COMMAND))
             return code
         if command == "which":
-            if getattr(args, "live", True):
-                refresh_limits(accounts)
             # A machine that pings nothing has no state of its own; a copy of
             # the pinging machine's schedule.json is all it needs to answer.
+            # Asked first, because a reading taken for an answer that comes out
+            # of a file is a request spent on nothing.
             view = schedule_view(accounts)
-            return which(*view) if view else which(accounts)
+            live = getattr(args, "live", None)
+            live = True if live is None else live
+            if not view and live:
+                refresh_limits(accounts)
+            return which(*view) if view else which(accounts, live=live)
         if command == "switch":
             return switch_account(accounts, args.account, sign_in=args.sign_in)
         if command == "log":
