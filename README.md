@@ -328,7 +328,7 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 
 ## Notes and caveats
 
-- Not affiliated with or endorsed by Anthropic. Running an automated background process against a subscription around the clock may conflict with Anthropic's terms of service, and using several subscriptions to raise your own ceiling is at best a grey area. Both are your call; this makes no claim that either is permitted.
+- Not affiliated with or endorsed by Anthropic. Worth knowing what you are running: this sends one saved line to your subscription every 30 minutes, day and night, whether or not you are at the machine. Anthropic's [consumer terms](https://www.anthropic.com/legal/consumer-terms) address reaching the service by automated means; Anthropic also ships Claude Code for scripted and headless use. On the other side of the ledger, the pings create no capacity — every window holds exactly the quota you paid for, and nothing here exceeds a limit or asks for more. Running several subscriptions is a separate decision with its own considerations. Read the terms and decide for yourself.
 - Pings are cheap but not free, and they also draw a little from the separate **weekly** limit — about 48 pings a day per account.
 - Pings ask Claude for no thinking and never update the CLI. Thinking is billed as output and a ping's reply is discarded; an update rewrites the tool definitions that sit at the front of every cached prompt, which would make your own open sessions expensive to resume. Neither affects how you run Claude Code yourself.
 - Accounts must be genuinely different Claude accounts. Signing in twice as the same one looks like it works and buys nothing; setup checks for it.
