@@ -2907,6 +2907,14 @@ def _ping(account, accounts=None):
         state["available_at"] = time.time()          # proven by demonstration
         state["consecutive_failures"] = 0
         state["anchor_streak"] = 0    # back to normal; forget past corrections
+        # A live reading that failed is recorded so `doctor` keeps saying it
+        # after the moment has scrolled by -- but only a live reading cleared
+        # it, so one bad minute of network left a warning standing for as long
+        # as nobody happened to run `which`. A ping getting through is the
+        # stronger proof of the two. If the probe itself is what is broken,
+        # the next reading records it again immediately.
+        state.pop("live_problem", None)
+        state.pop("live_problem_at", None)
     elif result["limited"]:
         if boundary:
             state["available_at"] = boundary

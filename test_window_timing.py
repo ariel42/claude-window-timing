@@ -5497,6 +5497,27 @@ def test_a_live_reading_beats_a_cached_one():
         check_true("and recorded so it outlives the moment",
                    "was rejected" in recorded)
 
+        # It must not outlive the *problem*, though. Only a live reading used
+        # to clear it, so one bad minute of network left `doctor` warning
+        # about a stale reading for as long as nobody happened to run `which`
+        # -- while every ping in between was getting through.
+        saved_run = ew.run_interactive
+        saved_anchor = ew.schedule_anchor
+        try:
+            ew.run_interactive = lambda *a, **k: {"completed": True,
+                                                  "limited": False,
+                                                  "text": "ok"}
+            ew.schedule_anchor = lambda a, t: True
+            with open(accounts[0].session_id_file, "w") as f:
+                f.write("sess\n")
+            stamp_checkpoint(accounts[0])
+            open(accounts[0].checkpoint_backup, "w").close()
+            _capture(lambda: ew.ping(accounts[0]))
+        finally:
+            ew.run_interactive, ew.schedule_anchor = saved_run, saved_anchor
+        check("a ping that gets through clears it",
+              ew.read_state(accounts[0]).get("live_problem"), None)
+
         # A machine that only switches never takes a reading. It has no ping
         # directory to read a login from, and it is not the authority on these
         # accounts either -- `which` there answers from the schedule the
