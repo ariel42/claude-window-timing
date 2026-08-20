@@ -9,7 +9,7 @@ This puts that timing back under your control. It starts your window before you 
 - **A fresh window every 5/N hours instead of every 5.** Two subscriptions are held 2h30m apart, three 1h40m. Not more quota — quota that arrives when you need it, instead of all at once and then not for hours.
 - **A straight answer to which account to spend.** The window that expires first, skipping any account that cannot serve a request at all — a spent weekly limit, a lapsed plan, an expired sign-in.
 
-It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 4,900 lines of Python standard library and a systemd timer — no dependencies, no daemon, and no network calls of its own.
+It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 5,600 lines of Python standard library and a systemd timer — no dependencies and no daemon. The only traffic it makes is the pings themselves, plus the one very small request per account that `which` and `status` use to read your limits ([how fresh those figures are](#which-account-to-use-now)).
 
 ---
 
@@ -68,9 +68,11 @@ Use account 1 (personal)
   1 (personal)  usable — window ends in 4h00m00s   <- use this
   2 (work)      unusable until 2026-08-13 01:22:35 — its 5-hour limit is spent
   3 (spare)     unusable until 2026-08-14 23:52:35 — its weekly limit is spent
+
+  Figures from a live reading, 0h00m02s ago.
 ```
 
-That last line appears once switching is set up, and names the account rather than making you match it up yourself. Until then `which` says nothing about switching at all.
+The `switch` line appears once switching is set up, and names the account rather than making you match it up yourself. Until then `which` says nothing about switching at all.
 
 Two questions, in that order. **Can this account serve a request at all?** and only then **how soon does its window expire?** Spending the most perishable window first is the right rule — quota does not carry over — but it is exactly the wrong answer for an account Claude is about to refuse.
 
@@ -200,7 +202,7 @@ Account 2 (work)
 Spacing
   Windows should sit 2h30m00s apart.
     account 1 (personal) next window starts 2026-08-11 15:30:00
-    account 2 (work)   next window starts 2026-08-11 13:00:00
+    account 2 (work)     next window starts 2026-08-11 13:00:00
   Spacing is correct.
 ```
 
@@ -261,9 +263,9 @@ The difference is not cosmetic. Three accounts with one out of action, counted a
 Spacing
   Windows should sit 2h30m00s apart — 2 of 3 accounts are holding a window.
     account 1 (personal) next window starts 2026-08-13 01:52:35
-    account 2 (work)   next window starts 2026-08-13 04:22:35
-    account 3 (spare)  not holding a window right now — its weekly limit is spent,
-                       which outlasts its current window
+    account 2 (work)     next window starts 2026-08-13 04:22:35
+    account 3 (spare)    not holding a window right now — its weekly limit is spent,
+                         which outlasts its current window
   Spacing is correct.
 ```
 
@@ -326,7 +328,7 @@ Uninstalling stops the timers and removes every unit, and by default leaves this
 |---|---|
 | `claude_window_timing.py` | The whole tool. |
 | `install.sh` / `uninstall.sh` | Prerequisite checks, then the wizard; and the teardown. |
-| `test_window_timing.py` | Over 830 checks. `python3 test_window_timing.py`. |
+| `test_window_timing.py` | Over 950 checks. `python3 test_window_timing.py`. |
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 
