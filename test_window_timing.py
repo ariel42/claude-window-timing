@@ -197,6 +197,22 @@ def test_refusal_text():
 # Which moment to aim at, given two limits
 # ---------------------------------------------------------------------------
 
+def _refusal_text(epoch, kind="session"):
+    """
+    A refusal message naming `epoch`, in the shape Claude Code produces.
+
+    The weekly one carries a date because a weekly reset can be days away; the
+    session one does not, because a 5-hour one never is.
+    """
+    when = datetime.fromtimestamp(epoch)
+    clock = "{}:{:02d}{}".format((when.hour % 12) or 12, when.minute,
+                                 "pm" if when.hour >= 12 else "am")
+    if kind == "weekly":
+        return "You've hit your weekly limit · resets {} {}, {} ({})".format(
+            when.strftime("%b"), when.day, clock, ZONE)
+    return "You've hit your session limit · resets {} ({})".format(clock, ZONE)
+
+
 def test_next_window_start():
     section("Both limits decide the target -> aim at whichever frees up last")
     now = time.time()
@@ -221,8 +237,13 @@ def test_next_window_start():
           (got[0], got[2]), (FIVE, "5-hour window"))
 
     restore = _pretend_timezone()
-    weekly_text = "You've hit your weekly limit · resets Aug 10, 10pm ({})".format(ZONE)
-    session_text = "You've hit your session limit · resets 9:30pm ({})".format(ZONE)
+    # Built from `now`, because a refusal names a time its own limit could
+    # plausibly reach and a hardcoded one stops doing that as the clock moves.
+    # "resets 9:30pm" was twenty-one hours away when this ran after midnight,
+    # so the check that a 5-hour refusal is read with a 5-hour horizon was
+    # quietly feeding it a time no 5-hour window could have.
+    weekly_text = _refusal_text(now + 3 * 86400, "weekly")
+    session_text = _refusal_text(now + 2 * 3600, "session")
 
     got = ew.next_window_start({}, weekly_text, True)
     check("no statusLine at all: weekly refusal text is used, with a 7-day horizon",
@@ -2607,7 +2628,7 @@ def test_what_a_ping_records_from_how_it_went():
         # Pinned rather than read, so these two run everywhere: a machine
         # whose zone name cannot be read used to skip them silently.
         restore_zone = _pretend_timezone()
-        refusal = "You've hit your session limit · resets 9:30pm ({})".format(ZONE)
+        refusal = _refusal_text(now + 2 * 3600, "session")
         state = ping_with({"completed": True, "limited": True, "text": refusal},
                           {})
         restore_zone()
