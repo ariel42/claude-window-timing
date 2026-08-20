@@ -9,7 +9,7 @@ This puts that timing back under your control. It starts your window before you 
 - **A fresh window every 5/N hours instead of every 5.** Two subscriptions are held 2h30m apart, three 1h40m. Not more quota — quota that arrives when you need it, instead of all at once and then not for hours.
 - **A straight answer to which account to spend.** The window that expires first, skipping any account that cannot serve a request at all — a spent weekly limit, a lapsed plan, an expired sign-in.
 
-It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 4,400 lines of Python standard library and a systemd timer — no dependencies, no daemon, and no network calls of its own.
+It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 4,900 lines of Python standard library and a systemd timer — no dependencies, no daemon, and no network calls of its own.
 
 ---
 
@@ -165,7 +165,7 @@ claude-window status
 ```
 
 ```
-Claude Code Early Window — status
+Claude Code Window Timing — status
 ==================================
 
 Use account 2 (work)
@@ -288,6 +288,7 @@ Answering "no pings" on a machine that has been pinging offers to stop its timer
 | Command | What it does |
 |---|---|
 | `./install.sh [--no-pings] [--accounts N] [-y]` | The setup wizard. Safe to re-run; asks only for what is missing. `--no-pings` sets a machine up to switch accounts without running the pings. |
+| `claude-window setup` | The same wizard, once the launcher exists. Takes the same options. |
 | `claude-window` | Status. Typing it can never spend quota. |
 | `claude-window status [--json]` | What every account is doing, and which to use now. |
 | `claude-window which` | Just the recommendation, and what is unusable. |
@@ -313,7 +314,7 @@ Uninstalling stops the timers and removes every unit, and by default leaves this
 |---|---|
 | `claude_window_timing.py` | The whole tool. |
 | `install.sh` / `uninstall.sh` | Prerequisite checks, then the wizard; and the teardown. |
-| `test_window_timing.py` | Over 720 checks. `python3 test_window_timing.py`. |
+| `test_window_timing.py` | Over 830 checks. `python3 test_window_timing.py`. |
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 

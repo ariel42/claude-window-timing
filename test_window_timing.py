@@ -2515,9 +2515,9 @@ def test_the_log_reads_in_the_order_it_was_written():
             (first, ["[2026-08-13 00:01:43] Turn confirmed: cache_read=6636",
                      "[2026-08-13 00:01:43] Usage: 5-hour 0%",
                      "[2026-08-13 00:01:43] Exited with code: 0",
-                     "[2026-08-13 00:01:43] Early-window run finished.",
+                     "[2026-08-13 00:01:43] Ping run finished.",
                      ""]),
-            (second, ["[2026-08-13 00:02:00] Starting early-window run"])):
+            (second, ["[2026-08-13 00:02:00] Starting ping run"])):
         account.ensure_state_dir()
         with open(account.log_file, "w") as f:
             f.write("\n".join(body) + "\n")
@@ -2532,9 +2532,9 @@ def test_the_log_reads_in_the_order_it_was_written():
 
     check("each run's lines stay in the order they were written",
           shown[:4], ["Turn confirmed: cache_read=6636", "Usage: 5-hour 0%",
-                      "Exited with code: 0", "Early-window run finished."])
+                      "Exited with code: 0", "Ping run finished."])
     check("and later accounts still interleave by time",
-          shown[-1], "Starting early-window run")
+          shown[-1], "Starting ping run")
     check("blank separators are not carried into the merged view",
           [line for line in buf.getvalue().splitlines() if not line.strip()], [])
 
@@ -2707,7 +2707,10 @@ def test_upgrading_keeps_the_existing_checkpoint():
         for name, body in (("early_window_session_id.txt", "old-session"),
                            ("early_window_checkpoint.jsonl.bak", "{}\n"),
                            ("early_window_state.json", '{"boundary": 1}'),
-                           ("claude_window_timing.log", "[x] hello\n")):
+                           # The name the log actually had. Renaming this with
+                           # the rest of the project made the test agree with a
+                           # rewritten constant instead of with history.
+                           ("claude_early_window.log", "[x] hello\n")):
             with open(os.path.join(ew.SCRIPT_DIR, name), "w") as f:
                 f.write(body)
 
@@ -2800,8 +2803,8 @@ def test_doctor_notices_a_deployment_going_wrong():
     # already succeeded still counts as a ping, but skips the state write and the
     # boundary anchor. Comparing the counts is the cheapest way to see it.
     with open(account.log_file, "w") as f:
-        f.write("[x] Starting early-window run\n" * 5)
-        f.write("[x] Early-window run finished\n" * 3)
+        f.write("[x] Starting ping run\n" * 5)
+        f.write("[x] Ping run finished\n" * 3)
     check("unfinished runs are counted", ew._log_run_counts(account), (5, 3))
 
     messages = [f.message for f in ew.validate_accounts([account])]
@@ -4236,6 +4239,39 @@ def test_switching_refuses_what_cannot_possibly_work():
     finally:
         restore()
 
+    # The worst case this command has: ~/.claude.json present but unparseable.
+    # _read_json answers "missing" and "unreadable" identically, so merging
+    # into the result and writing it out would replace the user's projects,
+    # trust decisions and settings with a file holding one key.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            f.write('{"projects": {"/work": {"hasTrustDialog')   # truncated
+        damaged = open(ew.USER_CONFIG_JSON).read()
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("an unparseable config stops the switch", code, 1)
+        check_true("saying what would have been lost",
+                   "projects" in (out + err) and "settings" in (out + err))
+        check("and the file is left exactly as it was",
+              open(ew.USER_CONFIG_JSON).read(), damaged)
+        check("the credential was not swapped either",
+              ew.account_identity(ew.user_login())["has_token"] and
+              json.load(open(ew.credentials_path(ew.user_login())))
+              ["claudeAiOauth"]["refreshToken"], "live-refresh-1")
+
+        # And the write itself refuses, so no other caller can reach it.
+        raised = None
+        try:
+            ew.install_login(ew.switch_store(accounts[1]))
+        except ew.ConfigError as exc:
+            raised = str(exc)
+        check_true("install_login refuses independently of the blocker",
+                   raised and "cannot be parsed" in raised)
+        check("still untouched", open(ew.USER_CONFIG_JSON).read(), damaged)
+    finally:
+        restore()
+
     # A store with a credential but no identity: switching would leave
     # ~/.claude.json naming the account being left while the other is billed.
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
@@ -5262,9 +5298,31 @@ def test_setup_says_the_pings_belong_on_one_machine():
 
 
 def main():
-    # Log somewhere disposable: several decisions are only visible in the log, so
-    # the tests read it, and they should not scribble on the running tool's.
-    ew.STATE_ROOT = tempfile.mkdtemp()
+    # Every path the tool reads or writes is redirected into one disposable
+    # directory before a single test runs.
+    #
+    # Individual tests redirect what they need, but a test that forgets used to
+    # fall through to the real machine: reading the developer's accounts.json,
+    # their installed units, their ~/.claude. That is wrong twice over. It can
+    # touch a working install, and it makes the suite's result depend on the
+    # machine it runs on -- six tests here once failed because the accounts.json
+    # sitting beside them had been edited, which tells a contributor nothing
+    # about the code they just changed.
+    #
+    # Defaulting everything to a sandbox means forgetting is safe. A test that
+    # wants the real thing has to say so.
+    suite_root = tempfile.mkdtemp(prefix="window-timing-tests-")
+    home = os.path.join(suite_root, "home")
+    ew.STATE_ROOT = os.path.join(suite_root, "state")
+    ew.ACCOUNTS_FILE = os.path.join(suite_root, "accounts.json")
+    ew.SCHEDULE_FILE = os.path.join(suite_root, "schedule.json")
+    ew.BIN_DIR = os.path.join(suite_root, "bin")
+    ew.UNIT_DIR = os.path.join(home, ".config", "systemd", "user")
+    ew.USER_CONFIG_DIR = os.path.join(home, ".claude")
+    ew.USER_CONFIG_JSON = os.path.join(home, ".claude.json")
+    ew.SWITCH_ROOT = os.path.join(home, ".claude-switch")
+    os.makedirs(ew.UNIT_DIR)
+    os.makedirs(ew.USER_CONFIG_DIR)
 
     for test in (test_refusal_text, test_next_window_start, test_guard_rails,
                  test_anchor_scheduling, test_statusline_parsing,

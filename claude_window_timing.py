@@ -1,5 +1,5 @@
 """
-Claude Code Early Window
+Claude Code Window Timing
 Keeps a Claude Code usage window rolling in the background so that you start work
 inside a fresh, almost-untouched window. Requires Python 3.6+, Linux, and the
 Claude Code CLI.
@@ -438,7 +438,10 @@ _LEGACY_FILES = (
     ("early_window_checkpoint.jsonl.bak", "checkpoint.jsonl.bak"),
     ("early_window_state.json",           "state.json"),
     ("early_window_statusline.jsonl",     "statusline.jsonl"),
-    ("claude_window_timing.log",           "ping.log"),
+    # Not renamed with the rest: this is the name the file had, on machines
+    # that still have one. Rewriting it to today's name would look tidy and
+    # quietly break the migration it exists to perform.
+    ("claude_early_window.log",           "ping.log"),
 )
 
 
@@ -1912,7 +1915,7 @@ def schedule_anchor(account, target_epoch):
         ["systemd-run", "--user", "--collect",
          "--unit", account.anchor_unit,
          "--description",
-         "Claude Early Window — window-boundary anchor for account "
+         "Claude Window Timing — window-boundary anchor for account "
          + account.name,
          "--on-calendar", stamp,
          "--timer-property=AccuracySec=1s",
@@ -2405,7 +2408,7 @@ def init(account):
 
 
 # ---------------------------------------------------------------------------
-# Early-window run (called by the systemd timer on each interval)
+# The ping run (called by the systemd timer on each interval)
 # ---------------------------------------------------------------------------
 
 def ping(account, accounts=None):
@@ -2429,7 +2432,7 @@ def ping(account, accounts=None):
         write_state(account, state)
         return
 
-    log(account, "Starting early-window run for account {}...".format(
+    log(account, "Starting ping run for account {}...".format(
         account.display))
     ensure_ping_config(account)
 
@@ -2458,7 +2461,7 @@ def ping(account, accounts=None):
     result = run_interactive(account, ["--resume", checkpoint_id], "bye",
                              checkpoint_id)
     if not result["completed"]:
-        log(account, "WARNING: early-window run did not confirm a completed turn.")
+        log(account, "WARNING: ping run did not confirm a completed turn.")
 
     # Clear a hold only once it has actually been served. A hold set for a
     # future boundary — by `realign --confirm`, say — has to survive every
@@ -2529,7 +2532,7 @@ def ping(account, accounts=None):
                           label, state, result["limited"])
     write_state(account, state)
 
-    log(account, "Early-window run finished.\n")
+    log(account, "Ping run finished.\n")
 
 
 def realign(accounts, confirm=False):
@@ -2581,7 +2584,7 @@ def status(accounts):
     now = time.time()
     states = {a.name: read_state(a) for a in accounts}
 
-    print("Claude Code Early Window — status")
+    print("Claude Code Window Timing — status")
     print("=" * 34)
     print()
 
@@ -2953,7 +2956,7 @@ def _user_account_findings(accounts):
         "warning",
         "Your own Claude Code is signed in as {}, which is not one of the "
         "accounts being pinged".format(identity.get("emailAddress") or theirs[:8]),
-        "You are getting no early-window benefit from this tool. " + fix)]
+        "You are getting no benefit from this tool at all. " + fix)]
 
 
 def _log_run_counts(account):
@@ -2962,8 +2965,8 @@ def _log_run_counts(account):
             body = f.read()
     except (IOError, OSError):
         return 0, 0
-    return (body.count("Starting early-window run"),
-            body.count("Early-window run finished"))
+    return (body.count("Starting ping run"),
+            body.count("Ping run finished"))
 
 
 def _read_text(path):
@@ -3175,6 +3178,27 @@ def user_login():
 
 def credentials_path(login):
     return os.path.join(login.config_dir, ".credentials.json")
+
+
+def readable_json(path):
+    """
+    True when `path` is absent, or present and parseable.
+
+    `_read_json` deliberately answers "missing" and "unreadable" the same way,
+    which is right for reading and dangerous for writing: a config that failed
+    to parse comes back as {}, and merging into {} and writing it out replaces
+    the file with whatever few keys were merged. For ~/.claude.json that is the
+    user's projects, trust decisions and settings, gone silently. Anything that
+    rewrites a file it first read has to ask this instead.
+    """
+    if not os.path.exists(path):
+        return True
+    try:
+        with open(path) as f:
+            json.load(f)
+        return True
+    except (IOError, OSError, ValueError):
+        return False
 
 
 def login_fingerprint(login):
@@ -3449,6 +3473,13 @@ def install_login(store):
     with open(credentials_path(store)) as f:
         _write_atomically(credentials_path(user_login()), f.read())
 
+    # Never merge into a file that failed to parse: {} plus a few keys, written
+    # out, is the user's configuration replaced. The blocker above catches this
+    # first; this is here so that it cannot be reached by any other route.
+    if not readable_json(USER_CONFIG_JSON):
+        raise ConfigError(
+            "{} cannot be parsed; refusing to overwrite it".format(
+                USER_CONFIG_JSON))
     config = _read_json(USER_CONFIG_JSON)
     identity = (_read_json(store.config_json).get("oauthAccount") or {})
     if identity:
@@ -3612,6 +3643,15 @@ def switch_blockers(accounts, account, usable=None):
             "Refresh tokens rotate, so the two would take turns invalidating "
             "each other and one of them would be signed out. Sign in again so "
             "the store holds its own: {}".format(sign_in_command(store))))
+
+    if not readable_json(USER_CONFIG_JSON):
+        findings.append(Finding(
+            "error",
+            "{} exists but cannot be parsed".format(USER_CONFIG_JSON),
+            "Switching rewrites that file, and rewriting one it cannot read "
+            "would replace your projects, trust decisions and settings with "
+            "almost nothing. Repair or move it first — Claude Code will "
+            "rebuild what it needs."))
 
     target = credentials_path(user_login())
     if os.path.islink(target):
@@ -3968,8 +4008,8 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
     """The whole first-run experience. Safe to re-run at any time."""
     global ASSUME_YES
     ASSUME_YES = assume_yes
-    print("Claude Code Early Window — setup")
-    print("=" * 32)
+    print("Claude Code Window Timing — setup")
+    print("=" * 33)
     print()
 
     try:
@@ -4273,7 +4313,7 @@ UNIT_DIR = os.path.join(HOME, ".config", "systemd", "user")
 UNIT_PREFIXES = ("claude-window-timing", "claude-early-window")
 
 _SERVICE_UNIT = """[Unit]
-Description=Claude Code Early Window — ping for account %i
+Description=Claude Code Window Timing — ping for account %i
 
 [Service]
 Type=oneshot
@@ -4287,7 +4327,7 @@ WantedBy=default.target
 """
 
 _TIMER_UNIT = """[Unit]
-Description=Claude Code Early Window — ping account %i every {interval} minutes
+Description=Claude Code Window Timing — ping account %i every {interval} minutes
 
 [Timer]
 # OnActiveSec fires shortly after the timer starts; OnUnitActiveSec then repeats
@@ -4693,7 +4733,7 @@ def show_log(accounts, name, lines, follow):
         return 1
     # Timestamp first, then each file's own order. Sorting whole lines would
     # alphabetise everything that shares a second — and a run writes several
-    # lines a second, so "Early-window run finished" would print before the
+    # lines a second, so "Ping run finished" would print before the
     # "Exited with code" it followed.
     entries.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
     width = max(len(a.name) for a in chosen)
