@@ -1672,7 +1672,7 @@ def statusline_records(account):
     """
     records = []
     try:
-        with open(account.statusline_file) as f:
+        with open(account.statusline_file, errors="replace") as f:
             for line in f:
                 try:
                     records.append(json.loads(line))
@@ -2340,7 +2340,9 @@ def _assistant_entries(account, session_id):
     if not os.path.exists(path):
         return []
     entries, seen = [], set()
-    with open(path) as f:
+    # Read while Claude Code is still writing it, so a partial line -- or a
+    # partial character -- is an ordinary state rather than a failure.
+    with open(path, errors="replace") as f:
         for line in f:
             try:
                 obj = json.loads(line)
@@ -2418,7 +2420,7 @@ def restore_checkpoint(account, session_id):
     # a checkpoint taken under an older layout usable under a newer one without
     # asking the user to re-initialise (which would cost a window).
     written = 0
-    with open(account.checkpoint_backup) as src, \
+    with open(account.checkpoint_backup, errors="replace") as src, \
             open(_session_file(account, session_id), "w") as dst:
         for line in src:
             stripped = line.strip()
@@ -3583,20 +3585,24 @@ def _launcher_findings():
 
 
 def _log_run_counts(account):
-    try:
-        with open(account.log_file) as f:
-            body = f.read()
-    except (IOError, OSError):
-        return 0, 0
+    body = _read_text(account.log_file)
     return (body.count("Starting ping run"),
             body.count("Ping run finished"))
 
 
 def _read_text(path):
+    """
+    A file's contents, or "" — never an exception, whatever is in it.
+
+    `errors="replace"` because these are files that can be half-written: a
+    checkpoint id, a unit, a log. A byte no decoder recognises is a corrupt
+    file, and a corrupt file is a thing to report rather than a thing to crash
+    `status` with — which is what a UnicodeDecodeError out of here did.
+    """
     try:
-        with open(path) as f:
+        with open(path, errors="replace") as f:
             return f.read()
-    except (IOError, OSError):
+    except (IOError, OSError, ValueError):
         return ""
 
 
@@ -6097,7 +6103,7 @@ def show_log(accounts, name, lines, follow):
     entries = []
     for account in chosen:
         try:
-            with open(account.log_file) as f:
+            with open(account.log_file, errors="replace") as f:
                 for position, line in enumerate(f):
                     if not line.strip():
                         continue        # run separators; nothing to interleave

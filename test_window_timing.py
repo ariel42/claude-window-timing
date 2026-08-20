@@ -3020,6 +3020,80 @@ def test_an_unusable_account_is_still_pinged():
           sorted(stoppers), ["install_units", "uninstall"])
 
 
+def test_a_corrupt_file_is_read_as_corrupt_and_not_as_a_crash():
+    """
+    Every file this tool reads can be half-written: a machine that lost power
+    mid-ping, a disk that filled, a checkpoint copied while it was being
+    written. JSON already answers "unreadable" the same way it answers
+    "missing", but the plain-text reads did not — a session id with one
+    undecodable byte in it took `status` down with a UnicodeDecodeError, on a
+    command whose entire job is to tell you what is wrong.
+
+    Every file, one at a time, filled with bytes no decoder will accept.
+    """
+    section("A corrupt file is read as corrupt, not as a crash")
+    root = tempfile.mkdtemp()
+    saved = (ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.ACCOUNTS_FILE, ew.UNIT_DIR,
+             ew._systemctl, ew._run)
+
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+
+    try:
+        ew.STATE_ROOT = os.path.join(root, "state")
+        ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
+        ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
+        ew.UNIT_DIR = os.path.join(root, "units")
+        os.makedirs(ew.UNIT_DIR)
+        ew._systemctl = lambda *a: Ok()
+        ew._run = lambda cmd: Ok()
+        account = ew.Account("1", os.path.join(root, "cfg-1"), 0)
+        account.ensure_state_dir()
+        now = time.time()
+        ew.write_state(account, {"last_run": now - 60, "available_at": now - 60,
+                                 "rate_limits": {"five_hour": {
+                                     "resets_at": now + 900,
+                                     "used_percentage": 10}}})
+        for path, body in ((account.session_id_file, "sess-1234\n"),
+                           (account.checkpoint_backup, '{"type":"user"}\n'),
+                           (account.log_file, "[2026-08-11 10:00:00] hi\n"),
+                           (account.statusline_file, '{"cost":{}}\n')):
+            with open(path, "w") as f:
+                f.write(body)
+        ew.publish_schedule([account])
+        unit = os.path.join(ew.UNIT_DIR, "claude-window-timing@.service")
+        with open(unit, "w") as f:
+            f.write("[Service]\nEnvironment=PATH=/usr/bin\n")
+
+        rubbish = b"\xff\xfe not text at all \x00\x80\n"
+        commands = (("status", lambda: ew.status([account])),
+                    ("which", lambda: ew.which([account])),
+                    ("status --json", lambda: ew.status_json([account])),
+                    ("doctor", lambda: ew.doctor([account])),
+                    ("log", lambda: ew.show_log([account], None, 5, False)))
+        for path in (account.session_id_file, account.checkpoint_backup,
+                     account.log_file, account.statusline_file,
+                     account.state_file, ew.SCHEDULE_FILE, unit):
+            keep = open(path, "rb").read()
+            with open(path, "wb") as f:
+                f.write(rubbish)
+            for name, run in commands:
+                try:
+                    _capture(run)
+                    crashed = ""
+                except Exception as e:                # noqa: BLE001 - the point
+                    crashed = "{}: {}".format(type(e).__name__, e)
+                check("{} survives a corrupt {}".format(
+                    name, os.path.basename(path)), crashed, "")
+            with open(path, "wb") as f:
+                f.write(keep)
+    finally:
+        (ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.ACCOUNTS_FILE, ew.UNIT_DIR,
+         ew._systemctl, ew._run) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_the_log_reads_in_the_order_it_was_written():
     """
     The merged log is a record of what happened, so its order has to be the
@@ -7211,6 +7285,7 @@ def main():
                  test_two_pings_at_once_do_not_tread_on_each_other,
                  test_a_hold_suppresses_the_ping_and_nothing_else,
                  test_an_unusable_account_is_still_pinged,
+                 test_a_corrupt_file_is_read_as_corrupt_and_not_as_a_crash,
                  test_the_log_reads_in_the_order_it_was_written,
                  test_setup_lays_accounts_out_sensibly,
                  test_setup_and_init_refuse_the_obviously_wrong,
