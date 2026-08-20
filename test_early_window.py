@@ -4906,6 +4906,62 @@ def test_the_installer_insists_on_claude_code_in_both_modes():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_a_machine_without_systemd_can_still_install_the_switcher():
+    """
+    The prerequisite that has to wait for an answer.
+
+    systemd runs the pings and nothing else, so whether it is required depends
+    on a question the shell script has not asked yet. Deciding it from the
+    --no-pings flag turned away a machine that had no systemd and no intention
+    of pinging -- refusing an install over a component it would never use.
+    """
+    section("A machine without systemd can still install the switcher")
+
+    real = ew._command_exists
+    try:
+        ew._command_exists = lambda name: name not in ("systemctl", "systemd-run")
+
+        check("nothing stops a machine that will not ping",
+              ew.systemd_blockers(pings=False), [])
+
+        blockers = ew.systemd_blockers(pings=True)
+        check("but pinging without systemd is an error",
+              [f.level for f in blockers], ["error"])
+        check_true("that offers the install which would work",
+                   "--no-pings" in blockers[0].hint)
+
+        # systemd present but systemd-run missing: the pings still work, only
+        # the boundary correction is lost, so it must not stop the install.
+        ew._command_exists = lambda name: name != "systemd-run"
+        blockers = ew.systemd_blockers(pings=True)
+        check("a missing systemd-run is only a warning",
+              [f.level for f in blockers], ["warning"])
+        check_true("and says what still works",
+                   "still run" in blockers[0].hint)
+
+        ew._command_exists = lambda name: True
+        check("a complete machine has nothing to report",
+              ew.systemd_blockers(pings=True), [])
+    finally:
+        ew._command_exists = real
+
+    # End to end: the wizard stops before writing anything.
+    root = tempfile.mkdtemp()
+    saved = (ew.ACCOUNTS_FILE, ew._command_exists)
+    try:
+        ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
+        ew._command_exists = lambda name: name != "systemctl"
+        out, _, code = _capture(
+            lambda: ew.setup(argv_accounts=2, pings=True, assume_yes=True))
+        check("choosing the pings without systemd stops the wizard", code, 1)
+        check("and it wrote no configuration on the way out",
+              os.path.exists(ew.ACCOUNTS_FILE), False)
+        check_true("having said which install would work", "--no-pings" in out)
+    finally:
+        (ew.ACCOUNTS_FILE, ew._command_exists) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_the_first_switch_on_a_machine_that_has_never_run_claude_code():
     """
     Someone can install this before ever signing in to Claude Code — indeed
@@ -5236,6 +5292,7 @@ def main():
                  test_a_machine_can_be_told_it_does_not_ping,
                  test_the_wizard_asks_for_each_sign_in_once_and_no_more,
                  test_the_installer_insists_on_claude_code_in_both_modes,
+                 test_a_machine_without_systemd_can_still_install_the_switcher,
                  test_the_first_switch_on_a_machine_that_has_never_run_claude_code,
                  test_a_switch_only_machine_knows_which_account_it_is_on,
                  test_doctor_on_a_switch_only_machine_reports_only_what_applies,

@@ -28,35 +28,12 @@ EOF
 CLAUDE_BIN="$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")"
 if [ ! -x "$CLAUDE_BIN" ]; then
     echo "ERROR: Claude Code CLI not found." >&2
+    echo "       Required on every machine this runs on — for running the pings," >&2
+    echo "       and for switching accounts on a machine that does not ping." >&2
+    echo "       Required even if you only ever use Claude Code through the" >&2
+    echo "       editor extension." >&2
     echo "       Install it from: https://claude.ai/download" >&2
     exit 1
-fi
-
-# systemd is what runs the pings. A machine that only switches accounts has no
-# timers, so requiring it there would turn a working setup into an error for a
-# component it never uses.
-WANTS_PINGS=1
-for arg in "$@"; do
-    [ "$arg" = "--no-pings" ] && WANTS_PINGS=0
-done
-
-if [ "$WANTS_PINGS" = "1" ]; then
-    if ! command -v systemctl &>/dev/null; then
-        echo "ERROR: systemctl not found — running the pings requires systemd." >&2
-        echo "       To set this machine up for switching accounts only:" >&2
-        echo "           ./install.sh --no-pings" >&2
-        exit 1
-    fi
-
-    # systemd-run creates the one-shot anchors that re-align each schedule with
-    # its real window boundary. Without it the tool still pings on its fixed
-    # cadence; it just cannot correct its phase after a missed ping, or hold an
-    # account back to space the accounts out.
-    if ! command -v systemd-run &>/dev/null; then
-        echo "WARNING: systemd-run not found — boundary anchoring and spacing will"
-        echo "         be disabled."
-        echo ""
-    fi
 fi
 
 exec python3 "$SCRIPT_DIR/claude_early_window.py" setup "$@"

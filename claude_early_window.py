@@ -3889,6 +3889,42 @@ def _ask_yes(prompt, default=True):
     return answer.startswith("y")
 
 
+def _command_exists(name):
+    """Whether `name` is on PATH. A seam, so the tests can pretend it is not."""
+    return bool(shutil.which(name))
+
+
+def systemd_blockers(pings):
+    """
+    What stops this machine running the pings, as Findings. Empty if nothing.
+
+    Checked here rather than in install.sh because the answer depends on a
+    question install.sh has not asked yet. Deciding it from the --no-pings flag
+    alone turned a machine without systemd away even when its owner was about
+    to say they did not want the pings — a prerequisite refusing an install
+    that would never have used it.
+    """
+    if not pings:
+        return []
+    findings = []
+    if not _command_exists("systemctl"):
+        findings.append(Finding(
+            "error",
+            "Running the pings needs systemd, and systemctl was not found",
+            "This machine can still switch accounts, which needs no timers: "
+            "re-run with ./install.sh --no-pings"))
+    elif not _command_exists("systemd-run"):
+        # Not fatal: the pings still run on their fixed cadence. What is lost
+        # is the correction that puts a schedule back on its window boundary.
+        findings.append(Finding(
+            "warning",
+            "systemd-run was not found, so boundary anchoring and spacing "
+            "will be disabled",
+            "The pings still run every {} minutes; they just cannot correct "
+            "their phase after a missed one.".format(INTERVAL_MIN)))
+    return findings
+
+
 def sign_ins_needed(accounts, pings):
     """
     Every directory on this machine still needing a browser sign-in.
@@ -3980,6 +4016,13 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
         print("which needs no timers and spends nothing.")
         print()
         pings = _ask_yes("Run the pings from this machine?", default=pings_here())
+
+    blockers = systemd_blockers(pings)
+    if blockers:
+        print()
+        report_findings(blockers)
+        if any(f.level == "error" for f in blockers):
+            return 1
 
     print()
     print("Layout:")

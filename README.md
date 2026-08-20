@@ -139,7 +139,9 @@ cd claude-early-window
 ./install.sh
 ```
 
-Claude Code itself must already be installed — on every machine, including the ones that only switch, because signing in to an account *is* running `claude` and signing in. The installer stops and says so if it is missing. You do **not** need to be signed in to anything first.
+Claude Code itself must already be installed — on every machine, including the ones that only switch, and including when you only ever use it through the editor extension. The installer stops and says so if it is missing. You do **not** need to be signed in to anything first.
+
+systemd is only needed on the machine that runs the pings, and that question is asked before it is checked, so a machine without it can still install the switcher.
 
 The wizard asks how many accounts you have and whether this machine should run the pings, shows the directories it will create, walks you through signing in to each, creates one background conversation per account, and starts a timer for each. Re-run it any time — adding an account, or changing your mind about the pings, is just running it again. It asks only for the sign-ins that are still missing, so a re-run costs nothing you have already done.
 
