@@ -368,6 +368,79 @@ def test_anchor_scheduling():
     check("cancelling removes the unit", _anchor_timer_count(account), 0)
 
 
+def test_the_anchor_names_an_instant_that_exists():
+    """
+    Twice a year a local wall clock is not a way to name a moment.
+
+    In the autumn hour that happens twice, systemd takes the first of the two
+    and the anchor fires an hour early — inside the window it was meant to end,
+    achieving nothing. In the spring hour that never happens at all,
+    `systemd-analyze calendar "2027-03-14 02:30:00"` in New York answers "Next
+    elapse: never", and the one correction the schedule depends on silently
+    does not happen.
+
+    So the moment is handed over in UTC, which has neither hour. Old systemd
+    may not take a timezone on a calendar spec, so the local form stays as a
+    fallback — tried second, and only if the first is refused.
+    """
+    section("The anchor names an instant that exists")
+    account = temp_account()
+    saved = ew._run
+    calls = []
+
+    class Result(object):
+        def __init__(self, code):
+            self.returncode, self.stdout = code, "no"
+
+    def booked():
+        """The moments handed to systemd-run, in the order they were tried."""
+        return [call[call.index("--on-calendar") + 1] for call in calls
+                if call and call[0] == "systemd-run"]
+
+    try:
+        # `cancel_anchor` runs first and goes through the same door, so only
+        # the bookings themselves are counted here.
+        ew._run = lambda cmd: calls.append(cmd) or Result(0)
+        target = time.time() + 900
+        ew.schedule_anchor(account, target)
+        check_true("the moment is given in UTC", booked()[-1].endswith(" UTC"))
+        check("and it is the moment asked for", booked()[-1],
+              datetime.fromtimestamp(target, ew.timezone.utc).strftime(
+                  "%Y-%m-%d %H:%M:%S UTC"))
+        check("one attempt is all a working systemd costs", len(booked()), 1)
+
+        # An older systemd that will not take a timezone suffix.
+        del calls[:]
+        refusals = [1]
+
+        def old_systemd(cmd):
+            """Refuses the first booking, the way a systemd without timezone
+            support in calendar specs refuses one."""
+            calls.append(cmd)
+            if cmd[0] == "systemd-run" and refusals:
+                refusals.pop()
+                return Result(1)
+            return Result(0)
+
+        ew._run = old_systemd
+        check_true("a refusal is retried", ew.schedule_anchor(account, target))
+        check("the second attempt is the local wall clock, as before",
+              booked()[-1],
+              ew._system_local(target).strftime("%Y-%m-%d %H:%M:%S"))
+        check("and nothing beyond those two is tried", len(booked()), 2)
+
+        del calls[:]
+        ew._run = lambda cmd: calls.append(cmd) or Result(
+            1 if cmd[0] == "systemd-run" else 0)
+        check("both refused is a failure, reported once",
+              ew.schedule_anchor(account, target), False)
+        check("having tried each form exactly once", len(booked()), 2)
+        check_true("having said so in the log",
+                   "could not schedule anchor" in open(account.log_file).read())
+    finally:
+        ew._run = saved
+
+
 def test_the_anchor_is_booked_in_the_zone_systemd_reads():
     """
     The anchor is a wall-clock instruction handed to systemd, which reads it in
@@ -7014,6 +7087,7 @@ def main():
     for test in (test_refusal_text, test_next_window_start, test_guard_rails,
                  test_anchor_scheduling,
                  test_the_anchor_is_booked_in_the_zone_systemd_reads,
+                 test_the_anchor_names_an_instant_that_exists,
                  test_statusline_parsing,
                  test_an_impossible_usage_report_is_ignored,
                  test_a_checkpoint_from_another_directory_is_rebuilt,

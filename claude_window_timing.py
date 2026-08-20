@@ -37,7 +37,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
 # Paths — all derived from the script's own location, no hardcoded user paths
@@ -2223,29 +2223,43 @@ def schedule_anchor(account, target_epoch):
     monotonic timers do not advance while the machine is suspended, which is one
     of the very situations this is meant to recover from.
 
+    The moment is given in UTC, because a local wall clock is not a reliable
+    way to name an instant twice a year. In the autumn hour that happens twice,
+    systemd takes the first of the two and the ping lands inside the window it
+    was meant to end; in the spring hour that never happens at all,
+    `systemd-analyze` answers "Next elapse: never" and the correction simply
+    does not occur -- on a machine whose whole schedule depends on it. Older
+    systemd may not accept a timezone on a calendar spec, so the local form is
+    kept as a fallback rather than as the default.
+
     The anchor starts the ping service with --no-block so it finishes immediately
     instead of waiting for the ping to return. Otherwise the anchor unit would
     still be active *during* the run it triggered, and that run deciding it needs
     another anchor would end up trying to cancel its own parent.
     """
     cancel_anchor(account)
-    stamp = _system_local(target_epoch).strftime("%Y-%m-%d %H:%M:%S")
-    result = _run(
-        ["systemd-run", "--user", "--collect",
-         "--unit", account.anchor_unit,
-         "--description",
-         "Claude Window Timing — window-boundary anchor for account "
-         + account.name,
-         "--on-calendar", stamp,
-         "--timer-property=AccuracySec=1s",
-         "systemctl", "--user", "start", "--no-block", account.service_unit])
-    if result.returncode != 0:
-        log(account, "WARNING: could not schedule anchor: {}".format(
-            (result.stdout or "").strip()))
-        return False
-    log(account, "Anchor scheduled for {} (in {})".format(
-        stamp, fmt_delta(target_epoch - time.time())))
-    return True
+    stamps = (datetime.fromtimestamp(target_epoch, timezone.utc).strftime(
+                  "%Y-%m-%d %H:%M:%S UTC"),
+              _system_local(target_epoch).strftime("%Y-%m-%d %H:%M:%S"))
+    result = None
+    for stamp in stamps:
+        result = _run(
+            ["systemd-run", "--user", "--collect",
+             "--unit", account.anchor_unit,
+             "--description",
+             "Claude Window Timing — window-boundary anchor for account "
+             + account.name,
+             "--on-calendar", stamp,
+             "--timer-property=AccuracySec=1s",
+             "systemctl", "--user", "start", "--no-block",
+             account.service_unit])
+        if result.returncode == 0:
+            log(account, "Anchor scheduled for {} (in {})".format(
+                stamp, fmt_delta(target_epoch - time.time())))
+            return True
+    log(account, "WARNING: could not schedule anchor: {}".format(
+        (result.stdout or "").strip() if result else "no answer"))
+    return False
 
 
 def maybe_schedule_anchor(account, boundary, horizon, label, state, was_limited):
