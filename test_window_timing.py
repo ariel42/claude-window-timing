@@ -4122,16 +4122,307 @@ def test_an_interrupted_switch_never_leaves_a_login_in_two_places():
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
     try:
         store = ew.switch_store(accounts[0])
-        os.makedirs(store.config_dir, exist_ok=True)
+        ew.secure_dir(store.config_dir)          # 0700, or the mode check fires too
         shutil.copyfile(ew.credentials_path(ew.user_login()),
                         ew.credentials_path(store))
         findings = ew.switch_findings(accounts)
-        check("a store holding the live login is an error",
-              [f.level for f in findings], ["error"])
+        errors = [f for f in findings if f.level == "error"]
+        check("a store holding the live login is an error", len(errors), 1)
         check_true("that says what happens and when",
-                   "eight hours" in findings[0].hint)
+                   "eight hours" in errors[0].hint)
     finally:
         restore()
+
+
+def test_the_schedule_is_treated_as_input_not_configuration():
+    """
+    `schedule.json` is copied between machines, so it arrives from elsewhere.
+    `parse_accounts` validates names before they reach a path; nothing
+    validated these, and a switch target taken from the file supplied both its
+    store path and the identity used to check it.
+    """
+    section("The schedule is input, not configuration")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",),
+                                              pings=False)
+    try:
+        now = time.time()
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"window_hours": 5, "written_at": now, "accounts": [
+                {"name": "../../../tmp/elsewhere", "account_uuid": "u",
+                 "config_dir": "/tmp/anywhere", "usable_now": True,
+                 "tier": "usable", "last_run": now - 60,
+                 "expires_at": now + 60, "window_phase": 0},
+                {"name": "2", "account_uuid": "uuid-2", "usable_now": True,
+                 "tier": "usable", "last_run": now - 60,
+                 "expires_at": now + 900, "window_phase": 0}]}, f)
+
+        view = ew.schedule_view(accounts)
+        names = [a.name for a in view[0]]
+        check("a name that is not a name is dropped", names, ["2"])
+        check("and no config_dir is taken from the file",
+              [a.config_dir for a in view[0]],
+              [ew.ping_config_dir("2")])
+
+        # A target the local accounts.json does not configure is refused
+        # outright rather than trusted from the file.
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"window_hours": 5, "written_at": now, "accounts": [
+                {"name": "9", "account_uuid": "u9", "usable_now": True,
+                 "tier": "usable", "last_run": now - 60,
+                 "expires_at": now + 60, "window_phase": 0}]}, f)
+        raised = None
+        try:
+            _capture(lambda: ew.switch_account(accounts, None, sign_in=False))
+        except ew.ConfigError as exc:
+            raised = str(exc)
+        check_true("an unconfigured account cannot be switched to", raised)
+    finally:
+        restore()
+
+
+def test_the_refusals_fire_where_the_readme_says_to_switch():
+    """
+    Two of the five advertised refusals compared the parked login against the
+    *ping* directory. On a --no-pings machine -- the configuration the README
+    recommends for every laptop -- there is no ping directory, so both checks
+    silently passed. And the copied-login check never looked at the login that
+    is live right now, though `doctor` did.
+    """
+    section("The refusals fire on switch-only machines")
+
+    # Wrong account parked, on a machine with no ping directories at all.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",),
+                                              pings=False)
+    try:
+        now = time.time()
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"window_hours": 5, "written_at": now, "accounts": [
+                {"name": "1", "account_uuid": "uuid-1", "usable_now": True,
+                 "tier": "usable", "last_run": now - 60, "expires_at": now + 60,
+                 "window_phase": 0},
+                {"name": "2", "account_uuid": "uuid-2", "usable_now": True,
+                 "tier": "usable", "last_run": now - 60, "expires_at": now + 60,
+                 "window_phase": 0}]}, f)
+        store = ew.switch_store(accounts[1])
+        config = json.load(open(store.config_json))
+        config["oauthAccount"] = {"accountUuid": "uuid-stranger",
+                                  "emailAddress": "stranger@example.com"}
+        with open(store.config_json, "w") as f:
+            json.dump(config, f)
+
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("a store signed in as the wrong account is refused here too", code, 1)
+        check_true("naming who it actually is", "stranger@example.com" in err)
+    finally:
+        restore()
+
+    # A store that is a copy of the login live in ~/.claude right now.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        store = ew.switch_store(accounts[1])
+        shutil.copyfile(ew.credentials_path(ew.user_login()),
+                        ew.credentials_path(store))
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("a copy of the live login is refused by switch, not just doctor",
+              code, 1)
+        check_true("with the eight hours spelled out", "eight hours" in err)
+    finally:
+        restore()
+
+
+def test_an_override_is_reported_before_anything_reassuring():
+    """
+    `ANTHROPIC_API_KEY` decides which account is billed whatever this command
+    does. The early "you are already signed in as that account" return skipped
+    every blocker, so it reassured the user while their requests went to a
+    pay-as-you-go account.
+    """
+    section("An override outranks every reassurance")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    saved = os.environ.get("ANTHROPIC_API_KEY")
+    try:
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "1",
+                                                            sign_in=False))
+        check("switching to the account already in use still refuses", code, 1)
+        check_true("naming the variable", "ANTHROPIC_API_KEY" in err)
+        check("and does not claim you are already on it",
+              "already signed in" in out, False)
+    finally:
+        if saved is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved
+        restore()
+
+
+def test_doctor_notices_a_timer_running_the_wrong_script():
+    """
+    `is-enabled` and the next elapse stay true when the script a unit names has
+    moved or been deleted, so an install can be enabled, scheduled, and failing
+    every time. Renaming the checkout does it; so does a second clone taking
+    over the shared template.
+    """
+    section("Doctor notices a timer running the wrong script")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1")
+    try:
+        check("nothing to say when no units are installed",
+              ew.unit_target_findings(), [])
+
+        unit = os.path.join(ew.UNIT_DIR, "claude-window-timing@.service")
+        with open(unit, "w") as f:
+            f.write("[Service]\nExecStart=/usr/bin/python3 "
+                    "/gone/claude_window_timing.py ping %i\n")
+        findings = ew.unit_target_findings()
+        check("a unit running a deleted script is an error",
+              [f.level for f in findings], ["error"])
+        check_true("saying every ping is failing",
+                   "Every ping is failing" in findings[0].hint)
+
+        other = os.path.join(home, "other_checkout.py")
+        open(other, "w").close()
+        with open(unit, "w") as f:
+            f.write("[Service]\nExecStart=/usr/bin/python3 {} ping %i\n".format(other))
+        findings = ew.unit_target_findings()
+        check("a unit owned by another checkout is a warning",
+              [f.level for f in findings], ["warning"])
+        check_true("explaining what taking it over would do",
+                   "take them over" in findings[0].hint)
+
+        with open(unit, "w") as f:
+            f.write("[Service]\nExecStart=/usr/bin/python3 {} ping %i\n".format(
+                os.path.abspath(ew.__file__)))
+        check("a unit pointing here is fine", ew.unit_target_findings(), [])
+    finally:
+        restore()
+
+
+def test_a_credential_directory_is_never_left_wide():
+    """
+    os.makedirs applies its mode to the leaf only, so every intermediate landed
+    at 0775. The credential inside was 0600 and substitutable anyway: directory
+    write permission decides who can replace a file.
+    """
+    section("Credential directories are never left wide")
+
+    root = tempfile.mkdtemp()
+    try:
+        deep = os.path.join(root, "switch", "sub")
+        os.makedirs(deep)                       # default mode, as before
+        os.chmod(os.path.dirname(deep), 0o775)
+        os.chmod(deep, 0o775)
+        ew.secure_dir(os.path.dirname(deep))
+        ew.secure_dir(deep)
+        check("an existing wide directory is tightened",
+              [oct(stat.S_IMODE(os.stat(d).st_mode))
+               for d in (os.path.dirname(deep), deep)], ["0o700", "0o700"])
+
+        fresh = os.path.join(root, "fresh")
+        ew.secure_dir(fresh)
+        check("and a new one is created tight",
+              oct(stat.S_IMODE(os.stat(fresh).st_mode)), "0o700")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_the_mutation_path_is_hardened():
+    """
+    The invariant used to be enforced by ordering alone, and ordering is what a
+    crash, a Ctrl-C, a second terminal or a live session removes. These are the
+    defences that do not depend on getting there first.
+    """
+    section("The mutation path is hardened")
+
+    # -- every refusal precedes every write ---------------------------------
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        before = open(ew.credentials_path(ew.user_login())).read()
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            f.write('{"projects": {"broken')
+        raised = None
+        try:
+            ew.install_login(ew.switch_store(accounts[1]))
+        except ew.ConfigError as exc:
+            raised = str(exc)
+        check_true("install_login refuses an unreadable config", raised)
+        check("and the credential was NOT swapped first",
+              open(ew.credentials_path(ew.user_login())).read(), before)
+        check("the parked login is still in its store",
+              os.path.exists(ew.credentials_path(ew.switch_store(accounts[1]))),
+              True)
+    finally:
+        restore()
+
+    # -- two switches cannot run at once ------------------------------------
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        held = ew.acquire_switch_lock()
+        check_true("a lock can be taken", held is not None)
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("a second switch refuses while one is running", code, 1)
+        check_true("and says why", "Another switch is already running" in err)
+        check("nothing was moved", ew.account_identity(ew.user_login())["email"],
+              "a1@example.com")
+        os.close(held)
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("once released it proceeds", code, 0)
+    finally:
+        restore()
+
+    # -- a login that cannot be parked is kept where nothing deletes it -----
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        config = json.load(open(ew.USER_CONFIG_JSON))
+        config["oauthAccount"] = {"accountUuid": "uuid-stranger",
+                                  "emailAddress": "who@example.com"}
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            json.dump(config, f)
+        stranded = open(ew.credentials_path(ew.user_login())).read()
+
+        out, _, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                          sign_in=False))
+        check("the switch happens", code, 0)
+        check_true("and says where the unparkable login is kept",
+                   "never pruned" in out)
+
+        orphans = os.path.join(ew.SWITCH_ROOT, ".orphaned")
+        kept = sorted(os.listdir(orphans))
+        check("it is on disk", len(kept), 1)
+        check("byte for byte",
+              open(os.path.join(orphans, kept[0], ".credentials.json")).read(),
+              stranded)
+
+        # The half the suite never joined: pruning must not reach it.
+        backups = os.path.join(ew.SWITCH_ROOT, ".backups")
+        for n in range(ew.SWITCH_BACKUPS_KEPT + 5):
+            os.makedirs(os.path.join(backups, "20200101-0000%02d" % n),
+                        exist_ok=True)
+        ew._prune_backups()
+        check("backups are pruned",
+              len(os.listdir(backups)) <= ew.SWITCH_BACKUPS_KEPT, True)
+        check("the stranded login is untouched by pruning",
+              sorted(os.listdir(orphans)), kept)
+    finally:
+        restore()
+
+    # -- a credential is never on disk at a wider mode, even briefly --------
+    root = tempfile.mkdtemp()
+    saved_umask = os.umask(0o022)
+    try:
+        path = os.path.join(root, ".credentials.json")
+        ew._write_atomically(path, '{"claudeAiOauth": {}}')
+        check("credentials are created at 0600, not widened afterwards",
+              oct(stat.S_IMODE(os.stat(path).st_mode)), "0o600")
+    finally:
+        os.umask(saved_umask)
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_a_failure_mid_switch_is_a_sentence_not_a_traceback():
@@ -5467,6 +5758,12 @@ def main():
                  test_doctor_notices_a_deployment_going_wrong,
                  test_a_login_is_never_in_two_places_at_once,
                  test_an_interrupted_switch_never_leaves_a_login_in_two_places,
+                 test_the_schedule_is_treated_as_input_not_configuration,
+                 test_the_refusals_fire_where_the_readme_says_to_switch,
+                 test_an_override_is_reported_before_anything_reassuring,
+                 test_doctor_notices_a_timer_running_the_wrong_script,
+                 test_a_credential_directory_is_never_left_wide,
+                 test_the_mutation_path_is_hardened,
                  test_a_failure_mid_switch_is_a_sentence_not_a_traceback,
                  test_the_token_and_the_identity_move_together,
                  test_switching_refuses_what_cannot_possibly_work,

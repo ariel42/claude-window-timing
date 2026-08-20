@@ -22,6 +22,7 @@ run `python3 claude_window_timing.py <command>` directly.
 
 import argparse
 import collections
+import fcntl
 import hashlib
 import json
 import os
@@ -247,8 +248,8 @@ class Account(object):
         return "{} ({})".format(self.name, self.label) if self.label else self.name
 
     def ensure_state_dir(self):
-        if not os.path.isdir(self.state_dir):
-            os.makedirs(self.state_dir, 0o700)
+        secure_dir(STATE_ROOT)
+        secure_dir(self.state_dir)
 
     def __repr__(self):
         return "<Account {} at {}>".format(self.name, self.config_dir)
@@ -821,8 +822,17 @@ def schedule_view(accounts):
     for index, entry in enumerate(document["accounts"]):
         if not isinstance(entry, dict) or not entry.get("name"):
             continue
-        account = Account(str(entry["name"]), entry.get("config_dir"), index,
-                          entry.get("label") or "")
+        # This file arrives from another machine -- the README says to copy it
+        # across -- so it is input, not configuration. `parse_accounts` applies
+        # this rule to accounts.json and nothing applied it here, which let a
+        # name like "../../elsewhere" out of SWITCH_ROOT and a config_dir point
+        # anywhere at all. The name is checked; the directory is ignored
+        # entirely, because a path from another machine cannot mean anything
+        # useful on this one.
+        name = str(entry["name"])
+        if not _NAME_RE.match(name):
+            continue
+        account = Account(name, None, index, str(entry.get("label") or "")[:40])
         published.append(account)
         states[account.name] = {
             "last_run": entry.get("last_run"),
@@ -2810,6 +2820,7 @@ def doctor(accounts):
 
     findings.extend(_user_account_findings(accounts))
     findings.extend(switch_findings(accounts))
+    findings.extend(unit_target_findings())
     findings.extend(_stray_unit_findings(accounts))
 
     if len(accounts) > 1:
@@ -3353,10 +3364,70 @@ def _write_atomically(path, body, mode=0o600):
     if directory and not os.path.isdir(directory):
         os.makedirs(directory, 0o700)
     tmp = "{}.tmp.{}".format(path, os.getpid())
-    with open(tmp, "w") as f:
-        f.write(body)
-    os.chmod(tmp, mode)
+    # Created at its final mode rather than widened-then-narrowed: opening with
+    # the default and calling chmod afterwards leaves a real window in which a
+    # credential sits on disk at 0644, and these directories are shared.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+            f.flush()
+            # rename is atomic, but only about which name points at which
+            # inode. Without this the rename can be durable while the bytes
+            # behind it are not, and a power cut leaves an empty credential
+            # file -- which reads to Claude Code as a broken login.
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     os.replace(tmp, path)
+    _fsync_directory(directory)
+
+
+def secure_dir(path, mode=0o700):
+    """
+    Create `path` if absent, and make sure it is no wider than `mode`.
+
+    `os.makedirs(p, 0o700)` applies that mode to the **leaf only**; every
+    intermediate it creates gets `0o777 & ~umask`, which is 0775 on an ordinary
+    machine. That is how a directory holding parked logins ended up
+    group-writable while the credential inside it was correctly 0600 -- and a
+    directory you can write is a file you can replace, whatever mode the file
+    has. Called for the root and the child separately, because there is no
+    version of makedirs that gets this right.
+    """
+    if not os.path.isdir(path):
+        os.makedirs(path, mode)
+    try:
+        current = stat.S_IMODE(os.stat(path).st_mode)
+        if current & ~mode:
+            os.chmod(path, current & mode)
+    except OSError:
+        pass
+    return path
+
+
+def _fsync_directory(path):
+    """
+    Make a rename durable, not just atomic.
+
+    Renaming into place survives a crash only once the directory entry itself
+    has reached the disk. Best effort: a filesystem that refuses the open is
+    not a reason to fail a switch that has otherwise succeeded.
+    """
+    try:
+        fd = os.open(path or ".", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _existing_mode(path, fallback=0o600):
@@ -3375,9 +3446,9 @@ def backup_user_login():
     that rewrites them.
     """
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    directory = os.path.join(SWITCH_ROOT, ".backups", stamp)
-    if not os.path.isdir(directory):
-        os.makedirs(directory, 0o700)
+    secure_dir(SWITCH_ROOT)
+    secure_dir(os.path.join(SWITCH_ROOT, ".backups"))
+    directory = secure_dir(os.path.join(SWITCH_ROOT, ".backups", stamp))
     saved = []
     for source, name in ((credentials_path(user_login()), "credentials.json"),
                          (USER_CONFIG_JSON, "claude.json")):
@@ -3393,8 +3464,39 @@ def backup_user_login():
     return directory
 
 
+def orphan_login(taken):
+    """
+    Store a login that belongs to no configured account, permanently.
+
+    The alternative was the rolling backup, and the switch said so out loud --
+    "it is in the backup below, and nowhere else" -- while `_prune_backups`
+    deleted it ten switches later. A copy described as the only one must not sit
+    in a directory whose whole job is to throw things away, so this one is never
+    pruned. It costs a few hundred bytes and saves a browser sign-in for
+    somebody who had signed in by hand.
+    """
+    credential, identity = taken
+    if not credential:
+        return None
+    secure_dir(SWITCH_ROOT)
+    secure_dir(os.path.join(SWITCH_ROOT, ".orphaned"))
+    directory = secure_dir(os.path.join(
+        SWITCH_ROOT, ".orphaned", datetime.now().strftime("%Y%m%d-%H%M%S")))
+    _write_atomically(os.path.join(directory, ".credentials.json"), credential)
+    if identity:
+        _write_atomically(os.path.join(directory, ".claude.json"),
+                          json.dumps({"oauthAccount": identity}, indent=2,
+                                     sort_keys=True))
+    return directory
+
+
 def _prune_backups():
-    """Keep the most recent SWITCH_BACKUPS_KEPT, oldest first out."""
+    """
+    Keep the most recent SWITCH_BACKUPS_KEPT, oldest first out.
+
+    Only ever touches .backups. A login that could not be parked is written to
+    .orphaned instead, precisely so that it is out of this function's reach.
+    """
     root = os.path.join(SWITCH_ROOT, ".backups")
     try:
         stamps = sorted(d for d in os.listdir(root)
@@ -3403,6 +3505,30 @@ def _prune_backups():
         return
     for stamp in stamps[:max(0, len(stamps) - SWITCH_BACKUPS_KEPT)]:
         shutil.rmtree(os.path.join(root, stamp), ignore_errors=True)
+
+
+def acquire_switch_lock():
+    """
+    Hold an exclusive lock for the length of a switch, or return None.
+
+    Two switches running at once interleave two read-modify-write pairs over
+    the same two files, and the loser does not merely end up stale: its login
+    is gone, because each run removes the store credential it installed and
+    each backup captured the same pre-state. No ordering survives that, so
+    they are serialised instead of being made clever.
+
+    The lock lives beside the stores rather than in /tmp, so it shares their
+    lifetime and their permissions.
+    """
+    secure_dir(SWITCH_ROOT)
+    fd = os.open(os.path.join(SWITCH_ROOT, ".lock"),
+                 os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        os.close(fd)
+        return None
+    return fd
 
 
 def take_login():
@@ -3436,8 +3562,8 @@ def park_login(account, taken):
     """
     credential, identity = taken
     store = switch_store(account)
-    if not os.path.isdir(store.config_dir):
-        os.makedirs(store.config_dir, 0o700)
+    secure_dir(SWITCH_ROOT)
+    secure_dir(store.config_dir)
     if credential is not None:
         _write_atomically(credentials_path(store), credential)
     if identity:
@@ -3470,16 +3596,18 @@ def install_login(store):
     key removed here is repaired within one session, while a key carried over
     from the other account is never repaired at all.
     """
-    with open(credentials_path(store)) as f:
-        _write_atomically(credentials_path(user_login()), f.read())
-
-    # Never merge into a file that failed to parse: {} plus a few keys, written
-    # out, is the user's configuration replaced. The blocker above catches this
-    # first; this is here so that it cannot be reached by any other route.
+    # Everything that can refuse happens before anything is written. The first
+    # version of this guard sat one statement further down, after the credential
+    # had already been swapped -- so reaching it caused exactly the damage it
+    # exists to prevent, and left the user on a token whose identity had not
+    # been updated to match.
     if not readable_json(USER_CONFIG_JSON):
         raise ConfigError(
             "{} cannot be parsed; refusing to overwrite it".format(
                 USER_CONFIG_JSON))
+    with open(credentials_path(store)) as f:
+        incoming = f.read()
+
     config = _read_json(USER_CONFIG_JSON)
     identity = (_read_json(store.config_json).get("oauthAccount") or {})
     if identity:
@@ -3489,9 +3617,16 @@ def install_login(store):
         if key in config:
             del config[key]
             dropped.append(key)
-    _write_atomically(USER_CONFIG_JSON,
-                      json.dumps(config, indent=2, sort_keys=True),
-                      _existing_mode(USER_CONFIG_JSON))
+    # Serialised first, so the only work left between the two writes is the
+    # writes themselves. A crash between them leaves the credential swapped and
+    # the identity stale, which `doctor` names and a re-run repairs; anything
+    # slower in the gap widens the window for a live Claude Code session to
+    # rewrite the file underneath us.
+    body = json.dumps(config, indent=2, sort_keys=True)
+    mode = _existing_mode(USER_CONFIG_JSON)
+
+    _write_atomically(credentials_path(user_login()), incoming)
+    _write_atomically(USER_CONFIG_JSON, body, mode)
 
     try:
         os.remove(credentials_path(store))
@@ -3510,8 +3645,8 @@ def prepare_store(store):
     rather than overwritten, so re-running cannot discard an identity already
     there.
     """
-    if not os.path.isdir(store.config_dir):
-        os.makedirs(store.config_dir, 0o700)
+    secure_dir(SWITCH_ROOT)
+    secure_dir(store.config_dir)
     config = _read_json(store.config_json)
     for key, value in ping_config(store.config_dir).items():
         if key == "projects":
@@ -3564,6 +3699,21 @@ def offer_sign_in(account, store):
     return bool(account_identity(store)["has_token"])
 
 
+def published_uuid(account):
+    """
+    This account's UUID as the pinging machine published it, or "".
+
+    A machine that only switches has no ping directory, so the checks that
+    compare a parked login against "who this account is" had nothing to compare
+    against and silently passed -- on exactly the machines the README tells
+    people to use for switching. The schedule carries the UUID already.
+    """
+    for entry in (read_schedule() or {}).get("accounts", []):
+        if isinstance(entry, dict) and str(entry.get("name")) == account.name:
+            return entry.get("account_uuid") or ""
+    return ""
+
+
 def switch_blockers(accounts, account, usable=None):
     """
     Everything that should stop or interrupt a switch to `account`, worst first.
@@ -3613,7 +3763,7 @@ def switch_blockers(accounts, account, usable=None):
                 account.display, fmt_time(expires)),
             "Sign in again: {}".format(sign_in_command(store))))
 
-    want = account_identity(account)["account_uuid"]
+    want = account_identity(account)["account_uuid"] or published_uuid(account)
     got = identity["account_uuid"]
     if not got:
         # Without it the identity in ~/.claude.json would keep naming the old
@@ -3635,6 +3785,18 @@ def switch_blockers(accounts, account, usable=None):
             "Sign in as the right account: {}".format(sign_in_command(store))))
 
     parked_grant = login_fingerprint(store)
+    # Against the live login as well as the ping directory. `doctor` already
+    # checked both; the switch checked only one, which left the copy it warns
+    # about -- "the unexplained logout eight hours later" -- reachable by the
+    # command that is supposed to refuse it.
+    if parked_grant and parked_grant == login_fingerprint(user_login()):
+        findings.append(Finding(
+            "error",
+            "Account {}'s parked login is the same one your Claude Code is "
+            "using right now".format(account.display),
+            "Installing it would put one grant in two places, and about eight "
+            "hours later one of them would be signed out. Sign in again so the "
+            "store holds its own: {}".format(sign_in_command(store))))
     if parked_grant and parked_grant == login_fingerprint(account):
         findings.append(Finding(
             "error",
@@ -3715,12 +3877,24 @@ def switch_account(accounts, name=None, sign_in=True):
         account = find_account(accounts, name)
     else:
         chosen, _ = choose_account(known, states, time.time(), avail)
-        try:
-            account = find_account(accounts, chosen.name)
-        except ConfigError:
-            # The schedule knows an account this machine's accounts.json does
-            # not. Its name is all the switch needs.
-            account = chosen
+        # Deliberately no fallback to the published account. A schedule naming
+        # an account this machine does not configure is either stale or came
+        # from somewhere it should not have, and switching to it would take its
+        # store path and its identity from the same untrusted file.
+        account = find_account(accounts, chosen.name)
+
+    # Overrides first, before anything reassuring can be said. They decide
+    # which account is billed regardless of what is on disk, so "you are
+    # already signed in as that account" is a false comfort while one is set --
+    # and with ANTHROPIC_API_KEY it is not even the same subscription.
+    overrides = account_overrides()
+    if overrides:
+        for where, var in overrides:
+            sys.stderr.write(
+                "ERROR: {} is set in {}\n  -> It decides which account is "
+                "billed, whatever this command does.\n".format(var, where))
+        sys.stderr.write("\nNothing was changed.\n")
+        return 1
 
     current = current_account(accounts)
     if current is not None and current.name == account.name:
@@ -3728,13 +3902,18 @@ def switch_account(accounts, name=None, sign_in=True):
             account.display))
         return 0
 
-    # Before judging: the one missing piece a person can supply right now.
     store = switch_store(account)
+    findings = switch_blockers(accounts, account, avail.get(account.name))
+
+    # The sign-in is offered only once everything else has passed. Offering it
+    # first meant a full browser round-trip could end in "Nothing was changed"
+    # because of a condition that was already knowable.
     if (sign_in and not os.path.exists(credentials_path(store))
+            and not [f for f in findings if f.level == "error"
+                     and "No login is parked" not in f.message]
             and sys.stdin.isatty() and not ASSUME_YES):
         offer_sign_in(account, store)
-
-    findings = switch_blockers(accounts, account, avail.get(account.name))
+        findings = switch_blockers(accounts, account, avail.get(account.name))
     errors = [f for f in findings if f.level == "error"]
     for finding in findings:
         stream = sys.stderr if finding.level == "error" else sys.stdout
@@ -3747,6 +3926,22 @@ def switch_account(accounts, name=None, sign_in=True):
     if findings:
         print()
 
+    lock = acquire_switch_lock()
+    if lock is None:
+        sys.stderr.write(
+            "Another switch is already running on this machine.\n"
+            "  Two at once would leave one of the logins on no disk at all, "
+            "so this one stops.\n  Try again once it has finished.\n")
+        return 1
+
+    try:
+        return _perform_switch(accounts, account, current, avail, states)
+    finally:
+        os.close(lock)          # releases the flock with it
+
+
+def _perform_switch(accounts, account, current, avail, states):
+    """The half of `switch_account` that writes, run under the lock."""
     # Read before anything is overwritten: after install_login the outgoing
     # identity is gone from ~/.claude.json, and it is the only way to name the
     # login for someone whose Claude Code was signed in by hand.
@@ -3755,15 +3950,21 @@ def switch_account(accounts, name=None, sign_in=True):
     taken = take_login()
     backup = backup_user_login()
 
-    # From here two files are being rewritten. A disk that filled up or a
-    # permission that changed underneath would otherwise surface as a traceback
-    # at the one moment a person most needs a sentence: mid-switch, possibly
-    # with the credential already replaced. Say which half happened and where
-    # the copy is.
+    # From here two files are being rewritten. A disk that filled up, a
+    # permission that changed underneath, or a Ctrl-C would otherwise surface
+    # as a traceback at the one moment a person most needs a sentence:
+    # mid-switch, possibly with the credential already replaced. Say which half
+    # happened and where the copy is.
     where = ("\n  Your previous credentials are in {}.".format(backup)
              if backup else "")
     try:
         dropped = install_login(switch_store(account))
+    except KeyboardInterrupt:
+        sys.stderr.write(
+            "\nInterrupted while installing account {}'s login.{}\n"
+            "  Run `{} status` to see which account you are on, then switch "
+            "again.\n".format(account.display, where, COMMAND))
+        return 1
     except (IOError, OSError) as e:
         sys.stderr.write(
             "Could not install account {}'s login: {}\n"
@@ -3773,6 +3974,13 @@ def switch_account(accounts, name=None, sign_in=True):
         return 1
     try:
         parked = park_login(current, taken) if current is not None else None
+    except KeyboardInterrupt:
+        sys.stderr.write(
+            "\nSwitched to account {}, but was interrupted before the login "
+            "it replaced could be parked.{}\n"
+            "  That login is in the backup and nowhere else.\n".format(
+                account.display, where))
+        return 1
     except (IOError, OSError) as e:
         sys.stderr.write(
             "Switched to account {}, but could not park the login it "
@@ -3787,13 +3995,15 @@ def switch_account(accounts, name=None, sign_in=True):
     if parked is not None:
         print("  Parked account {} in {}".format(current.display,
                                                  parked.config_dir))
-    elif backup:
+    else:
         # Refusing would be worse: it would leave someone stuck behind a login
         # this tool cannot name. Saying exactly where it went is enough.
+        orphan = orphan_login(taken)
         print("  The login that was here{} is not one of the configured "
               "accounts, so it was not parked.".format(
                   " ({})".format(outgoing) if outgoing else ""))
-        print("  It is in the backup below, and nowhere else.")
+        if orphan:
+            print("  It is kept in {}, which is never pruned.".format(orphan))
     if backup:
         print("  Previous credentials backed up to {}".format(backup))
     if dropped:
@@ -3831,6 +4041,47 @@ def switch_account(accounts, name=None, sign_in=True):
     print("  A fresh session here costs almost nothing; resuming a long one "
           "pays for its whole history again.")
     return 0
+
+
+def unit_target_findings():
+    """
+    Units that no longer point at the checkout they are being run from.
+
+    `is-enabled` and the next elapse both stay true when the script a unit
+    names has moved or been deleted, so a machine can be enabled, scheduled,
+    and failing every single time. That happens when the checkout is renamed or
+    moved, and when a second clone rewrites the shared template out from under
+    the first. `checkpoint_is_for_this_cwd` exists for exactly this shape of
+    failure -- everything looks installed and every run dies for a reason only
+    the log knows -- and the same reasoning was never applied to the units.
+    """
+    findings, me = [], os.path.abspath(__file__)
+    for name in installed_units():
+        if not name.endswith(".service"):
+            continue
+        for line in _read_text(os.path.join(UNIT_DIR, name)).splitlines():
+            if not line.startswith("ExecStart="):
+                continue
+            target = next((part for part in shlex.split(line[10:])
+                           if part.endswith(".py")), "")
+            if not target:
+                continue
+            if not os.path.exists(target):
+                findings.append(Finding(
+                    "error",
+                    "The installed timer runs {}, which does not exist".format(
+                        target),
+                    "Every ping is failing. Re-run ./install.sh from the "
+                    "checkout you want it to use."))
+            elif os.path.abspath(target) != me:
+                findings.append(Finding(
+                    "warning",
+                    "The installed timer runs {}, not this checkout".format(
+                        target),
+                    "Another copy of this repository owns the timers. Running "
+                    "./install.sh here would take them over; uninstalling here "
+                    "would stop them there."))
+    return findings
 
 
 def switch_findings(accounts):
@@ -3879,6 +4130,25 @@ def switch_findings(accounts):
                     account.display, fmt_time(expires)),
                 "Switch to it before then and it renews itself; leave it and it "
                 "needs a browser sign-in."))
+        mode = _permissions(store.config_dir)
+        if mode is not None and mode & 0o077:
+            findings.append(Finding(
+                "warning",
+                "Account {}'s parked login is in a directory others can reach "
+                "({:o})".format(account.display, mode),
+                "A directory that can be written is a file that can be "
+                "replaced, whatever mode the file has. Tighten it: chmod 700 "
+                "{}".format(store.config_dir)))
+        marker = _sync_marker(store.config_dir)
+        if marker:
+            findings.append(Finding(
+                "warning",
+                "Account {}'s parked login is inside a synced folder "
+                "({})".format(account.display, marker),
+                "Syncing it puts one login on two machines, and refresh tokens "
+                "rotate — within about eight hours one of them is signed out. "
+                "Exclude {} from the sync.".format(SWITCH_ROOT)))
+
         scopes = login_scopes(store)
         missing = [s for s in FULL_LOGIN_SCOPES if scopes and s not in scopes]
         if missing:
