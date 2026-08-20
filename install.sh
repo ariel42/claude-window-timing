@@ -29,8 +29,6 @@ CLAUDE_BIN="$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")"
 if [ ! -x "$CLAUDE_BIN" ]; then
     echo "ERROR: Claude Code CLI not found." >&2
     echo "       Install it from: https://claude.ai/download" >&2
-    echo "       It is needed even to set this machine up for switching only:" >&2
-    echo "       signing in to an account is done by running claude itself." >&2
     exit 1
 fi
 

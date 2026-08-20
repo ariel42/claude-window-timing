@@ -4902,13 +4902,6 @@ def test_the_installer_insists_on_claude_code_in_both_modes():
                        "Claude Code CLI not found" in result.stderr)
             check_true("{}: and where to get it".format(label),
                        "claude.ai/download" in result.stderr)
-        check_true("the switch-only refusal explains why it needs it too",
-                   "signing in to an account is done by running claude" in
-                   subprocess.run(["bash", os.path.join(here, "install.sh"),
-                                   "--no-pings"], cwd=here, capture_output=True,
-                                  text=True,
-                                  env={"HOME": home, "PATH": "/usr/bin:/bin"}
-                                  ).stderr)
     finally:
         shutil.rmtree(home, ignore_errors=True)
 
