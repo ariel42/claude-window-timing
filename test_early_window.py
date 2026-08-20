@@ -4798,6 +4798,23 @@ def test_the_wizard_asks_for_each_sign_in_once_and_no_more():
     finally:
         restore()
 
+    # Grouped by account, not by kind. Many people sign in through Google SSO,
+    # where re-authorising the same identity is a click and *changing* identity
+    # is the expensive part -- so listing every ping directory and then every
+    # store would walk a three-account install through A, B, C, B, C: four
+    # identity switches where two would do.
+    restore, home, accounts = _switch_sandbox(names=("1", "2", "3"), pings=False)
+    try:
+        order = [a.name for _what, a, _d in ew.sign_ins_needed(accounts,
+                                                               pings=True)]
+        check("each account's sign-ins are adjacent",
+              order, ["1", "1", "2", "2", "3", "3"])
+        check("which is one identity change per account, not one per directory",
+              len([i for i in range(1, len(order)) if order[i] != order[i - 1]]),
+              len(accounts) - 1)
+    finally:
+        restore()
+
     # Nobody signed in anywhere: every store is asked for, none skipped.
     restore, home, accounts = _switch_sandbox(pings=False)
     try:

@@ -147,7 +147,7 @@ Three things worth knowing:
 
 - **Signing in sends no message to Claude**, so it starts no usage window. There is no good or bad moment, and nothing to time.
 - **Sign in to each directory even if you already use that account elsewhere.** Each gets its own login rather than a copy of one, so a token refresh in a ping directory can never log you out of your own Claude Code.
-- **How many sign-ins that is.** One per ping directory, plus one per account you want to switch to — except the account you are already signed in as, which needs none, because that login moves into its own store the first time you switch away from it. On a machine running the pings for two accounts, that is three; on a machine that only switches, one.
+- **How many sign-ins that is.** One per ping directory, plus one per account you want to switch to — except the account you are already signed in as, which needs none, because that login moves into its own store the first time you switch away from it. On a machine running the pings for two accounts, that is three; on a machine that only switches, one. Two per account is the floor, not an accident: the ping directory refreshes that account's token every eight hours forever, your own Claude Code refreshes too, and rotation is strict — one login in both places means whichever refreshes second is signed out. Setup lists an account's sign-ins together so that a browser only has to change identity once per account, which is the part that actually costs time under SSO.
 
 You never have to be awake at a particular hour. The service works out where each window sits and spaces them itself, holding an account back when that is what it takes.
 

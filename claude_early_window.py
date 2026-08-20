@@ -3884,20 +3884,20 @@ def sign_ins_needed(accounts, pings):
     only for the new one.
     """
     needed = []
-    if pings:
-        for account in accounts:
-            if not account_identity(account)["has_token"]:
-                needed.append(("pings for account {}".format(account.display),
-                               account, account.config_dir))
     mine = current_account(accounts)
+    # Grouped by account, not by kind. Where an account needs both, the two
+    # sign-ins are the same Claude account and land next to each other, so an
+    # SSO user picks that identity in the browser once and does both. Listing
+    # every ping directory and then every store would walk them through
+    # A, B, C, B, C -- four identity switches in the browser for three
+    # accounts, which is the whole friction.
     for account in accounts:
+        if pings and not account_identity(account)["has_token"]:
+            needed.append(("its pings", account, account.config_dir))
         store = switch_store(account)
-        if account_identity(store)["has_token"]:
-            continue
-        if mine is not None and mine.name == account.name:
-            continue
-        needed.append(("switching to account {}".format(account.display),
-                       account, store.config_dir))
+        if (not account_identity(store)["has_token"]
+                and (mine is None or mine.name != account.name)):
+            needed.append(("switching to it", account, store.config_dir))
     return needed
 
 
@@ -4022,11 +4022,20 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
             print("this machine cannot tell which that is. Copy schedule.json")
             print("here from the machine running the pings and re-run setup,")
             print("and it will recognise it and ask for one sign-in fewer.")
-        for what, _account, directory in needed:
+        grouped = [(a, [(what, d) for what, acc, d in needed
+                        if acc.name == a.name]) for a in accounts]
+        grouped = [(a, rows) for a, rows in grouped if rows]
+        if any(len(rows) > 1 for _a, rows in grouped):
             print()
-            print("  For {}:".format(what))
-            print("    CLAUDE_CONFIG_DIR={} claude    then /login".format(
-                directory))
+            print("Where an account needs two, they are listed together on")
+            print("purpose: both are the same Claude account, so do them one")
+            print("after the other and your browser only changes identity once.")
+        for account, rows in grouped:
+            print()
+            print("  Account {}".format(account.display))
+            for what, directory in rows:
+                print("    CLAUDE_CONFIG_DIR={} claude".format(directory))
+                print("      then /login — for {}".format(what))
         print()
         print("That is {} browser sign-in{}, once on this machine.".format(
             len(needed), "" if len(needed) == 1 else "s"))
