@@ -5344,6 +5344,28 @@ def test_the_user_is_told_which_account_they_are_on():
     finally:
         restore()
 
+    # Being on the best of a bad lot is not being on the one to spend. The
+    # headline has just said nothing can be used, and this line has to agree
+    # with it rather than say the reassuring thing.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        now = time.time()
+        for account in accounts:
+            account.ensure_state_dir()
+            ew.write_state(account, {"last_run": now - 60,
+                                     "rate_limits": {"five_hour": {
+                                         "used_percentage": 100,
+                                         "resets_at": now + 900}}})
+        out, _, _ = _capture(lambda: ew.status(accounts))
+        check_true("it still says which account they are on",
+                   "Your Claude Code  : account 1" in out)
+        check("but does not call a spent one the account to spend",
+              "the one to spend" in out, False)
+        check_true("and the headline says as much",
+                   "No account is usable yet" in out)
+    finally:
+        restore()
+
     # An account this tool has never heard of is a state worth naming, not a
     # crash: it is exactly what happens after someone logs in by hand.
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
@@ -5870,6 +5892,9 @@ def test_the_first_switch_on_a_machine_that_has_never_run_claude_code():
               False)
         check("nothing claims to have parked a login that was never there",
               "Parked" in out, False)
+        # Nor to have found one and declined to park it: there was none.
+        check("nor to have found a login here at all",
+              "The login that was here" in out, False)
     finally:
         restore()
 

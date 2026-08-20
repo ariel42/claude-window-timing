@@ -2853,8 +2853,13 @@ def status(accounts):
             print("Your Claude Code  : signed in as an account this tool does "
                   "not know")
         elif mine.name == chosen.name:
-            print("Your Claude Code  : account {} — the one to spend".format(
-                mine.display))
+            # "The one to spend" is an endorsement, and there is nothing to
+            # endorse when the account it names cannot serve a request: the
+            # headline above has just said so, and agreeing with it matters
+            # more than saying something reassuring.
+            print("Your Claude Code  : account {}{}".format(
+                mine.display, " — the one to spend"
+                if avail[chosen.name].tier == USABLE else ""))
         else:
             print("Your Claude Code  : account {}".format(mine.display))
             print("                    `{} switch` moves it to account "
@@ -4320,7 +4325,7 @@ def _perform_switch(accounts, account, current, avail, states):
     if parked is not None:
         print("  Parked account {} in {}".format(current.display,
                                                  parked.config_dir))
-    else:
+    elif any(taken):
         # Refusing would be worse: it would leave someone stuck behind a login
         # this tool cannot name. Saying exactly where it went is enough.
         orphan = orphan_login(taken)
@@ -4329,6 +4334,10 @@ def _perform_switch(accounts, account, current, avail, states):
                   " ({})".format(outgoing) if outgoing else ""))
         if orphan:
             print("  It is kept in {}, which is never pruned.".format(orphan))
+    # And where `taken` holds nothing at all, nothing is said: this is the
+    # first switch on a machine that had never signed in to Claude Code, and
+    # describing the login that was not here reads as though one had been
+    # lost.
     if backup:
         print("  Previous credentials backed up to {}".format(backup))
     if dropped:
