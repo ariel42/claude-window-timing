@@ -4124,11 +4124,52 @@ def test_a_spent_account_is_never_recommended():
         av = ew.account_availability(spent, states["1"], now)
         check("spent with no reset time is still not usable",
               ew.TIER_NAMES[av.tier], "waiting")
-        check("and says so honestly rather than inventing a time",
-              "nothing says when it returns" in
-              ew.describe_availability(states["1"], av, now), True)
+        # It is not unknowable: a spent 5-hour limit cannot outlast five hours,
+        # so the answer is a bound, offered as one rather than as a promise.
+        check("the return time is bounded by the limit's own length",
+              round(av.until - now), ew.WINDOW_HOURS * 3600)
+        check("and marked as a bound, not an observation", av.exact, False)
+        check_true("which the wording says out loud",
+                   "no later than" in
+                   ew.describe_availability(states["1"], av, now))
         check("it is still not recommended",
               ew.choose_account(accounts, states, now)[0].name, "2")
+
+        # The same rule for a reading that arrived from another machine. This
+        # branch had a latent NameError: no test reached it, because a
+        # published WAITING entry normally carries the reset time the pinging
+        # machine observed.
+        sched = os.path.join(root, "schedule.json")
+        saved_sched = ew.SCHEDULE_FILE
+        try:
+            ew.SCHEDULE_FILE = sched
+            with open(sched, "w") as f:
+                json.dump({"window_hours": 5, "written_at": now, "accounts": [
+                    {"name": "1", "account_uuid": "u1", "usable_now": False,
+                     "tier": "waiting", "unusable_until": None,
+                     "unusable_because": "its 5-hour limit is spent",
+                     "last_run": now - 60, "expires_at": now + 900,
+                     "window_phase": 0},
+                    {"name": "2", "account_uuid": "u2", "usable_now": True,
+                     "tier": "usable", "last_run": now - 60,
+                     "expires_at": now + 3600, "window_phase": 0}]}, f)
+            for a in accounts:
+                shutil.rmtree(a.state_dir, ignore_errors=True)
+            view = ew.schedule_view(accounts)
+            check_true("a published schedule is read at all", view is not None)
+            pub_known, pub_states, pub_avail, _ = view
+            check("a published WAITING entry with no time is bounded, not unknown",
+                  round(pub_avail["1"].until - now), ew.WINDOW_HOURS * 3600)
+            check("and marked a bound", pub_avail["1"].exact, False)
+            check("it is still not the recommendation",
+                  ew.choose_account(pub_known, pub_states, now,
+                                    pub_avail)[0].name, "2")
+        finally:
+            ew.SCHEDULE_FILE = saved_sched
+            for a in accounts:
+                a.ensure_state_dir()
+            for name, state in states.items():
+                ew.write_state(ew.find_account(accounts, name), state)
 
         # Every command that has an opinion goes through the same function.
         # status_json reads state from disk rather than taking it, so put the
@@ -4149,11 +4190,16 @@ def test_a_spent_account_is_never_recommended():
                                                "resets_at": now + 900},
                                  "seven_day": {"used_percentage": 100}}}
         av = ew.account_availability(spent, mixed, now)
-        check("a blocker with no end still makes it unusable",
+        check("a weekly limit with no reset still makes it unusable",
               ew.TIER_NAMES[av.tier], "waiting")
-        check("and the end really is unknown", av.until, None)
-        check("yet it keeps its place in the spacing",
-              ew.participation(spent, mixed, now)[0], True)
+        check("bounded by the weekly window rather than the 5-hour one",
+              round(av.until - now), 7 * 86400)
+        check("and known to be a bound", av.exact, False)
+        # A bound that outlasts this account's own window does drop it from
+        # the rotation -- correctly: a spent weekly limit really can outlast
+        # the boundary, which is the case that reasoning was written for.
+        check("so it does not hold a slot it cannot fill",
+              ew.participation(spent, mixed, now)[0], False)
     finally:
         ew.STATE_ROOT = saved
         shutil.rmtree(root, ignore_errors=True)

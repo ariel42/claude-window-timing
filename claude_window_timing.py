@@ -481,12 +481,22 @@ STALE_AFTER_SEC = UNHEALTHY_AFTER * INTERVAL_MIN * 60
 # both; `status` and the log print both.
 _LIMIT_NAMES = (("five_hour", "5-hour"), ("seven_day", "weekly"))
 
+# How long each limit's window is, for bounding a spent limit whose reset time
+# was never recorded -- which is what a refusal looks like, since a 429 carries
+# no headers at all.
+_LIMIT_LENGTHS = {"five_hour": WINDOW_HOURS * 3600, "seven_day": 7 * 86400}
+
 # Ranking tiers, best first.
 USABLE, WAITING, UNKNOWN, NEEDS_ACTION = range(4)
 
 # tier: one of the above. until: when it returns, when that is knowable.
 # note: why, in words a user can act on — never consulted for the ranking.
-Availability = collections.namedtuple("Availability", "tier until note")
+# `exact` says whether `until` is an observed reset time or the longest the
+# limit could possibly last. A spent limit always returns eventually -- a
+# 5-hour window cannot outlast five hours -- so "we do not know the reset time"
+# is never a reason to answer "we do not know when", only a reason to say
+# "no later than".
+Availability = collections.namedtuple("Availability", "tier until note exact")
 
 # How a tier travels to another machine. Names rather than the integers, because
 # the integers are an implementation detail and a published file outlives one.
@@ -530,13 +540,14 @@ def spent_limits(state, now):
         if (window.get("used_percentage") or 0) < LIMIT_SPENT_PCT:
             continue
         if resets is None:
-            # Spent, and nothing says when it comes back -- which is exactly
-            # what a refusal looks like when no reset time was ever recorded: a
-            # 429 carries no headers at all. Skipping it for want of a
-            # timestamp would recommend an account that is certain to refuse.
-            spent.append((name, None))
+            # Spent, with no reset time recorded -- what a refusal looks like,
+            # since a 429 carries no headers. The limit still turns over: this
+            # window began at some unobserved moment and cannot run longer than
+            # the limit's own length, so the latest it can end is that far from
+            # now. An upper bound, offered as one.
+            spent.append((name, now + _LIMIT_LENGTHS[key], False))
         elif resets > now:
-            spent.append((name, resets))
+            spent.append((name, resets, True))
     return spent
 
 
@@ -578,7 +589,7 @@ def account_availability(account, state, now):
     # of the last ping — and because waiting will not fix it.
     stuck = identity_blocker(account)
     if stuck:
-        return Availability(NEEDS_ACTION, None, stuck)
+        return Availability(NEEDS_ACTION, None, stuck, True)
 
     blockers = []
 
@@ -587,24 +598,20 @@ def account_availability(account, state, now):
     # here needs to know.
     available_at = state.get("available_at")
     if available_at and available_at > now:
-        blockers.append((available_at, "Claude refused the last ping"))
+        blockers.append((available_at, "Claude refused the last ping", True))
 
-    for name, resets in spent_limits(state, now):
-        blockers.append((resets, "its {} limit is spent".format(name)))
+    for name, resets, exact in spent_limits(state, now):
+        blockers.append((resets, "its {} limit is spent".format(name), exact))
 
     if blockers:
-        # Back only when the last one clears -- and an unknown return time is
-        # the latest of all, because nothing here can promise it has passed.
-        if any(until is None for until, _note in blockers):
-            note = next(note for until, note in blockers if until is None)
-            return Availability(WAITING, None, note)
-        until, note = max(blockers)
-        return Availability(WAITING, until, note)
+        until, note, exact = max(blockers)   # back when the last one clears
+        return Availability(WAITING, until, note, exact)
 
     if state.get("consecutive_failures", 0) >= UNHEALTHY_AFTER:
-        return Availability(UNKNOWN, None, "its pings keep failing — cannot tell")
+        return Availability(UNKNOWN, None, "its pings keep failing — cannot tell",
+                            True)
 
-    return Availability(USABLE, None, "")
+    return Availability(USABLE, None, "", True)
 
 
 def availabilities(accounts, states, now):
@@ -698,10 +705,9 @@ def describe_availability(state, avail, now):
             return "no window information yet"
         return "usable — window ends in {}".format(fmt_delta(expiry - now))
     if avail.tier == WAITING:
-        if avail.until is None:
-            return "unusable — {}, and nothing says when it returns".format(
-                avail.note)
-        return "unusable until {} — {}".format(fmt_time(avail.until), avail.note)
+        return "unusable until {}{} — {}".format(
+            "" if avail.exact else "no later than ",
+            fmt_time(avail.until), avail.note)
     return "unusable — {}".format(avail.note)
 
 
@@ -791,7 +797,7 @@ def schedule_view(accounts):
     if not document:
         return None
 
-    published, states, avail = [], {}, {}
+    published, states, avail, now = [], {}, {}, time.time()
     for index, entry in enumerate(document["accounts"]):
         if not isinstance(entry, dict) or not entry.get("name"):
             continue
@@ -818,9 +824,14 @@ def schedule_view(accounts):
         tier = TIERS_BY_NAME.get(entry.get("tier"))
         if tier is None:
             tier = USABLE if entry.get("usable_now") else WAITING
+        # A published file carries the pinging machine's observed reset time,
+        # so it is exact where it exists at all; a WAITING entry that arrives
+        # without one is bounded here the same way a local one would be.
+        until, exact = entry.get("unusable_until"), True
+        if tier == WAITING and not until:
+            until, exact = now + WINDOW_HOURS * 3600, False
         avail[account.name] = Availability(
-            tier, entry.get("unusable_until"),
-            entry.get("unusable_because") or "")
+            tier, until, entry.get("unusable_because") or "", exact)
 
     if not published:
         return None
@@ -4028,11 +4039,10 @@ def switch_blockers(accounts, account, usable=None):
         findings.append(Finding(
             "warning",
             "Account {} is not usable yet — {}".format(account.display, usable.note),
-            ("It comes back {}. ".format(fmt_time(usable.until))
-             if usable.until is not None
-             else "Nothing here says when it comes back. ") +
-            "Switching now is harmless; the first request before then is "
-            "simply refused."))
+            "It comes back {}{}. Switching now is harmless; the first "
+            "request before then is simply refused.".format(
+                "" if usable.exact else "no later than ",
+                fmt_time(usable.until))))
     elif usable.tier == NEEDS_ACTION:
         findings.append(Finding(
             "warning",
