@@ -6296,6 +6296,88 @@ def test_running_sessions_are_looked_for_without_counting_our_own_pings():
                    ew.Account("1", "/tmp/nonexistent", 0)))
 
 
+def test_a_machine_that_does_not_ping_is_never_told_to_ping():
+    """
+    The decision `--no-pings` records is the README's central one: the pings
+    belong on ONE machine, because a second doubles what those accounts consume
+    and buys nothing. Every command that answered as though this were the
+    pinging machine quietly argued with it.
+
+    Walked here as a new install on a second machine is walked: nothing pinged,
+    no schedule copied across yet, and somebody typing the commands the tool
+    itself lists.
+    """
+    section("A machine that does not ping is never told to ping")
+    root = tempfile.mkdtemp()
+    saved = (ew.ACCOUNTS_FILE, ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.UNIT_DIR,
+             ew.SWITCH_ROOT, ew.ALIGNMENT_FILE, ew._systemctl, ew._run)
+
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+
+    try:
+        ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
+        ew.STATE_ROOT = os.path.join(root, "state")
+        ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
+        ew.UNIT_DIR = os.path.join(root, "units")
+        ew.SWITCH_ROOT = os.path.join(root, "switch")
+        ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
+        ew._systemctl = lambda *a: Ok()
+        ew._run = lambda cmd: Ok()
+        os.makedirs(ew.UNIT_DIR)
+        accounts = [ew.Account("1", os.path.join(root, "cfg-1"), 0),
+                    ew.Account("2", os.path.join(root, "cfg-2"), 1)]
+        ew._write_accounts_file(accounts, pings=False)
+        check("the file records the decision", ew.pings_here(), False)
+
+        # -- the recommendation ------------------------------------------
+        _, reason = ew.choose_account(accounts, {"1": {}, "2": {}}, time.time())
+        check_true("`which` sends them to the file, not to a ping",
+                   "copy schedule.json" in reason and "run a ping" not in reason)
+
+        said, _, _ = _capture(lambda: ew.status(accounts))
+        check_true("and so does status", "copy schedule.json here" in said)
+        # Spacing is worked out from what the pings observe. Here it is
+        # arithmetic over an empty state that ends in advice to go and ping.
+        check("no spacing report where nothing is spaced", "Spacing" in said, False)
+
+        # -- the commands that only mean something where pings run --------
+        for command, expected in (("ping", "sending one by hand"),
+                                  ("realign", "no schedule of its own"),
+                                  ("init", "no checkpoint to build")):
+            out, err, code = _capture(lambda: ew.cli([command]))
+            check("`{}` is refused rather than attempted".format(command),
+                  code, 2)
+            check_true("saying why: {}".format(expected), expected in err)
+            check_true("and how to change the decision, if that is the mistake",
+                       "./install.sh --pings" in err)
+
+        out, err, code = _capture(lambda: ew.cli(["log"]))
+        check("`log` explains where the log is", code, 1)
+        check_true("which is the machine that pings",
+                   "this machine does not ping" in err)
+
+        # -- and `check` stops asking for ping directories ----------------
+        out, _, code = _capture(lambda: ew.cli(["check"]))
+        check_true("`check` says nothing about ping directories",
+                   "does not exist" not in out and ".claude-1" not in out)
+        check_true("but does say what this machine is missing",
+                   "no logins parked" in out and "schedule.json" in out)
+
+        # -- the discovery line names only what works here ----------------
+        said, _, _ = _capture(lambda: ew.cli([]))
+        listed = said.split("Other commands:")[1]
+        check_true("realign and log are not offered", "realign" not in listed
+                   and "log" not in listed)
+        check_true("switch and which are", "switch" in listed
+                   and "which" in listed)
+    finally:
+        (ew.ACCOUNTS_FILE, ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.UNIT_DIR,
+         ew.SWITCH_ROOT, ew.ALIGNMENT_FILE, ew._systemctl, ew._run) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_a_machine_can_be_told_it_does_not_ping():
     """
     The pings belong on one machine; switching belongs on all of them. That
@@ -6935,6 +7017,7 @@ def main():
                  test_doctor_notices_a_store_going_stale,
                  test_only_one_function_writes_to_the_users_own_files,
                  test_running_sessions_are_looked_for_without_counting_our_own_pings,
+                 test_a_machine_that_does_not_ping_is_never_told_to_ping,
                  test_a_machine_can_be_told_it_does_not_ping,
                  test_the_wizard_asks_for_each_sign_in_once_and_no_more,
                  test_the_installer_insists_on_claude_code_in_both_modes,

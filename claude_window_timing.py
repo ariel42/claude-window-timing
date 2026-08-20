@@ -675,7 +675,10 @@ def choose_account(accounts, states=None, now=None, avail=None):
 
     expiry = next_expiry(state, now)
     if expiry == float("inf"):
-        return best, "no window information yet — run a ping first"
+        return best, ("no window information yet — copy schedule.json here "
+                      "from the machine that runs the pings"
+                      if not pings_here() else
+                      "no window information yet — run a ping first")
     if only:
         return best, "the only account; its window ends {}".format(fmt_time(expiry))
     # "ends first" is a claim about the accounts it was chosen over, so it has to
@@ -3019,7 +3022,11 @@ def status(accounts):
                     print("  Next ping     : {}".format(
                         " ".join(line.split()[:4])))
 
-    if len(accounts) > 1:
+    # Spacing is worked out from what the pings observe, so it belongs to the
+    # machine doing them. On any other it is arithmetic over an empty state
+    # that ends in advice to go and ping, which is the one thing that machine
+    # must not do.
+    if len(accounts) > 1 and pings:
         print()
         print("Spacing")
         for line in describe_alignment(accounts, states, now)[0]:
@@ -3046,6 +3053,42 @@ def status(accounts):
 # say precisely what is wrong is not an extra — most of these failures are silent,
 # and "it stopped helping" is all the user would otherwise see.
 
+def switch_only_findings(accounts):
+    """
+    Everything worth saying about a machine that switches but does not ping.
+
+    Its own function because two commands need it. `doctor` has always made
+    this split; `check` did not, and validated ping directories that a
+    switch-only machine is not supposed to have -- telling somebody to create
+    and sign into the very thing the install had just told them they did not
+    need.
+    """
+    findings = switch_findings(accounts)
+    findings.extend(_stray_unit_findings(accounts))
+    if installed_units():
+        findings.append(Finding(
+            "error",
+            "This machine is configured not to ping, but its timers are "
+            "still installed",
+            "It is pinging anyway, which doubles what those accounts "
+            "consume for no benefit. Re-run ./install.sh --no-pings to "
+            "stop them, or ./install.sh --pings if this machine should be "
+            "the one doing it."))
+    if not parked_logins(accounts) and not switching_configured(accounts):
+        findings.append(Finding(
+            "warning",
+            "This machine switches accounts but has no logins parked",
+            "Run ./install.sh, or sign in as you need them: `{} switch` "
+            "offers the one it needs, when it needs it.".format(COMMAND)))
+    if not read_schedule():
+        findings.append(Finding(
+            "warning",
+            "No schedule.json here, so nothing knows which account to spend",
+            "Copy it from the machine running the pings; `{} which` reads "
+            "it and needs nothing else.".format(COMMAND)))
+    return findings
+
+
 def doctor(accounts):
     # A machine that only switches has no ping directories, no checkpoints and
     # no timers. Reporting all three as broken would bury the one finding that
@@ -3053,31 +3096,9 @@ def doctor(accounts):
     # describing a machine this was never meant to be.
     pings = pings_here()
     if not pings:
-        findings = switch_findings(accounts)
-        findings.extend(_stray_unit_findings(accounts))
-        if installed_units():
-            findings.append(Finding(
-                "error",
-                "This machine is configured not to ping, but its timers are "
-                "still installed",
-                "It is pinging anyway, which doubles what those accounts "
-                "consume for no benefit. Re-run ./install.sh --no-pings to "
-                "stop them, or ./install.sh --pings if this machine should be "
-                "the one doing it."))
-        if not parked_logins(accounts) and not switching_configured(accounts):
-            findings.append(Finding(
-                "warning",
-                "This machine switches accounts but has no logins parked",
-                "Run ./install.sh, or sign in as you need them: `{} switch` "
-                "offers the one it needs, when it needs it.".format(COMMAND)))
-        if not read_schedule():
-            findings.append(Finding(
-                "warning",
-                "No schedule.json here, so nothing knows which account to spend",
-                "Copy it from the machine running the pings; `{} which` reads "
-                "it and needs nothing else.".format(COMMAND)))
         order = {"error": 0, "warning": 1}
-        return report_findings(sorted(findings, key=lambda f: order.get(f.level, 2)))
+        return report_findings(sorted(switch_only_findings(accounts),
+                                      key=lambda f: order.get(f.level, 2)))
 
     findings = validate_accounts(accounts)
     now = time.time()
@@ -5879,6 +5900,24 @@ def normalise_help(argv, commands):
     return ["--help"]
 
 
+def not_a_pinging_machine(clause):
+    """
+    Refuse an action that only makes sense where the pings run. Exit code 2.
+
+    This machine was configured with `--no-pings`, which is a decision somebody
+    made and the README leans on: a second machine pinging the same accounts
+    doubles what they consume and buys nothing at all. Acting on it anyway
+    because a command was typed would undo that quietly.
+    """
+    sys.stderr.write(
+        "This machine is configured not to ping, {}.\n"
+        "  The pings belong on one machine; a second one doubles what these "
+        "accounts consume.\n"
+        "  If this should be that machine, re-run:  ./install.sh --pings\n"
+        .format(clause))
+    return 2
+
+
 def _selected(accounts, name):
     return find_account(accounts, name) if name else accounts[0]
 
@@ -5920,6 +5959,12 @@ def show_log(accounts, name, lines, follow):
         except (IOError, OSError):
             continue
     if not entries:
+        if not pings_here():
+            sys.stderr.write(
+                "No logs here: this machine does not ping.\n"
+                "  Every ping, and every log line, is on the machine that "
+                "does.\n")
+            return 1
         sys.stderr.write("No logs yet — run `claude-window ping` first.\n")
         return 1
     # Timestamp first, then each file's own order. Sorting whole lines would
@@ -6060,8 +6105,11 @@ def cli(argv=None):
                 # rest exist. Naming a few beats pointing at `help`, which is
                 # only useful to someone who already suspects there is more.
                 print()
-                print("Other commands: which, switch, doctor, log, realign, "
-                      "setup — run `{} help` for all of them.".format(COMMAND))
+                print("Other commands: {} — run `{} help` for all of "
+                      "them.".format(
+                          "which, switch, doctor, log, realign, setup"
+                          if pings_here() else "which, switch, doctor, setup",
+                          COMMAND))
             return code
         if command == "which":
             # A machine that pings nothing has no state of its own; a copy of
@@ -6079,11 +6127,19 @@ def cli(argv=None):
         if command == "log":
             return show_log(accounts, args.account, args.lines, args.follow)
         if command == "realign":
+            if not pings_here():
+                return not_a_pinging_machine("so there is no schedule of its "
+                                             "own to realign")
             return realign(accounts, confirm=args.confirm)
         if command == "doctor":
             return doctor(accounts)
         if command == "check":
-            return report_findings(validate_accounts(accounts))
+            # The same split `doctor` makes. On a machine that does not ping,
+            # "Account 1: ~/.claude-1 does not exist -- create it and sign in"
+            # is an instruction to build the very thing it was told not to.
+            return report_findings(validate_accounts(accounts)
+                                   if pings_here()
+                                   else switch_only_findings(accounts))
         if command == "accounts":
             for account in accounts:
                 print(account.name)
@@ -6130,9 +6186,16 @@ def cli(argv=None):
             offer_launcher_link()
             return 0
         if command == "init":
+            if not pings_here():
+                return not_a_pinging_machine("so it has no checkpoint to "
+                                             "build")
             init(_selected(accounts, args.account))
             return 0
         if command == "ping":
+            if not pings_here():
+                return not_a_pinging_machine("and sending one by hand is "
+                                             "exactly what that decision was "
+                                             "about")
             ping(_selected(accounts, args.account), accounts)
             publish_schedule(accounts)
             return 0
