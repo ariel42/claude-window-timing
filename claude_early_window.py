@@ -3192,6 +3192,21 @@ def login_fingerprint(login):
     return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
 
 
+# What a full claude.ai sign-in grants. A credential can be narrowed to a
+# subset on refresh -- and never widened back, which the token endpoint refuses
+# outright -- so a parked login carrying less than this is one somebody has to
+# replace rather than repair.
+FULL_LOGIN_SCOPES = ("user:file_upload", "user:inference", "user:mcp_servers",
+                     "user:profile", "user:sessions:claude_code")
+
+
+def login_scopes(login):
+    """What this stored login is allowed to do, as recorded beside it."""
+    creds = (_read_json(credentials_path(login)).get("claudeAiOauth") or {})
+    scopes = creds.get("scopes")
+    return tuple(sorted(scopes)) if isinstance(scopes, list) else ()
+
+
 def parked_logins(accounts):
     """{account name: Login} for every account with a login parked."""
     return {a.name: switch_store(a) for a in accounts
@@ -3798,6 +3813,18 @@ def switch_findings(accounts):
                     account.display, fmt_time(expires)),
                 "Switch to it before then and it renews itself; leave it and it "
                 "needs a browser sign-in."))
+        scopes = login_scopes(store)
+        missing = [s for s in FULL_LOGIN_SCOPES if scopes and s not in scopes]
+        if missing:
+            findings.append(Finding(
+                "warning",
+                "Account {}'s parked login is missing {}".format(
+                    account.display, ", ".join(missing)),
+                "It can still answer, but not everything Claude Code does — "
+                "and a narrowed sign-in cannot be widened again, only "
+                "replaced. Sign in once more: {}".format(
+                    sign_in_command(store))))
+
         parked_grant = login_fingerprint(store)
         if parked_grant and parked_grant == login_fingerprint(user_login()):
             findings.append(Finding(

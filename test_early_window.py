@@ -4609,6 +4609,39 @@ def test_doctor_notices_a_store_going_stale():
         check("one about to expire is a warning", [f.level for f in findings],
               ["warning"])
 
+        # A login can be narrowed to a subset of its scopes on refresh and can
+        # never be widened again -- the token endpoint refuses outright. So a
+        # reduced one has to be noticed here rather than mid-switch, and the
+        # advice has to be "replace it", not "fix it".
+        creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
+            (time.time() + 30 * 86400) * 1000)
+        creds["claudeAiOauth"]["scopes"] = list(ew.FULL_LOGIN_SCOPES)
+        with open(ew.credentials_path(store), "w") as f:
+            json.dump(creds, f)
+        check("a full-scope login is not a finding", ew.switch_findings(accounts), [])
+
+        creds["claudeAiOauth"]["scopes"] = ["user:inference"]
+        with open(ew.credentials_path(store), "w") as f:
+            json.dump(creds, f)
+        findings = ew.switch_findings(accounts)
+        check("a narrowed one is a warning", [f.level for f in findings],
+              ["warning"])
+        check_true("naming what it lost",
+                   "user:profile" in findings[0].message)
+        check_true("and saying it can only be replaced",
+                   "cannot be widened" in findings[0].hint)
+
+        # Older credential files record no scopes at all; silence beats a
+        # warning invented from missing data.
+        del creds["claudeAiOauth"]["scopes"]
+        with open(ew.credentials_path(store), "w") as f:
+            json.dump(creds, f)
+        check("a file that records no scopes says nothing",
+              ew.switch_findings(accounts), [])
+        creds["claudeAiOauth"]["scopes"] = list(ew.FULL_LOGIN_SCOPES)
+        with open(ew.credentials_path(store), "w") as f:
+            json.dump(creds, f)
+
         shutil.copyfile(ew.credentials_path(accounts[1]),
                         ew.credentials_path(store))
         levels = [f.level for f in ew.switch_findings(accounts)]
