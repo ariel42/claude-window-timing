@@ -20,3 +20,8 @@ claude-window-timing*.timer
 __pycache__/
 *.pyc
 *.pyo
+
+# Half-written files from an interrupted atomic write. They hold the same
+# account names and paths as the real ones and must never be committed.
+*.tmp
+*.tmp.*

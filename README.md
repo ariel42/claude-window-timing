@@ -4,7 +4,7 @@
 
 This puts that timing back under your control. It starts your window before you arrive, keeps one running around the clock, and — with more than one subscription — holds their windows apart so a fresh one is never far away, tells you which to spend, and moves you there in a single command.
 
-- **A window already running when you sit down.** A background ping opens it at dawn, so 9:00 finds you with a nearly untouched window rather than one you have just started. Your next fresh window arrives at 11:40 instead of 14:00. The pings themselves cost nothing — Claude serves them from its prompt cache, and [cache reads are not deducted from your limit](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+- **A window already running when you sit down.** Pings keep one open around the clock, so you never start the clock yourself — you arrive partway into a window that is already running, and the next one comes sooner. Where in the window you land is luck; averaged over many days it is about 2.5 hours of waiting for a fresh one instead of a flat 5. The pings cost almost nothing against the 5-hour limit — Claude serves them from its prompt cache — and a little against the separate weekly one ([the numbers](#notes-and-caveats)).
 - **Hit the limit, keep working.** `claude-window switch` points your own Claude Code at an account that still has quota. No logging out, no browser, no losing your place — and it refuses when it would not actually work.
 - **A fresh window every 5/N hours instead of every 5.** Two subscriptions are held 2h30m apart, three 1h40m. Not more quota — quota that arrives when you need it, instead of all at once and then not for hours.
 - **A straight answer to which account to spend.** The window that expires first, skipping any account that cannot serve a request at all — a spent weekly limit, a lapsed plan, an expired sign-in.
@@ -99,7 +99,7 @@ The account you are signed in as right now needs no sign-in of its own: the firs
 
 **Give each one its own sign-in rather than a copy of an existing login.** Claude Code rotates refresh tokens strictly: the moment one holder refreshes, the token it replaced is rejected outright. A copy therefore keeps working until its own access token runs out — about eight hours — and is then signed out, far enough from the copy that nothing connects the two. Two *separate* logins to one account coexist for as long as they both live, which is why the ping directories each get their own too.
 
-That is also why a switch **moves** a login rather than copying one: the store is a parking place, the copy in `~/.claude` is the only live one, and switching parks the outgoing login before installing the incoming one. `doctor` says so if it ever finds one login in two places.
+That is also why a switch **moves** a login rather than copying one: the store is a parking place and the copy in `~/.claude` is the only live one. The outgoing login is read into memory, the incoming one installed, and only then is the outgoing one written to its store — so there is no moment when one grant sits in two directories, not even if the machine dies in the middle. `doctor` says so if it ever finds one login in two places.
 
 Three things worth knowing before you rely on it:
 
@@ -157,7 +157,7 @@ Three things worth knowing:
 
 - **Signing in sends no message to Claude**, so it starts no usage window. There is no good or bad moment, and nothing to time.
 - **Sign in to each directory even if you already use that account elsewhere.** Each gets its own login rather than a copy of one, so a token refresh in a ping directory can never log you out of your own Claude Code.
-- **How many sign-ins that is.** One per ping directory, plus one per account you want to switch to — except the account you are already signed in as, which needs none, because that login moves into its own store the first time you switch away from it. On a machine running the pings for two accounts, that is three; on a machine that only switches, one. If you have never signed in to Claude Code on this machine there is nothing to adopt, so it is two per account and one per account respectively — and that works: nothing here needs you to be signed in before you start. Two per account is the floor, not an accident: the ping directory refreshes that account's token every eight hours forever, your own Claude Code refreshes too, and rotation is strict — one login in both places means whichever refreshes second is signed out. Setup lists an account's sign-ins together so that a browser only has to change identity once per account, which is the part that actually costs time under SSO.
+- **How many sign-ins that is.** One per ping directory, plus one per account you want to switch to — except the account you are already signed in as, which needs none, because that login moves into its own store the first time you switch away from it. That exemption needs the tool to be able to recognise the account you are on, which it can once its ping directory is signed in or a `schedule.json` has been copied across — so on a **first** install expect two per account, and one fewer on any re-run. On a machine that only switches, it is one per account, or one fewer once the schedule is there. Nothing requires you to be signed in to anything before you start. Two per account is the floor, not an accident: the ping directory refreshes that account's token every eight hours forever, your own Claude Code refreshes too, and rotation is strict — one login in both places means whichever refreshes second is signed out. Setup lists an account's sign-ins together so that a browser only has to change identity once per account, which is the part that actually costs time under SSO.
 
 You never have to be awake at a particular hour. The service works out where each window sits and spaces them itself, holding an account back when that is what it takes.
 
@@ -210,7 +210,7 @@ Every run is logged, so the log doubles as a record of your usage through the da
 
 ```
 [2026-08-11 11:37:26] Turn confirmed: cache_read=6864 cache_write=0 in=10 out=54
-[2026-08-11 11:37:26] Usage: 5-hour 82% (resets 15:30:00, in 3h51m) · weekly 17% (...)
+[2026-08-11 11:37:26] Usage: 5-hour 82% (resets 2026-08-11 15:30:00, in 3h51m29s) · weekly 17% (resets 2026-08-17 10:00:00, in 142h21m29s)
 ```
 
 ## Staying on schedule
@@ -221,7 +221,7 @@ A window lasts 5 hours and the pings are 30 minutes apart, so a ping lands exact
 
 **Sometimes a ping does not happen.** The laptop slept, the network dropped, or you used the window up yourself and Claude refused the ping until your limit reset. When the ping at the *end* of a window is missed, the next window starts late — and stays late, because every window after it is measured from that late start.
 
-**The fix.** Claude Code reports exactly when your current window ends. Shortly before it does, the tool books one extra ping for **30 seconds after** that moment. Because the regular 30-minute rhythm restarts from whenever the last ping happened, everything after it comes back into step. One correction and the schedule is repaired.
+**The fix.** Claude Code reports exactly when your current window ends. Shortly before it does, the tool books one extra ping for **30 seconds after** that moment — plus a minute per account beyond the first, so several accounts correcting at once do not ping in the same instant. Because the regular 30-minute rhythm restarts from whenever the last ping happened, everything after it comes back into step. One correction and the schedule is repaired.
 
 **Why 30 seconds late rather than exactly on time?** Early and late are not equally bad. A ping a moment *early* finds the old window still running, achieves nothing, and waits another 30 minutes. A ping a moment *late* starts the new window a few seconds late. So it deliberately aims late.
 
@@ -298,10 +298,10 @@ Answering "no pings" on a machine that has been pinging offers to stop its timer
 | `claude-window` | Status. Typing it can never spend quota. |
 | `claude-window status [--json]` | What every account is doing, and which to use now. |
 | `claude-window which` | Just the recommendation, and what is unusable. |
-| `claude-window switch [2]` | Point your own Claude Code at an account. The only command that writes to `~/.claude`. |
+| `claude-window switch [2] [--no-sign-in]` | Point your own Claude Code at an account. The only command that writes to `~/.claude`. |
 | `claude-window doctor` | Check the setup and say what is wrong. |
 | `claude-window realign [--confirm]` | Show, then optionally apply, a spacing correction. |
-| `claude-window log [2] [-f]` | A ping log, or every account's interleaved. |
+| `claude-window log [2] [-f] [-n N]` | A ping log, or every account's interleaved. |
 | `claude-window accounts` | List the configured accounts. |
 | `claude-window check` | Validate the accounts without changing anything. |
 | `claude-window ping [2]` | Send one ping. This is what the timer runs. |
@@ -324,7 +324,7 @@ Uninstalling stops the timers and removes every unit, and by default leaves this
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 
-Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool, including the empty `pingcwd` inside each that its pings run from. `~/.claude-switch/<name>` holds a parked login per account and exists only if you use `switch`, which is also the only thing that ever writes to `~/.claude` or `~/.claude.json`.
+Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool, including the empty `pingcwd` inside each that its pings run from. `~/.claude-switch/<name>` holds a parked login per account; it appears as soon as you run the sign-in the wizard prints, alongside `.backups/` and `.orphaned/`. `switch` is the only thing that ever writes to `~/.claude` or `~/.claude.json`.
 
 The tests cover the decisions that fail silently — which reset time to believe, how to space windows for the least dead time, whether a ping can start a window at the wrong moment, which accounts are safe to recommend, and whether anything writes where it should not — along with the words each command prints in each state it can be in, because a recommendation nobody can act on is a bug too. Switching gets the same treatment, and one test there is worth more than the rest: after a switch, no login may exist in two places at once. That is the failure that would otherwise show up as an unexplained logout eight hours later, and it is checked by counting refresh tokens across every directory involved. A full install, uninstall, purge and re-install runs end to end in a sandboxed home directory. They spend no usage: a fake CLI stands in for Claude, so all of that can be exercised with no account at all, and nothing they do touches a running install.
 
@@ -342,10 +342,10 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 - Pings are cheap but not free, and they also draw a little from the separate **weekly** limit — about 48 pings a day per account.
 - Pings ask Claude for no thinking and never update the CLI. Thinking is billed as output and a ping's reply is discarded; an update rewrites the tool definitions that sit at the front of every cached prompt, which would make your own open sessions expensive to resume. Neither affects how you run Claude Code yourself.
 - Accounts must be genuinely different Claude accounts. Signing in twice as the same one looks like it works and buys nothing; setup checks for it.
-- **Do not use `/login` or `/logout` inside a ping directory.** That is how the tool knows which account it is pinging. Change accounts by editing `accounts.json` and re-running `./install.sh`.
-- A booked correction does not survive a reboot. Harmless: the next ordinary ping reads the reset times again and books another.
+- **Do not point a ping directory at a *different* account with `/login`.** That directory's identity is how the tool knows which account it is pinging. Signing the *same* account in again is fine and is what `doctor` tells you to do when a login expires; changing which account lives there means editing `accounts.json` and re-running `./install.sh`.
+- A booked *anchor* does not survive a reboot — it is a transient systemd unit. Harmless: the next ordinary ping reads the reset times again and books another. A hold booked by `realign --confirm` is written to `state/` and does survive.
 - It relies on where Claude Code stores sessions and on the window reset time it reports. Both are internal details that a future release could change; the tests would notice, and `doctor` reports what it can verify.
-- Linux only. Running the pings needs systemd; `--no-pings` does not, but switching reads the credentials file Claude Code keeps on Linux, which macOS replaces with the Keychain. macOS and Windows are not supported either way.
+- Linux only, and enforced rather than merely stated. Running the pings needs systemd; `--no-pings` does not, but switching reads the credentials file Claude Code keeps on Linux, which macOS replaces with the Keychain — so `switch` refuses there rather than consuming a parked login to no effect.
 
 ## Where the pings run
 

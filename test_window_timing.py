@@ -4233,6 +4233,45 @@ def test_the_refusals_fire_where_the_readme_says_to_switch():
         restore()
 
 
+def test_switching_refuses_where_it_cannot_work():
+    """
+    macOS keeps the credential in the Keychain, so a switch there writes a file
+    Claude Code does not read -- and takes the store's only copy of that login
+    on the way, leaving the user on the account they started with and one
+    browser sign-in worse off. The README always said unsupported; nothing
+    enforced it, and --no-pings installs cleanly there because it needs neither
+    systemd nor a timer.
+    """
+    section("Switching refuses where it cannot work")
+
+    check("nothing blocks it on Linux", ew.platform_blocker(), None)
+
+    saved = sys.platform
+    try:
+        sys.platform = "darwin"
+        blocker = ew.platform_blocker()
+        check_true("but macOS is refused", blocker is not None)
+        check_true("naming the platform", "darwin" in blocker.message)
+        check_true("and saying why the file would not be read",
+                   "Keychain" in blocker.hint)
+
+        restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                                  parked=("2",))
+        try:
+            before = _snapshot_user_files()
+            out, err, code = _capture(lambda: ew.switch_account(
+                accounts, "2", sign_in=False))
+            check("the switch refuses rather than consuming the login", code, 1)
+            check("nothing was written", _snapshot_user_files(), before)
+            check("and the parked login is still parked",
+                  os.path.exists(ew.credentials_path(
+                      ew.switch_store(accounts[1]))), True)
+        finally:
+            restore()
+    finally:
+        sys.platform = saved
+
+
 def test_an_override_is_reported_before_anything_reassuring():
     """
     `ANTHROPIC_API_KEY` decides which account is billed whatever this command
@@ -5760,6 +5799,7 @@ def main():
                  test_an_interrupted_switch_never_leaves_a_login_in_two_places,
                  test_the_schedule_is_treated_as_input_not_configuration,
                  test_the_refusals_fire_where_the_readme_says_to_switch,
+                 test_switching_refuses_where_it_cannot_work,
                  test_an_override_is_reported_before_anything_reassuring,
                  test_doctor_notices_a_timer_running_the_wrong_script,
                  test_a_credential_directory_is_never_left_wide,

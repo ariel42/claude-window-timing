@@ -80,8 +80,9 @@ LOG_RETENTION_HOURS = 48
 # Timing
 # ---------------------------------------------------------------------------
 #
-# INTERVAL_MIN is the single source of truth for the ping cadence: install.sh
-# reads it from here when it writes the systemd timer. 30 divides the 5-hour
+# INTERVAL_MIN is the single source of truth for the ping cadence:
+# install_units() reads it from here when it writes the systemd timer.
+# (install.sh reads nothing — it checks prerequisites and execs `setup`.) 30 divides the 5-hour
 # window evenly, so consecutive windows sit back-to-back, and it stays well under
 # the ~1-hour prompt-cache TTL so every ping is a (rate-limit-exempt) cache read.
 INTERVAL_MIN = 30
@@ -1425,7 +1426,7 @@ def _permissions(path):
 # Set on every ping so anything watching `claude` invocations can tell a ping
 # from a person. Nothing here needs it — CLAUDE_CONFIG_DIR already pins the
 # account — but a marker is clearer than inferring intent from a path.
-PING_MARKER_ENV = "CLAUDE_EARLY_WINDOW_PING"
+PING_MARKER_ENV = "CLAUDE_WINDOW_TIMING_PING"
 
 
 # Environment variables to pass through to the Claude subprocess *if* present.
@@ -2593,14 +2594,25 @@ def realign(accounts, confirm=False):
 def status(accounts):
     now = time.time()
     states = {a.name: read_state(a) for a in accounts}
+    pings = pings_here()
 
     print("Claude Code Window Timing — status")
     print("=" * 34)
     print()
 
-    avail = availabilities(accounts, states, now)
-    chosen, reason = choose_account(accounts, states, now, avail)
-    print(headline(chosen, avail[chosen.name], len(accounts)))
+    # A machine that pings nothing has no readings of its own, and answering
+    # "no window information yet — run a ping first" on a machine the README
+    # says must never ping is worse than useless: the remedy is one it has been
+    # told not to apply. `which` already answers from the published schedule;
+    # the headline here should agree with it rather than contradict it.
+    view = schedule_view(accounts)
+    if view:
+        known, states, avail, _published_at = view
+    else:
+        known = accounts
+        avail = availabilities(accounts, states, now)
+    chosen, reason = choose_account(known, states, now, avail)
+    print(headline(chosen, avail[chosen.name], len(known)))
     print("  {}".format(reason))
 
     # Only once switching has been set up. Until then this tool has no business
@@ -2621,16 +2633,21 @@ def status(accounts):
                   "{}".format(COMMAND, chosen.display))
 
     for account in accounts:
-        state = states[account.name]
+        state = states.get(account.name, {})
         print()
         print("Account {}".format(account.display))
-        print("  Config dir    : {}".format(account.config_dir))
+        # Naming the ping directory on a machine that does not ping points at
+        # somewhere that does not exist; the store is where its login lives.
+        print("  {:<14}: {}".format(
+            "Config dir" if pings else "Parked login",
+            account.config_dir if pings else switch_store(account).config_dir))
 
         installed = (os.path.exists(account.session_id_file)
                      and os.path.exists(account.checkpoint_backup))
-        print("  Checkpoint    : {}".format(
-            _read_text(account.session_id_file).strip() if installed
-            else "MISSING — run ./install.sh"))
+        if pings:
+            print("  Checkpoint    : {}".format(
+                _read_text(account.session_id_file).strip() if installed
+                else "MISSING — run ./install.sh"))
 
         if state.get("last_run"):
             print("  Last ping     : {} ({} ago)".format(
@@ -2657,31 +2674,36 @@ def status(accounts):
         elif usable.tier != USABLE:
             print("  Usable        : no — {}".format(usable.note))
 
-        boundary = state.get("boundary")
-        if boundary:
-            stale = "" if boundary > now else " — passed, awaiting next ping"
-            print("  Next start-of-window opportunity: {} (in {}){}".format(
-                fmt_time(boundary), fmt_delta(boundary - now), stale))
-            print("    set by the {}   [via {}]".format(
-                state.get("boundary_label", "?"),
-                state.get("limits_source", "?")))
-        else:
-            print("  Next start-of-window opportunity: not known yet — "
-                  "run one ping first")
+        # Everything below describes this machine's own pinging. On a machine
+        # that does not ping, each line is either unknowable or actively
+        # misleading — a "Next ping" for a timer that does not exist.
+        if pings:
+            boundary = state.get("boundary")
+            if boundary:
+                stale = "" if boundary > now else " — passed, awaiting next ping"
+                print("  Next start-of-window opportunity: {} (in {}){}".format(
+                    fmt_time(boundary), fmt_delta(boundary - now), stale))
+                print("    set by the {}   [via {}]".format(
+                    state.get("boundary_label", "?"),
+                    state.get("limits_source", "?")))
+            else:
+                print("  Next start-of-window opportunity: not known yet — "
+                      "run one ping first")
 
-        hold = state.get("hold")
-        if hold and hold.get("until", 0) > now:
-            print("  Holding       : until {} — {}".format(
-                fmt_time(hold["until"]), hold.get("reason", "alignment")))
+            hold = state.get("hold")
+            if hold and hold.get("until", 0) > now:
+                print("  Holding       : until {} — {}".format(
+                    fmt_time(hold["until"]), hold.get("reason", "alignment")))
 
-        pending = anchor_pending(account)
-        print("  Anchor        : {}".format(
-            "pending — " + pending if pending else "none scheduled"))
+            pending = anchor_pending(account)
+            print("  Anchor        : {}".format(
+                "pending — " + pending if pending else "none scheduled"))
 
-        result = _systemctl("list-timers", "--all", account.timer_unit)
-        for line in (result.stdout or "").splitlines():
-            if account.timer_unit in line:
-                print("  Next ping     : {}".format(" ".join(line.split()[:4])))
+            result = _systemctl("list-timers", "--all", account.timer_unit)
+            for line in (result.stdout or "").splitlines():
+                if account.timer_unit in line:
+                    print("  Next ping     : {}".format(
+                        " ".join(line.split()[:4])))
 
     if len(accounts) > 1:
         print()
@@ -3121,9 +3143,11 @@ def report_findings(findings):
 #     refreshes, and the stale one is signed out about eight hours later, from a
 #     cause nobody would connect to the switch. So a login is never in two places
 #     at once: each account's store is a parking place, the copy in ~/.claude is
-#     the only live one, and a switch *parks the outgoing login before installing
-#     the incoming one*. That is why this is a move and not a copy, and it is the
-#     single most important thing in this section.
+#     the only live one. The outgoing login is read into memory, the incoming
+#     one installed, and only then is the outgoing one written to its store, so
+#     there is no instant at which one grant sits in two directories -- not even
+#     if the machine dies between the two. That is why this is a move and not a
+#     copy, and it is the single most important thing in this section.
 #
 #   * The bearer token decides which account is billed; the oauthAccount block in
 #     ~/.claude.json decides which account Claude Code tells you that you are.
@@ -3842,6 +3866,28 @@ def switch_blockers(accounts, account, usable=None):
     return findings
 
 
+def platform_blocker():
+    """
+    Why this cannot work here, or None.
+
+    On macOS the credential lives in the Keychain, not in a file. A switch
+    would write a file Claude Code ignores, and take the store's only copy of
+    that login on the way -- leaving the user on the account they started with
+    and one browser sign-in worse off. The README has always said macOS is
+    unsupported; nothing enforced it, and `--no-pings` installs cleanly there
+    because it needs neither systemd nor a timer.
+    """
+    if sys.platform.startswith("linux"):
+        return None
+    return Finding(
+        "error",
+        "Switching accounts is only supported on Linux (this is {})".format(
+            sys.platform),
+        "Claude Code keeps its credential in the Keychain here, not in a file, "
+        "so a switch would move a file it does not read — and consume the "
+        "parked login doing it.")
+
+
 def switch_account(accounts, name=None, sign_in=True):
     """
     Point the user's own Claude Code at one account. Returns an exit code.
@@ -3887,6 +3933,12 @@ def switch_account(accounts, name=None, sign_in=True):
     # which account is billed regardless of what is on disk, so "you are
     # already signed in as that account" is a false comfort while one is set --
     # and with ANTHROPIC_API_KEY it is not even the same subscription.
+    unsupported = platform_blocker()
+    if unsupported is not None:
+        sys.stderr.write("ERROR: {}\n  -> {}\n".format(
+            unsupported.message, unsupported.hint))
+        return 1
+
     overrides = account_overrides()
     if overrides:
         for where, var in overrides:
@@ -4334,9 +4386,10 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
         return 2
     if count > 4:
         print()
-        print("Beyond three accounts this stops being the cheaper option: four")
-        print("Pro subscriptions cost about the same as one Max plan, which")
-        print("gives you a single pool instead of four you cannot combine.")
+        print("Beyond three accounts this stops being the cheaper option:")
+        print("four Pro subscriptions cost about the same as one Max plan,")
+        print("which gives you a single pool instead of four you cannot")
+        print("combine — and this many logins to keep alive besides.")
         if not _ask_yes("Continue with {} anyway?".format(count), default=False):
             return 0
 
