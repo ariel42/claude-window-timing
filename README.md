@@ -63,11 +63,14 @@ claude-window which
 Use account 1 (personal)
   the only account usable right now; its window ends 2026-08-13 03:52:35 (in 4h00m00s)
   That is the window to spend; how you use the account is up to you.
+  Point your own Claude Code at it:  claude-window switch 1
 
   1 (personal)  usable — window ends in 4h00m00s   <- use this
   2 (work)      unusable until 2026-08-13 01:22:35 — its 5-hour limit is spent
   3 (spare)     unusable until 2026-08-14 23:52:35 — its weekly limit is spent
 ```
+
+That last line appears once switching is set up, and names the account rather than making you match it up yourself. Until then `which` says nothing about switching at all.
 
 Two questions, in that order. **Can this account serve a request at all?** and only then **how soon does its window expire?** Spending the most perishable window first is the right rule — quota does not carry over — but it is exactly the wrong answer for an account Claude is about to refuse.
 
@@ -170,6 +173,9 @@ Claude Code Window Timing — status
 
 Use account 2 (work)
   its window ends first, 2026-08-11 13:00:00 (in 1h21m29s)
+
+Your Claude Code  : account 1 (personal)
+                    `claude-window switch` moves it to account 2 (work)
 
 Account 1 (personal)
   Config dir    : /home/you/.claude-1

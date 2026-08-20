@@ -5247,6 +5247,48 @@ def test_doctor_catches_a_machine_pinging_when_it_says_it_does_not():
         restore()
 
 
+def test_setup_names_an_account_it_is_about_to_drop():
+    """
+    Answering "1" where "2" was meant is an easy slip, and the layout shows
+    only what survives it -- so the wizard would ask "Go ahead?" about a
+    configuration quietly missing an account. Everything except the label
+    survives, which is worth saying too: it makes the mistake cheap to undo.
+    """
+    section("Setup names an account it is about to drop")
+
+    root = tempfile.mkdtemp()
+    saved = (ew.ACCOUNTS_FILE, ew._command_exists, sys.stdin)
+    try:
+        ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
+        ew._command_exists = lambda name: True
+        with open(ew.ACCOUNTS_FILE, "w") as f:
+            json.dump({"accounts": [
+                {"name": "1", "config_dir": "~/.claude-1", "label": "personal"},
+                {"name": "2", "config_dir": "~/.claude-2", "label": "work"}]}, f)
+
+        sys.stdin = io.StringIO("n\n")          # decline at "Go ahead?"
+        out, _, code = _capture(
+            lambda: ew.setup(argv_accounts=1, pings=True))
+        check("declining changes nothing", code, 0)
+        check_true("it says an account is being dropped", "Dropping" in out)
+        check_true("and which one, by the name the user gave it",
+                   "2 (work)" in out)
+        check_true("it says the timer stops", "timer stops" in out)
+        check_true("and that everything else survives",
+                   "left exactly as" in out and "label" in out)
+        check("the configuration was not touched, since it was declined",
+              [a["name"] for a in json.load(open(ew.ACCOUNTS_FILE))["accounts"]],
+              ["1", "2"])
+
+        # Nothing to say when the count is unchanged.
+        sys.stdin = io.StringIO("n\n")
+        out, _, _ = _capture(lambda: ew.setup(argv_accounts=2, pings=True))
+        check("no warning when no account is dropped", "Dropping" in out, False)
+    finally:
+        (ew.ACCOUNTS_FILE, ew._command_exists, sys.stdin) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_setup_says_the_pings_belong_on_one_machine():
     """
     The one thing someone installing this on their third laptop needs to be
@@ -5397,6 +5439,7 @@ def main():
                  test_setup_can_install_the_switcher_without_the_pings,
                  test_turning_the_pings_off_actually_turns_them_off,
                  test_doctor_catches_a_machine_pinging_when_it_says_it_does_not,
+                 test_setup_names_an_account_it_is_about_to_drop,
                  test_setup_says_the_pings_belong_on_one_machine):
         test()
     # Nothing armed on the way out, whatever a test did or failed to do.

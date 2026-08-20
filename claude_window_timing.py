@@ -4064,6 +4064,23 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
         if any(f.level == "error" for f in blockers):
             return 1
 
+    # Answering "1" where "2" was meant is a plausible slip, and the layout
+    # below shows only what survives it -- so without this the wizard asks
+    # "Go ahead?" about a configuration quietly missing an account, and the
+    # label is the one part that cannot be put back by re-running.
+    dropped = [a for a in existing
+               if a.name not in set(b.name for b in accounts)]
+    if dropped:
+        print()
+        print("Dropping {} from the configuration:".format(
+            "an account" if len(dropped) == 1 else "accounts"))
+        for account in dropped:
+            print("  account {:<10} {}".format(account.display,
+                                               account.config_dir))
+        print("Its timer stops." if len(dropped) == 1 else "Their timers stop.")
+        print("The directory, login, checkpoint and logs are left exactly as")
+        print("they are, so adding it back later costs nothing but the label.")
+
     print()
     print("Layout:")
     for account in accounts:
