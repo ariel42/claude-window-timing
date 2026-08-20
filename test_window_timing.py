@@ -3898,6 +3898,10 @@ def test_doctor_spots_residue_from_an_earlier_install():
         check("a foreign claude-window unit is reported", len(found), 1)
         check_true("and the message says how to clear it",
                    "reset-failed" in found[0].hint)
+        # Clearing the flag is not the end of it if a timer keeps starting the
+        # thing: it fails again on the next tick, for ever.
+        check_true("and how to stop it coming back",
+                   "disable --now" in found[0].hint)
 
         # Our own units failing is a different finding, made elsewhere; saying it
         # twice, and calling them foreign, would be worse than silence.

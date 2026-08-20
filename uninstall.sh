@@ -14,12 +14,15 @@ echo "====================================="
 # Everything that needs judgement lives in the Python, where it is tested.
 python3 "$SCRIPT_DIR/claude_window_timing.py" uninstall "$@" || {
     echo "Could not read the account configuration; removing units by name." >&2
-    for prefix in claude-window-timing; do
-        systemctl --user list-units --all --plain --no-legend "${prefix}@*.timer" \
-            2>/dev/null | sed -n "s/^\(${prefix}@[^.]*\.timer\).*/\1/p" \
-            | while read -r unit; do systemctl --user disable --now "$unit" 2>/dev/null || true; done
-        rm -f "$USER_UNIT_DIR/${prefix}"*.service "$USER_UNIT_DIR/${prefix}"*.timer
-    done
+    systemctl --user list-units --all --plain --no-legend 'claude-window-timing@*.timer' \
+        2>/dev/null | sed -n 's/^\(claude-window-timing@[^.]*\.timer\).*/\1/p' \
+        | while read -r unit; do systemctl --user disable --now "$unit" 2>/dev/null || true; done
+    rm -f "$USER_UNIT_DIR"/claude-window-timing*.service \
+          "$USER_UNIT_DIR"/claude-window-timing*.timer
+    # The per-account stagger lives in a drop-in directory, which `rm -f` above
+    # cannot remove — leaving it behind makes the next install look like an
+    # upgrade of something that is no longer there.
+    rm -rf "$USER_UNIT_DIR"/claude-window-timing*.timer.d
     systemctl --user daemon-reload 2>/dev/null || true
 }
 

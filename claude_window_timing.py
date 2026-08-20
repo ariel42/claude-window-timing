@@ -33,9 +33,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
-import time
 import uuid
 from datetime import datetime, timedelta
 
@@ -83,10 +83,11 @@ LOG_RETENTION_HOURS = 48
 # ---------------------------------------------------------------------------
 #
 # INTERVAL_MIN is the single source of truth for the ping cadence:
-# install_units() reads it from here when it writes the systemd timer.
-# (install.sh reads nothing — it checks prerequisites and execs `setup`.) 30 divides the 5-hour
-# window evenly, so consecutive windows sit back-to-back, and it stays well under
-# the ~1-hour prompt-cache TTL so every ping is a (rate-limit-exempt) cache read.
+# install_units() reads it from here when it writes the systemd timer, and
+# install.sh reads nothing — it checks prerequisites and execs `setup`. 30
+# divides the 5-hour window evenly, so consecutive windows sit back-to-back, and
+# it stays well under the ~1-hour prompt-cache TTL so every ping is a
+# (rate-limit-exempt) cache read.
 INTERVAL_MIN = 30
 
 # A window reset reported as 17:00:00 is pinged at 17:00:30. Firing *early* is the
@@ -424,8 +425,6 @@ def find_account(accounts, name):
 
 
 # ---------------------------------------------------------------------------
-# Upgrading from the single-account layout
-# ---------------------------------------------------------------------------
 # Which account to use right now
 # ---------------------------------------------------------------------------
 #
@@ -535,7 +534,11 @@ def next_expiry(state, now):
 
 def spent_limits(state, now):
     """
-    Every reported limit that is fully spent, as (name, when it resets).
+    Every reported limit that is fully spent.
+
+    Each entry is (name, when it comes back, whether that time was observed);
+    an unobserved one is the longest the limit could possibly run, offered as
+    an upper bound rather than as a fact.
 
     A reset already in the past is not evidence of anything: it describes a
     window that has since rolled over, so the percentage recorded beside it
@@ -1108,6 +1111,10 @@ def describe_alignment(accounts, states, now, suggest_realign=True,
                                                          record=record)
     lines = []
     window = WINDOW_HOURS * 3600
+    # Measured rather than assumed: an account labelled "1 (personal)" is wider
+    # than the fixed column this used to have, so it pushed its own line out of
+    # line with every other one.
+    width = max([len(a.display) for a in accounts] or [0])
     if len(participants) < 2:
         # A brand-new install is not a fault, and must not read like one: no
         # account has a window yet because nothing has been pinged yet.
@@ -1123,8 +1130,8 @@ def describe_alignment(accounts, states, now, suggest_realign=True,
         for account in accounts:
             holding, why = participation(account, states[account.name], now)
             if not holding:
-                lines.append("  account {:<10} is not: {}".format(
-                    account.display, why))
+                lines.append("  account {:<{}} is not: {}".format(
+                    account.display, width, why))
         return lines, delays, total, settled
 
     # The target is 5/N over the accounts that will actually start a window, not
@@ -1145,8 +1152,8 @@ def describe_alignment(accounts, states, now, suggest_realign=True,
     booked = False
     for account in accounts:
         if account.name not in delays:
-            lines.append("  account {:<10} not holding a window right now — "
-                         "{}".format(account.display,
+            lines.append("  account {:<{}} not holding a window right now — "
+                         "{}".format(account.display, width,
                                      participation(account, states[account.name],
                                                    now)[1]))
             continue
@@ -1160,8 +1167,8 @@ def describe_alignment(accounts, states, now, suggest_realign=True,
             note = ""
         else:
             note = "   hold {} to line up".format(fmt_delta(delay))
-        lines.append("  account {:<10} next window starts {}{}".format(
-            account.display, fmt_time(boundary), note))
+        lines.append("  account {:<{}} next window starts {}{}".format(
+            account.display, width, fmt_time(boundary), note))
 
     if total < ALIGN_DEADBAND_SEC:
         lines.append("Spacing is correct.")
@@ -3140,9 +3147,13 @@ def _stray_unit_findings(accounts):
 
     An earlier version installed under another name, or a hand-rolled attempt at
     the same idea, leaves a failed entry systemd remembers indefinitely — long
-    after its unit file is gone. It cannot run, but it is the first thing anyone
-    diagnosing this will trip over, so say what it is rather than leave them to
-    wonder.
+    after its unit file is gone. It is the first thing anyone diagnosing this
+    will trip over, so say what it is rather than leave them to wonder.
+
+    Clearing the failure is not always the end of it: a service fails because
+    something started it, and if that something is a timer nobody disabled, it
+    will fail again on the next tick and go on doing so for ever. So the hint
+    covers both, rather than the half that is true on the day it is read.
     """
     ours = set()
     for account in accounts:
@@ -3161,9 +3172,12 @@ def _stray_unit_findings(accounts):
                 "warning",
                 "{} is in a failed state but is not part of this "
                 "install".format(unit),
-                "Probably an earlier or hand-rolled version. It cannot run, but "
-                "it will confuse the next person to look. Clear it with: "
-                "systemctl --user reset-failed {}".format(unit)))
+                "Probably an earlier or hand-rolled version; nothing here "
+                "installed it. Clear it with `systemctl --user reset-failed "
+                "{}`. If it comes back, a timer is still starting it: "
+                "`systemctl --user list-timers --all` names it, and "
+                "`systemctl --user disable --now <that timer>` stops it "
+                "firing.".format(unit)))
     return findings
 
 
@@ -4014,7 +4028,7 @@ def published_uuid(account):
     return ""
 
 
-def switch_blockers(accounts, account, usable=None):
+def switch_blockers(account, usable=None):
     """
     Everything that should stop or interrupt a switch to `account`, worst first.
 
@@ -4233,7 +4247,7 @@ def switch_account(accounts, name=None, sign_in=True):
         return 0
 
     store = switch_store(account)
-    findings = switch_blockers(accounts, account, avail.get(account.name))
+    findings = switch_blockers(account, avail.get(account.name))
 
     # The sign-in is offered only once everything else has passed. Offering it
     # first meant a full browser round-trip could end in "Nothing was changed"
@@ -4243,7 +4257,7 @@ def switch_account(accounts, name=None, sign_in=True):
                      and "No login is parked" not in f.message]
             and sys.stdin.isatty() and not ASSUME_YES):
         offer_sign_in(account, store)
-        findings = switch_blockers(accounts, account, avail.get(account.name))
+        findings = switch_blockers(account, avail.get(account.name))
     errors = [f for f in findings if f.level == "error"]
     for finding in findings:
         stream = sys.stderr if finding.level == "error" else sys.stdout
@@ -4265,12 +4279,12 @@ def switch_account(accounts, name=None, sign_in=True):
         return 1
 
     try:
-        return _perform_switch(accounts, account, current, avail, states)
+        return _perform_switch(account, current, states)
     finally:
         os.close(lock)          # releases the flock with it
 
 
-def _perform_switch(accounts, account, current, avail, states):
+def _perform_switch(account, current, states):
     """The half of `switch_account` that writes, run under the lock."""
     # Read before anything is overwritten: after install_login the outgoing
     # identity is gone from ~/.claude.json, and it is the only way to name the
@@ -4650,8 +4664,10 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
 
     if configured:
         print("Currently configured:")
+        width = max([len(a.display) for a in existing] or [0])
         for account in existing:
-            print("  account {:<10} {}".format(account.display, account.config_dir))
+            print("  account {:<{}} {}".format(account.display, width,
+                                               account.config_dir))
         print()
 
     count = argv_accounts
@@ -4705,8 +4721,9 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
         print()
         print("Dropping {} from the configuration:".format(
             "an account" if len(dropped) == 1 else "accounts"))
+        width = max(len(a.display) for a in dropped)
         for account in dropped:
-            print("  account {:<10} {}".format(account.display,
+            print("  account {:<{}} {}".format(account.display, width,
                                                account.config_dir))
         print("Its timer stops." if len(dropped) == 1 else "Their timers stop.")
         print("The directory, login, checkpoint and logs are left exactly as")
@@ -4714,9 +4731,10 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
 
     print()
     print("Layout:")
+    width = max(len(a.name) for a in accounts)
     for account in accounts:
-        print("  account {:<10} {}".format(
-            account.name,
+        print("  account {:<{}} {}".format(
+            account.name, width,
             account.config_dir if pings else switch_store(account).config_dir))
     if pings:
         print()
@@ -4738,9 +4756,6 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
 
     _write_accounts_file(accounts, pings=pings)
     print("Wrote {}".format(ACCOUNTS_FILE))
-
-    # Must happen before the checkpoint check below, or an upgrade would look
-    # like a fresh install and spend a ping rebuilding what it already has.
 
     # ── Signing in ──────────────────────────────────────────────────────────
     if pings:
