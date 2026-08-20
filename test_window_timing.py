@@ -2372,8 +2372,9 @@ def test_the_json_report_is_a_contract():
               sorted(entries[name]),
               ["available_at", "boundary", "boundary_label", "checkpoint",
                "config_dir", "consecutive_failures", "expires_at", "hold",
-               "label", "last_run", "limits_source", "name", "rate_limits",
-               "tier", "unusable_because", "unusable_until", "usable_now"])
+               "label", "last_run", "limits_read_at", "limits_source", "name",
+               "rate_limits", "tier", "unusable_because", "unusable_until",
+               "usable_now"])
     # The integers are an implementation detail; a caller should never see one.
     check("tiers travel as words", [entries[n]["tier"] for n in ("1", "2")],
           ["usable", "waiting"])
@@ -2385,6 +2386,10 @@ def test_the_json_report_is_a_contract():
                "limit is spent" in (entries["2"]["unusable_because"] or ""))
     check("a missing checkpoint is null, not an empty string",
           entries["1"]["checkpoint"], None)
+    # A caller cannot judge the figures without knowing their age, which is
+    # the same thing `which` says in words at the bottom of its answer.
+    check("and the figures are dated, so a script can judge them too",
+          entries["1"]["limits_read_at"], now - 60)
 
 
 def test_what_a_ping_records_from_how_it_went():
@@ -2679,6 +2684,19 @@ def test_the_log_reads_in_the_order_it_was_written():
     check("blank separators are not carried into the merged view",
           [line for line in buf.getvalue().splitlines() if not line.strip()], [])
 
+    # `entries[-n:]` counts from the wrong end when n is not positive: -5 asks
+    # for the oldest five lines of a log people read to see what just happened,
+    # and 0 asks for all of them.
+    for count, wanted in ((1, 1), (0, 0), (-5, 0)):
+        buf = io.StringIO()
+        saved, sys.stdout = sys.stdout, buf
+        try:
+            ew.show_log([first, second], None, count, False)
+        finally:
+            sys.stdout = saved
+        check("asking for {} lines shows {}".format(count, wanted),
+              len(buf.getvalue().splitlines()), wanted)
+
 
 # ---------------------------------------------------------------------------
 # Setup and diagnosis
@@ -2708,6 +2726,16 @@ def test_setup_lays_accounts_out_sensibly():
               [a.name for a in planned], ["main", "2", "3"])
         check("and their labels", planned[0].label, "work")
 
+        # Names come from the slot, so an existing account that already
+        # answers to the next number has to push it along. Written out
+        # unchecked, the pair would be a file the loader refuses.
+        planned = ew._plan_accounts([ew.Account("2", "~/.claude-2", 0)], 2)
+        check("a new account never collides with one already there",
+              [a.name for a in planned], ["2", "3"])
+        check("and gets a directory of its own with it",
+              planned[1].config_dir, ew.ping_config_dir("3"))
+
+        planned = ew._plan_accounts(existing, 3)
         ew._write_accounts_file(planned)
         written = json.load(open(ew.ACCOUNTS_FILE))
         check("the file records every account", len(written["accounts"]), 3)

@@ -4895,7 +4895,14 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
 
 
 def _plan_accounts(existing, count):
-    """Keep the accounts already configured, add or drop to reach `count`."""
+    """
+    Keep the accounts already configured, add or drop to reach `count`.
+
+    A new slot takes its position as its name, unless an account being kept
+    already answers to it: somebody whose accounts.json holds one account
+    called "2" would otherwise be handed a second one called "2", and every
+    run after that would refuse to read the file it had just been given.
+    """
     accounts = []
     for index in range(count):
         if index < len(existing):
@@ -4903,7 +4910,10 @@ def _plan_accounts(existing, count):
             accounts.append(Account(source.name, source.config_dir, index,
                                     source.label))
             continue
-        name = str(index + 1)
+        number, taken = index + 1, set(a.name for a in accounts)
+        while str(number) in taken:
+            number += 1
+        name = str(number)
         accounts.append(Account(name, ping_config_dir(name), index))
     return accounts
 
@@ -5333,6 +5343,9 @@ def _selected(accounts, name):
 
 def show_log(accounts, name, lines, follow):
     """Show one account's log, or every account's interleaved."""
+    # A count below zero would slice from the *front* — `-n -5` printing the
+    # oldest five lines of a log people read to see what just happened.
+    lines = max(0, lines)
     chosen = [_selected(accounts, name)] if name else accounts
     if len(chosen) == 1 and follow:
         account = chosen[0]
@@ -5373,7 +5386,7 @@ def show_log(accounts, name, lines, follow):
     # "Exited with code" it followed.
     entries.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
     width = max(len(a.name) for a in chosen)
-    for _, name_, _, line in entries[-lines:]:
+    for _, name_, _, line in (entries[-lines:] if lines else []):
         print("{:<{}}  {}".format(name_, width, line) if len(chosen) > 1 else line)
     return 0
 
@@ -5437,6 +5450,11 @@ def status_json(accounts):
             "boundary": state.get("boundary"),
             "boundary_label": state.get("boundary_label"),
             "limits_source": state.get("limits_source"),
+            # How old the figures above are, for a caller that has to decide
+            # whether to trust them — the same question the human output
+            # answers in words at the bottom of `which`.
+            "limits_read_at": (state.get("limits_read_at")
+                               or state.get("last_run")),
             "checkpoint": _read_text(account.session_id_file).strip() or None,
         })
     json.dump(document, sys.stdout, indent=2, sort_keys=True)
