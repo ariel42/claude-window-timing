@@ -2864,9 +2864,24 @@ def ping(account, accounts=None):
             # rather than as an account worth recommending.
             spent = dict(state.get("rate_limits") or {})
             five = dict(spent.get("five_hour") or {})
-            if (five.get("resets_at") or 0) <= time.time():
-                five.pop("resets_at", None)
             five["used_percentage"] = LIMIT_SPENT_PCT
+            # A reset already in the past would be read as a window that has
+            # since rolled over, and the refusal forgotten. Rolled forward on
+            # the phase this account is already believed to be on, which keeps
+            # both facts: spent now, and back at the boundary it was going to
+            # reach anyway. Only where nothing is known at all does it fall
+            # back to the limit's own length.
+            rolled = next_expiry(state, time.time())
+            if rolled == float("inf"):
+                five.pop("resets_at", None)
+            else:
+                five["resets_at"] = rolled
+                # A refusal is Claude answering, which is proof this account is
+                # reachable and that the phase it is on is still real. Without
+                # recording that, the only account whose news is refusals reads
+                # as one nothing has been heard from, and drops out of the
+                # spacing it is still entitled to a place in.
+                state["available_at"] = rolled
             spent["five_hour"] = five
             state["rate_limits"] = spent
             log(account, "Refused with no usable reset time — recording the "
@@ -3022,10 +3037,18 @@ def status(accounts):
         limits = state.get("rate_limits", {})
         for key, name in _LIMIT_NAMES:
             window = limits.get(key) or {}
+            label = "5-hour window" if key == "five_hour" else "Weekly limit"
             if not window.get("resets_at"):
+                # A limit can be known to be spent without anything having
+                # said when it comes back -- that is what a refusal carrying
+                # no figures looks like. Printing nothing there left `status`
+                # silent about the very limit the line below is waiting on.
+                if window.get("used_percentage") is not None:
+                    print("  {:<14}: {} used, no reset time reported".format(
+                        label, fmt_pct(window.get("used_percentage"))))
                 continue
             print("  {:<14}: {} used, resets {} (in {})".format(
-                "5-hour window" if key == "five_hour" else "Weekly limit",
+                label,
                 fmt_pct(window.get("used_percentage")),
                 fmt_time(window["resets_at"]),
                 fmt_delta(window["resets_at"] - now)))
@@ -4804,8 +4827,21 @@ def _perform_switch(account, current, states):
     # login for someone whose Claude Code was signed in by hand.
     outgoing = account_identity(user_login())["email"]
 
-    taken = take_login()
-    backup = backup_user_login()
+    # Reading and copying come before anything is written, so a failure here
+    # costs nothing -- but it still arrives as a traceback unless it is caught,
+    # and a traceback from a command that touches ~/.claude reads as though it
+    # had got half way. It has not.
+    try:
+        taken = take_login()
+        backup = backup_user_login()
+    except (IOError, OSError) as e:
+        sys.stderr.write(
+            "Could not read the login in {}: {}\n"
+            "  Nothing was changed.\n".format(USER_CONFIG_DIR, e))
+        return 1
+    except KeyboardInterrupt:
+        sys.stderr.write("\nInterrupted. Nothing was changed.\n")
+        return 1
 
     # From here two files are being rewritten. A disk that filled up, a
     # permission that changed underneath, or a Ctrl-C would otherwise surface

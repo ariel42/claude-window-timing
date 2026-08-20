@@ -2794,6 +2794,30 @@ def test_what_a_ping_records_from_how_it_went():
                            "text": "You've hit your limit."}, {})
         check("a reset already known is kept over the bound",
               state["rate_limits"]["five_hour"]["resets_at"], now + 900)
+
+        # And a reset that has already passed is rolled forward rather than
+        # dropped: dropping it costs the account the phase it is on, which
+        # takes it out of the spacing entirely — a heavy price for one
+        # refusal that happened to carry no figures.
+        window = ew.WINDOW_HOURS * 3600
+        ew.write_state(account, {"last_run": now - 60, "rate_limits": {
+            "five_hour": {"resets_at": now - 600, "used_percentage": 40}}})
+        state = ping_with({"completed": True, "limited": True,
+                           "text": "You've hit your limit."}, {})
+        check("a stale reset is rolled onto the window running now",
+              round(state["rate_limits"]["five_hour"]["resets_at"] - now),
+              window - 600)
+        check("so the account keeps its place in the rotation",
+              ew.participation(account, state, time.time())[1], "")
+
+        # What `status` shows for a limit that is spent with nothing saying
+        # when it returns. It used to show nothing at all, and left the line
+        # below it waiting on a limit it had not mentioned.
+        ew.write_state(account, {"last_run": now - 60, "rate_limits": {
+            "five_hour": {"used_percentage": 100}}})
+        said, _, _ = _capture(lambda: ew.status([account]))
+        check_true("status names a spent limit even with no reset time",
+                   "5-hour window : 100% used, no reset time reported" in said)
     finally:
         (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
          ew.restore_checkpoint, ew._systemctl, ew._run) = saved
