@@ -4134,6 +4134,55 @@ def test_an_interrupted_switch_never_leaves_a_login_in_two_places():
         restore()
 
 
+def test_a_failure_mid_switch_is_a_sentence_not_a_traceback():
+    """
+    Two files are rewritten here. A full disk or a permission that changed
+    underneath would otherwise surface as a stack trace at the one moment
+    somebody most needs a plain sentence -- half way through, possibly with the
+    credential already replaced. Which half happened decides what they should
+    do, so it has to be said.
+    """
+    section("A failure mid-switch is a sentence")
+
+    # Failing to install: nothing has moved yet.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    real_install = ew.install_login
+    try:
+        ew.install_login = lambda store: (_ for _ in ()).throw(
+            IOError("No space left on device"))
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("it reports a failure rather than raising", code, 1)
+        check_true("naming the cause", "No space left on device" in err)
+        check_true("and saying nothing was moved", "no login has been moved" in err)
+        check_true("with the backup pointed at", ".backups" in err)
+        check("the parked login is still parked",
+              ew.account_identity(ew.switch_store(accounts[1]))["has_token"], True)
+    finally:
+        ew.install_login = real_install
+        restore()
+
+    # Failing to park: the switch happened, the old login is in the backup only.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    real_park = ew.park_login
+    try:
+        ew.park_login = lambda *a, **k: (_ for _ in ()).throw(
+            OSError("Permission denied"))
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("it reports a failure rather than raising", code, 1)
+        check_true("saying the switch did happen", "Switched to account" in err)
+        check_true("that the old login is only in the backup",
+                   "only in the backup" in err)
+        check_true("and where to put it back",
+                   ew.switch_store(accounts[0]).config_dir in err)
+        check("the switch really did land",
+              ew.account_identity(ew.user_login())["email"], "a2@example.com")
+    finally:
+        ew.park_login = real_park
+        restore()
+
+
 def test_the_token_and_the_identity_move_together():
     """
     The token decides billing; oauthAccount decides what Claude Code says you
@@ -5418,6 +5467,7 @@ def main():
                  test_doctor_notices_a_deployment_going_wrong,
                  test_a_login_is_never_in_two_places_at_once,
                  test_an_interrupted_switch_never_leaves_a_login_in_two_places,
+                 test_a_failure_mid_switch_is_a_sentence_not_a_traceback,
                  test_the_token_and_the_identity_move_together,
                  test_switching_refuses_what_cannot_possibly_work,
                  test_switching_says_what_it_will_and_will_not_fix,

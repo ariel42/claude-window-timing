@@ -3754,8 +3754,34 @@ def switch_account(accounts, name=None, sign_in=True):
 
     taken = take_login()
     backup = backup_user_login()
-    dropped = install_login(switch_store(account))
-    parked = park_login(current, taken) if current is not None else None
+
+    # From here two files are being rewritten. A disk that filled up or a
+    # permission that changed underneath would otherwise surface as a traceback
+    # at the one moment a person most needs a sentence: mid-switch, possibly
+    # with the credential already replaced. Say which half happened and where
+    # the copy is.
+    where = ("\n  Your previous credentials are in {}.".format(backup)
+             if backup else "")
+    try:
+        dropped = install_login(switch_store(account))
+    except (IOError, OSError) as e:
+        sys.stderr.write(
+            "Could not install account {}'s login: {}\n"
+            "  Nothing was parked, so no login has been moved.{}\n"
+            "  Run `{} status` to see which account you are on.\n".format(
+                account.display, e, where, COMMAND))
+        return 1
+    try:
+        parked = park_login(current, taken) if current is not None else None
+    except (IOError, OSError) as e:
+        sys.stderr.write(
+            "Switched to account {}, but could not park the login it "
+            "replaced: {}\n"
+            "  That login now exists only in the backup.{}\n"
+            "  Copy it back into {} before switching away again.\n".format(
+                account.display, e, where,
+                switch_store(current).config_dir if current else "its store"))
+        return 1
 
     print("Switched your Claude Code to account {}.".format(account.display))
     if parked is not None:
