@@ -504,6 +504,15 @@ TIER_NAMES = {USABLE: "usable", WAITING: "waiting", UNKNOWN: "unknown",
               NEEDS_ACTION: "needs_action"}
 TIERS_BY_NAME = {name: tier for tier, name in TIER_NAMES.items()}
 
+# What is known about an account configured here that the published schedule
+# does not mention -- the copy predates it being added, or the machine running
+# the pings does not have it. Nothing on this machine can answer for it: there
+# are no readings, and on a machine that only switches there is no ping
+# directory to look in either. So it is "cannot tell", never "fine", and never
+# a KeyError in the middle of `status`.
+UNPUBLISHED = Availability(
+    UNKNOWN, None, "the machine that pings has not published this account", True)
+
 SCHEDULE_FILE = os.path.join(SCRIPT_DIR, "schedule.json")
 
 
@@ -2762,8 +2771,15 @@ def status(accounts):
     # told not to apply. `which` already answers from the published schedule;
     # the headline here should agree with it rather than contradict it.
     view = schedule_view(accounts)
+    absent = set()
     if view:
         known, states, avail, _published_at = view
+        # Every line below looks both dicts up by account name, and an account
+        # added here since the file was copied is in neither.
+        absent = set(a.name for a in accounts if a.name not in avail)
+        for account in accounts:
+            states.setdefault(account.name, {})
+            avail.setdefault(account.name, UNPUBLISHED)
     else:
         known = accounts
         avail = availabilities(accounts, states, now)
@@ -2824,7 +2840,9 @@ def status(accounts):
                 fmt_delta(window["resets_at"] - now)))
 
         usable = avail[account.name]
-        if usable.tier == WAITING:
+        if account.name in absent:
+            print("  Usable        : cannot tell — {}".format(usable.note))
+        elif usable.tier == WAITING:
             print("  Usable again  : {} (in {}) — {}".format(
                 fmt_time(usable.until), fmt_delta(usable.until - now), usable.note))
         elif usable.tier != USABLE:
@@ -5291,11 +5309,32 @@ def show_log(accounts, name, lines, follow):
 def status_json(accounts):
     now = time.time()
     states = {a.name: read_state(a) for a in accounts}
-    avail = availabilities(accounts, states, now)
-    chosen, reason = choose_account(accounts, states, now, avail)
+    # The same fallback the human `status` uses. Without it a script on a
+    # machine that pings nothing would read every account as usable with no
+    # window information -- confidently, and wrongly, which is the one thing a
+    # machine-readable answer must not do.
+    view = schedule_view(accounts)
+    if view:
+        known, published, avail, published_at = view
+        states.update(published)
+        for account in accounts:
+            states.setdefault(account.name, {})
+            avail.setdefault(account.name, UNPUBLISHED)
+    else:
+        known, published_at = accounts, None
+        avail = availabilities(accounts, states, now)
+    chosen, reason = choose_account(known, states, now, avail)
+    # Reported as this machine configures it. With a view, `chosen` was built
+    # from the published file and carries the *other* machine's paths, and
+    # `use.account` naming something absent from `accounts` below would make
+    # the two halves of one document disagree.
+    chosen = next((a for a in accounts if a.name == chosen.name), chosen)
     mine = current_account(accounts)
     document = {
         "generated_at": now,
+        # When the machine running the pings wrote the file these figures came
+        # from, or null when they are this machine's own.
+        "published_at": published_at,
         "use": {"account": chosen.name, "reason": reason,
                 "config_dir": chosen.config_dir},
         # Always present, unlike the human output, which stays silent until

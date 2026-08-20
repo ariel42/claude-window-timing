@@ -1525,6 +1525,75 @@ def test_a_second_machine_answers_from_the_schedule():
         ew.STATE_ROOT, ew.SCHEDULE_FILE = saved
 
 
+def test_an_account_the_schedule_has_never_heard_of():
+    """
+    The laptop is configured for three accounts and the schedule copied to it
+    knows two — the copy predates the third being added, or the machine that
+    pings does not have it.
+
+    Every line of `status` looks its accounts up by name in the two dictionaries
+    the schedule produced, so the third one raised KeyError half way through
+    printing: a traceback on the machine the README tells people to switch from,
+    in the command they run to find out what is going on.
+    """
+    section("An account the published schedule has never heard of")
+    now = time.time()
+    saved = (ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.ALIGNMENT_FILE,
+             ew._systemctl, ew._run)
+
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+
+    try:
+        root = tempfile.mkdtemp()
+        ew.STATE_ROOT = os.path.join(root, "state")
+        ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
+        ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
+        ew._systemctl = lambda *a: Ok()
+        ew._run = lambda cmd: Ok()
+        accounts = [ew.Account(name, os.path.join(root, "cfg-" + name), index,
+                               label)
+                    for index, (name, label) in enumerate(
+                        (("1", "personal"), ("2", "work"), ("3", "spare")))]
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"written_at": now, "window_hours": 5, "accounts": [
+                {"name": "1", "label": "personal", "tier": "usable",
+                 "usable_now": True, "expires_at": now + 600,
+                 "last_run": now - 60, "used_percentage": 12},
+                {"name": "2", "label": "work", "tier": "usable",
+                 "usable_now": True, "expires_at": now + 9000,
+                 "last_run": now - 60, "used_percentage": 12}]}, f)
+
+        said, _, code = _capture(lambda: ew.status(accounts))
+        check("status answers rather than raising", code, 0)
+        check_true("naming the account the file does know about",
+                   "Use account 1" in said)
+        check_true("and admitting what it cannot know about the other",
+                   "cannot tell" in said
+                   and "has not published this account" in said)
+        check_true("the spacing report survives it too",
+                   "Spacing" in said and "account 3" in said)
+
+        said, _, code = _capture(lambda: ew.status_json(accounts))
+        document = json.loads(said)
+        check("the JSON answers too", code, 0)
+        check_true("and says whose figures these are",
+                   abs(document["published_at"] - now) < 2)
+        entries = {e["name"]: e for e in document["accounts"]}
+        check("every configured account is still reported",
+              sorted(entries), ["1", "2", "3"])
+        # The one that matters: a script must never be told that an account
+        # nothing is known about is fine to spend.
+        check("the unheard-of one reads as cannot-tell, never usable",
+              entries["3"]["tier"], "unknown")
+        check("and is not what the answer points at",
+              document["use"]["account"], "1")
+    finally:
+        (ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.ALIGNMENT_FILE,
+         ew._systemctl, ew._run) = saved
+
+
 def test_a_login_that_stopped_working_is_reported():
     """
     `doctor` asks the CLI whether a login still works, rather than deciding for
@@ -2220,7 +2289,10 @@ def test_the_json_report_is_a_contract():
 
     document = json.loads(buf.getvalue())      # fails loudly if anything else printed
     check("the top level says what it is and what to do",
-          sorted(document), ["accounts", "generated_at", "switching", "use"])
+          sorted(document),
+          ["accounts", "generated_at", "published_at", "switching", "use"])
+    check("figures of this machine's own are not attributed to another",
+          document["published_at"], None)
     check("including which account the user's own Claude Code is on",
           sorted(document["switching"]), ["configured", "current_account"])
     check("reported as unconfigured until a store exists",
@@ -3522,7 +3594,7 @@ def test_every_command_routes_to_the_thing_it_names():
 
         check("status --json is JSON and nothing else",
               sorted(json.loads(run(["status", "--json"])[1])),
-              ["accounts", "generated_at", "switching", "use"])
+              ["accounts", "generated_at", "published_at", "switching", "use"])
 
         code, said, _ = run(["which"])
         check("which succeeds", code, 0)
@@ -5937,6 +6009,7 @@ def main():
                  test_an_unusable_login_is_never_recommended,
                  test_schedule_is_publishable_for_other_machines,
                  test_a_second_machine_answers_from_the_schedule,
+                 test_an_account_the_schedule_has_never_heard_of,
                  test_a_login_that_stopped_working_is_reported,
                  test_what_it_says_in_every_state_it_can_be_in,
                  test_the_status_display_shows_the_unusual_parts,
