@@ -9,7 +9,17 @@ This puts that timing back under your control. It starts your window before you 
 - **A fresh window every 5/N hours instead of every 5.** Two subscriptions are held 2h30m apart, three 1h40m. Not more quota — quota that arrives when you need it, instead of all at once and then not for hours.
 - **A straight answer to which account to spend.** The window that expires first, skipping any account that cannot serve a request at all — a spent weekly limit, a lapsed plan, an expired sign-in.
 
-It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 6,700 lines of Python standard library and a systemd timer — no dependencies and no daemon. The only traffic it makes is the pings themselves, plus the one very small request per account that `which` and `status` use to read your limits ([how fresh those figures are](#which-account-to-use-now)).
+It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 8,000 lines of Python standard library and a systemd timer — no dependencies and no daemon. The only traffic it makes is the pings themselves, plus the one very small request per account that `which` and `status` use to read your limits ([how fresh those figures are](#which-account-to-use-now)).
+
+---
+
+## Before you install
+
+Two things to decide before you run anything, because both are easier to weigh now than later.
+
+**This sends automated requests to your subscription, around the clock.** One saved line per account every 30 minutes, day and night, whether or not you are at the machine — roughly 340 requests per account per week. Anthropic's [consumer terms](https://www.anthropic.com/legal/consumer-terms) address reaching the service by automated means, and Anthropic also ships Claude Code for scripted and headless use; the pings create no capacity, exceed no limit and ask for nothing extra. Where that leaves you is a judgement this tool cannot make for you. **Read the terms and decide.** If you would rather not, there is nothing here for you, and that is a reasonable conclusion.
+
+**The pings belong on exactly one machine.** A second machine pinging the same accounts doubles what they consume and buys nothing at all. Install with `./install.sh --no-pings` everywhere else — those machines can still switch accounts and read the figures. If it happens anyway, `claude-window doctor` now notices and says which machine.
 
 ---
 
@@ -196,7 +206,7 @@ Account 1 (personal)
   Checkpoint    : 6f1c47a9-2d40-4e5b-9a7c-1b3e8d05f2aa
   Last ping     : 2026-08-11 11:37:26 IDT (0h01m05s ago)
   5-hour window : 82% used, resets 2026-08-11 15:30:00 IDT (in 3h51m29s)
-  Weekly limit  : 17% used, resets 2026-08-17 10:00:00 IDT (in 142h21m29s)
+  Weekly limit  : 17% used, resets 2026-08-17 10:00:00 IDT (in 5d 22h21m29s)
   Next start-of-window opportunity: 2026-08-11 15:30:00 IDT (in 3h51m29s)
     set by the 5-hour window, as reported by the last ping
   Anchor        : none scheduled
@@ -218,15 +228,22 @@ When something is wrong rather than merely worth knowing:
 claude-window doctor
 ```
 
-It checks what otherwise fails silently: accounts that are secretly the same login, a lapsed subscription, a sign-in that no longer works or is about to expire, timers that stopped, runs that started but never finished, a checkpoint that no ping can resume because it belongs to an older layout, a machine clock that disagrees with Claude's, leftover units from an older install — and the one failure specific to this design, **your own Claude Code being signed in as an account nobody is pinging**, where every other check passes while you get no benefit at all.
+It checks what otherwise fails silently: accounts that are secretly the same login, a lapsed subscription, a sign-in that no longer works or is about to expire, timers that stopped, runs that started but never finished, a checkpoint that no ping can resume because it belongs to an older layout, a checkout it cannot write to, leftover units from an older install — and the one failure specific to this design, **your own Claude Code being signed in as an account nobody is pinging**, where every other check passes while you get no benefit at all.
 
-Three of those are worth naming, because each one leaves an install that looks perfect and does nothing: **a timer that cannot find the Claude CLI** (an npm or nvm install lives where only your shell knows to look, and the timer has none of your shell), **lingering being off** (a user timer belongs to your login session, so the pings stop when you log out), and **`claude-window` not being on your PATH** (every instruction here begins with it).
+Four of them exist because the thing they catch is invisible from every other screen:
+
+- **A second machine pinging the same accounts.** The evidence is destroyed by the act — `schedule.json` is the file a second machine copies to answer `which`, and the moment it starts pinging it overwrites that copy with its own. The sighting is taken in the instant before the overwrite and kept, so it is still there when somebody looks.
+- **A boundary anchor that could not be booked.** The anchor is the whole of how a missed ping's phase is recovered, and `status` prints "Anchor: none scheduled" whether it is healthy or `systemd-run` has been refusing every booking.
+- **A clock that disagrees with Claude's by more than half a minute.** Every anchor is a wall-clock time computed from this machine's clock, so a machine two minutes fast books its ping two minutes *before* the boundary — inside the window still running, which opens nothing. Measured for free from the `Date` header on any live reading.
+- **A timer still firing for an account that is no longer in `accounts.json`.** Losing that one file quietly halves a two-account setup, and everything runtime here is gitignored, so a `git clean -xdf` takes it.
+
+Three more are worth naming, because each one leaves an install that looks perfect and does nothing: **a timer that cannot find the Claude CLI** (an npm or nvm install lives where only your shell knows to look, and the timer has none of your shell), **lingering being off** (a user timer belongs to your login session, so the pings stop when you log out), and **`claude-window` not being on your PATH** (every instruction here begins with it).
 
 Every run is logged, so the log doubles as a record of your usage through the day:
 
 ```
 [2026-08-11 11:37:26] Turn confirmed: cache_read=6864 cache_write=0 in=10 out=54
-[2026-08-11 11:37:26] Usage: 5-hour 82% (resets 2026-08-11 15:30:00 IDT, in 3h51m29s) · weekly 17% (resets 2026-08-17 10:00:00 IDT, in 142h21m29s)
+[2026-08-11 11:37:26] Usage: 5-hour 82% (resets 2026-08-11 15:30:00 IDT, in 3h51m29s) · weekly 17% (resets 2026-08-17 10:00:00 IDT, in 5d 22h21m29s)
 ```
 
 ## Staying on schedule
@@ -311,16 +328,17 @@ Answering "no pings" on a machine that has been pinging offers to stop its timer
 
 | Command | What it does |
 |---|---|
-| `./install.sh [--no-pings] [--accounts N] [-y]` | The setup wizard. Safe to re-run; asks only for what is missing. `--no-pings` sets a machine up to switch accounts without running the pings. |
+| `./install.sh [--pings \| --no-pings] [--accounts N] [--yes]` | The setup wizard. Safe to re-run; asks only for what is missing. `--no-pings` sets a machine up to switch accounts without running the pings; `--pings` turns them back on. `./install.sh --help` lists them. |
 | `claude-window setup` | The same wizard, once the launcher exists. Takes the same options. |
 | `claude-window` | Status. The bare form never spends anything. |
 | `claude-window status [--json] [--no-live] [--live]` | What every account is doing, and which to use now. `--json` reads nothing from Claude unless you add `--live`. |
 | `claude-window which [--no-live] [--live]` | Just the recommendation, and what is unusable. Reads the limits from Claude unless you pass `--no-live`. |
 | `claude-window switch [2] [--no-sign-in]` | Point your own Claude Code at an account. The only command that writes to `~/.claude`. |
 | `claude-window doctor` | Check the setup and say what is wrong. |
+| `claude-window uninstall [--purge]` | Remove the timers. `--purge` also deletes this checkout's generated files, and asks first: the checkpoints in `state/` cost a real message each to rebuild. |
 | `claude-window realign [--confirm]` | Show, then optionally apply, a spacing correction. |
 | `claude-window log [2] [-f] [-n N]` | A ping log, or every account's interleaved. |
-| `claude-window accounts` | List the configured accounts. |
+| `claude-window accounts` | List the configured accounts, who each is, and where its login lives. |
 | `claude-window check` | Validate the accounts without changing anything. |
 | `claude-window ping [2]` | Send one ping. This is what the timer runs. |
 | `claude-window init [2]` | Build one account's checkpoint. Setup does this for you. |
@@ -338,7 +356,7 @@ Uninstalling stops the timers and removes every unit, and by default leaves this
 |---|---|
 | `claude_window_timing.py` | The whole tool. |
 | `install.sh` / `uninstall.sh` | Prerequisite checks, then the wizard; and the teardown. |
-| `test_window_timing.py` | Over 1,100 checks. `python3 test_window_timing.py`. |
+| `test_window_timing.py` | Over 1,600 checks. `python3 test_window_timing.py`. |
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 
@@ -356,14 +374,17 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 
 ## Notes and caveats
 
-- Not affiliated with or endorsed by Anthropic. Worth knowing what you are running: this sends one saved line to your subscription every 30 minutes, day and night, whether or not you are at the machine. Anthropic's [consumer terms](https://www.anthropic.com/legal/consumer-terms) address reaching the service by automated means; Anthropic also ships Claude Code for scripted and headless use. On the other side of the ledger, the pings create no capacity — every window holds exactly the quota you paid for, and nothing here exceeds a limit or asks for more. Running several subscriptions is a separate decision with its own considerations. Read the terms and decide for yourself.
+- Not affiliated with or endorsed by Anthropic. The full version of this is under [Before you install](#before-you-install), at the top, where it belongs: this sends automated requests to your subscription around the clock, Anthropic's [consumer terms](https://www.anthropic.com/legal/consumer-terms) address automated access, and the decision is yours to make with the terms in front of you. Running several subscriptions is a separate decision with its own considerations.
+- **What the pings cost against the weekly limit is bounded, not measured.** The longest stretch of ping-only activity observed here is 13 consecutive readings with the weekly figure unmoved, and that figure is reported to the nearest 1% — so all the data supports is "less than 1 percentage point per 13 idle pings". Over ~340 pings a week that bound is too loose to be useful. It is stated here as a bound rather than dressed up as a measurement. Leaving one account unused for a full weekly cycle with the pings running would settle it exactly.
 - Pings are cheap but not free, and they also draw a little from the separate **weekly** limit — about 48 pings a day per account. How little is below what can be measured from outside: the weekly figure is reported to the nearest 1%, and in this machine's logs it did not move across 13 consecutive pings that spent nothing at all of the 5-hour window. Read "a little" as an upper bound nobody has been able to tighten, not as a measurement.
 - Pings ask Claude for no thinking and never update the CLI. Thinking is billed as output and a ping's reply is discarded; an update rewrites the tool definitions that sit at the front of every cached prompt, which would make your own open sessions expensive to resume. Neither affects how you run Claude Code yourself.
 - Accounts must be genuinely different Claude accounts. Signing in twice as the same one looks like it works and buys nothing; setup checks for it.
 - **Do not point a ping directory at a *different* account with `/login`.** That directory's identity is how the tool knows which account it is pinging. Signing the *same* account in again is fine and is what `doctor` tells you to do when a login expires; changing which account lives there means editing `accounts.json` and re-running `./install.sh`.
 - A booked *anchor* does not survive a reboot — it is a transient systemd unit. Harmless: the next ordinary ping reads the reset times again and books another. A hold booked by `realign --confirm` is written to `state/` and does survive.
 - It relies on where Claude Code stores sessions and on the window reset time it reports. Both are internal details that a future release could change; the tests would notice, and `doctor` reports what it can verify.
-- Linux only, and enforced rather than merely stated. Running the pings needs systemd; `--no-pings` does not, but switching reads the credentials file Claude Code keeps on Linux, which macOS replaces with the Keychain — so `switch` refuses there rather than consuming a parked login to no effect.
+- Linux only, and enforced rather than merely stated — and now said *before* you spend anything rather than after. Running the pings needs systemd; `--no-pings` does not, but switching reads the credentials file Claude Code keeps on Linux, which macOS replaces with the Keychain — so `switch` refuses there rather than consuming a parked login to no effect. Setup on macOS or Windows warns up front that `switch` will not work, `doctor` reports it instead of saying "Everything checks out", and what does still work there — `status`, `which` and `doctor` reading a copied `schedule.json` — carries on working. Switching on macOS and Windows is wanted and not yet built.
+- **Having `systemctl` is not the same as having a systemd user session.** WSL without `systemd=true`, `docker exec`, `su -` and `ssh host ./install.sh` on some distributions all ship the binary and reach no user bus. Setup checks for the manager itself now and refuses rather than reporting timers it did not start.
+- **The pings do not catch up after downtime, and do not advance across a suspend.** The timer is monotonic on purpose; a machine asleep for four hours resumes and pings up to one interval of *awake* time later. Right for a server, and the thing to know if you run this on a laptop.
 
 ## Where the pings run
 
