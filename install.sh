@@ -8,6 +8,37 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Answered here rather than passed through. Handing --help to the wizard printed
+# "usage: claude-window setup", naming a command the reader has not installed
+# yet and flags described for a different entry point -- and it never mentioned
+# --pings at all, which the tool's own error messages tell people to run.
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help)
+            cat <<'USAGE'
+usage: ./install.sh [--accounts N] [--pings | --no-pings] [--yes]
+
+Sets up Claude window timing on this machine: creates a ping directory per
+account, has you sign each one in, and starts a systemd timer per account.
+Safe to re-run — it reports what already exists rather than rebuilding it.
+
+  --accounts N   how many accounts to configure, instead of being asked
+  --pings        run the pings from this machine (the default)
+  --no-pings     this machine only switches accounts; the pings run on
+                 another one. No timers, no checkpoints, no quota spent here.
+                 The pings belong on exactly one machine: a second one
+                 doubles what these accounts consume and buys nothing.
+  --yes          take every default rather than prompting
+  -h, --help     this message
+
+Afterwards: `claude-window status` for the figures, `claude-window which` for
+which account to spend, `claude-window doctor` if anything looks wrong.
+USAGE
+            exit 0
+            ;;
+    esac
+done
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 if ! command -v python3 &>/dev/null; then

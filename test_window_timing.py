@@ -5590,7 +5590,25 @@ def test_every_command_routes_to_the_thing_it_names():
         # -- the ones that act: stubbed, and checked for arriving at all -----
         check("doctor's exit code is its own", run(["doctor"])[0], 1)
         run(["ping"]); run(["ping", "2"]); run(["init"]); run(["setup"])
-        run(["uninstall"]); run(["uninstall", "--purge"])
+        run(["uninstall"])
+
+        # --purge deletes the checkpoints, and each one costs a real message
+        # to Claude to rebuild -- so with nobody there to confirm it, it must
+        # not act at all.
+        code, _, err = run(["uninstall", "--purge"])
+        check("a purge with nobody to confirm to is refused", code, 2)
+        check_true("saying nothing was removed",
+                   "Nothing was removed" in err)
+        check("and it never reached the implementation", reached[-1:],
+              ["uninstall"])
+
+        # Said deliberately, it goes through.
+        saved_yes = ew.ASSUME_YES
+        ew.ASSUME_YES = True
+        try:
+            run(["uninstall", "--purge"])
+        finally:
+            ew.ASSUME_YES = saved_yes
         check("each acting command reached its own implementation",
               reached, ["doctor", "ping", "ping", "init", "setup",
                         "uninstall", "uninstall --purge"])
@@ -9442,6 +9460,99 @@ def test_an_anchor_that_could_not_be_booked_is_not_silent():
         shutil.rmtree(root, ignore_errors=True)
 
 
+
+def test_setup_says_up_front_what_it_cannot_do_here():
+    """
+    Off Linux, `switch` refuses -- the credential is in the Keychain, not in a
+    file -- and on a machine that does not ping, `switch` is the entire point.
+    Setup ran to the end anyway, had the user spend a browser sign-in per
+    account, and finished by recommending the one command that was going to
+    turn them down.
+    """
+    section("Setup says up front what it cannot do here")
+    original = ew.sys.platform
+    try:
+        ew.sys.platform = "linux"
+        check("on Linux there is nothing to warn about",
+              len(ew.platform_warning()), 0)
+
+        for elsewhere in ("darwin", "win32"):
+            ew.sys.platform = elsewhere
+            warnings = ew.platform_warning()
+            check("{} gets a warning".format(elsewhere), len(warnings), 1)
+            # A warning, not an error: reading the figures still works here,
+            # and that is a reason to install.
+            check("and only a warning", warnings[0].level, "warning")
+            check_true("naming the command that will refuse",
+                       "switch" in warnings[0].hint)
+            check_true("and what does still work",
+                       "which" in warnings[0].hint
+                       and "schedule.json" in warnings[0].hint)
+    finally:
+        ew.sys.platform = original
+
+
+def test_a_purge_says_what_it_costs_before_it_takes_it():
+    """
+    Everything --purge removes is rebuilt by the next install for nothing,
+    except the checkpoints: each one costs a real message to Claude, and the
+    window that message opens is what sets that account's phase. A one-word
+    flag was enough to do that silently on the way past.
+    """
+    section("A purge says what it costs")
+    saved = (ew.ASSUME_YES, ew._stdin_is_interactive, sys.stdin)
+    try:
+        # Nobody there: it must not guess, in either direction.
+        ew.ASSUME_YES = False
+        ew._stdin_is_interactive = lambda: False
+        buf, err = io.StringIO(), io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        real_err, sys.stderr = sys.stderr, err
+        try:
+            agreed = ew.purge_confirmed([])
+        finally:
+            sys.stdout, sys.stderr = out, real_err
+        check("with no terminal, a purge does not happen", agreed, False)
+        check_true("and says nothing was removed",
+                   "Nothing was removed" in err.getvalue())
+        check_true("and how to mean it deliberately", "--yes" in err.getvalue())
+        check_true("having first said what the cost actually is",
+                   "real message" in buf.getvalue())
+        check_true("and that logins are not part of it",
+                   "logins are not touched" in buf.getvalue())
+
+        # Asked and declined.
+        ew._stdin_is_interactive = lambda: True
+        sys.stdin = _Answers("n\n")
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            check("no means no", ew.purge_confirmed([]), False)
+        finally:
+            sys.stdout = out
+
+        # Asked and agreed.
+        sys.stdin = _Answers("y\n")
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            check("yes means yes", ew.purge_confirmed([]), True)
+        finally:
+            sys.stdout = out
+
+        # And --yes, which is how a script says it deliberately.
+        ew.ASSUME_YES = True
+        ew._stdin_is_interactive = lambda: False
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            check("--yes is a deliberate yes", ew.purge_confirmed([]), True)
+        finally:
+            sys.stdout = out
+    finally:
+        ew.ASSUME_YES, ew._stdin_is_interactive, sys.stdin = saved
+
+
 def main():
     # Every path the tool reads or writes is redirected into one disposable
     # directory before a single test runs.
@@ -9554,6 +9665,8 @@ def main():
                  test_rebuilding_a_checkpoint_waits_for_a_ping_in_flight,
                  test_uninstall_finds_the_path_line_whatever_the_shell_says,
                  test_an_anchor_that_could_not_be_booked_is_not_silent,
+                 test_setup_says_up_front_what_it_cannot_do_here,
+                 test_a_purge_says_what_it_costs_before_it_takes_it,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
                  test_install_uninstall_purge_and_install_again,

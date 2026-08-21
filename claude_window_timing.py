@@ -6541,6 +6541,30 @@ def _command_exists(name):
     return bool(shutil.which(name))
 
 
+def platform_warning():
+    """
+    Say up front what this install will not be able to do here.
+
+    Off Linux, `switch` refuses — the credential lives in the Keychain, not in
+    a file — and on a machine that does not ping, `switch` is the entire point.
+    Setup used to run to the end anyway, have the user spend a browser sign-in
+    per account, and finish by recommending the one command that was going to
+    turn them down. Said here, before anything is spent.
+    """
+    unsupported = platform_blocker()
+    if unsupported is None:
+        return []
+    return [Finding(
+        "warning",
+        "Switching accounts does not work on {} — only on Linux".format(
+            sys.platform),
+        "The rest still works: `status`, `which` and `doctor` read a "
+        "schedule.json copied from the machine that pings, which is what a "
+        "second machine is normally for. What you will not be able to do "
+        "here is `{} switch`. Carry on only if reading the figures is what "
+        "you want this machine for.".format(COMMAND))]
+
+
 def writability_blockers():
     """
     Whether this checkout can hold the files an install has to put in it.
@@ -6738,7 +6762,8 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
         print()
         pings = _ask_yes("Run the pings from this machine?", default=pings_here())
 
-    blockers = writability_blockers() + systemd_blockers(pings)
+    blockers = (platform_warning() + writability_blockers()
+                + systemd_blockers(pings))
     if blockers:
         print()
         report_findings(blockers)
@@ -7193,6 +7218,53 @@ def installed_units():
                       if f.startswith(UNIT_PREFIX))
     except (IOError, OSError):
         return []
+
+
+def purge_confirmed(accounts):
+    """
+    Say what --purge takes that cannot be got back, and ask.
+
+    Everything else it removes is rebuilt by the next install for nothing. The
+    checkpoints are not: each one costs a real message to Claude, and the
+    window that message opens is what sets that account's phase — so a purge
+    followed by an install starts every account's window in the same minute.
+    A one-word flag was enough to do that, silently, on the way past.
+    """
+    print("--purge will delete this checkout's generated files: {}".format(
+        ", ".join(["state/", "accounts.json", "schedule.json", "bin/"])))
+    print()
+    print("The checkpoints in state/ are the part that is not free to replace.")
+    print("Rebuilding each one sends a real message to Claude, and the window")
+    print("that message opens is what sets that account's phase — so installing")
+    print("again afterwards starts every account's window in the same minute.")
+    print()
+    print("Your logins are not touched: ping directories and ~/.claude are")
+    print("left exactly as they are.")
+    print()
+    if ASSUME_YES:
+        print("Delete them? yes (--yes)")
+        return True
+    if not _stdin_is_interactive():
+        # Never guess at an answer for a destructive flag. The one place this
+        # is reached is a script, and a script that meant it can say so.
+        sys.stderr.write(
+            "Nothing was removed: --purge deletes files that cost a real "
+            "message each to rebuild,\n  and there is no terminal here to "
+            "confirm on. Re-run with --yes if that is what you want.\n")
+        return False
+    if _ask_yes("Delete them?", default=False):
+        return True
+    print("Nothing was removed. Without --purge the timers still come out and "
+          "the generated files stay.")
+    return False
+
+
+def _stdin_is_interactive():
+    """Whether there is a person on the other end of stdin. A seam for tests."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
 
 
 def uninstall_advice(accounts, purge):
@@ -7807,6 +7879,8 @@ def cli(argv=None):
                     "  " + _tilde(account.config_dir)))
             return 0
         if command == "uninstall":
+            if args.purge and not purge_confirmed(accounts):
+                return 2
             for item in uninstall(accounts, purge=args.purge):
                 print("  removed {}".format(item))
             for line in uninstall_advice(accounts, args.purge):
