@@ -440,6 +440,28 @@ def test_the_anchor_names_an_instant_that_exists():
                   "%Y-%m-%d %H:%M:%S UTC"))
         check("one attempt is all a working systemd costs", len(booked()), 1)
 
+        # The stamp handed to systemd is UTC on purpose. The log is read by a
+        # person, and every other line in it is in that person's own zone -- so
+        # a UTC stamp here named a moment hours in the past on any machine not
+        # set to UTC, which is what the live logs showed it doing.
+        saved_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "Asia/Tokyo"   # never UTC, whatever this machine is
+            time.tzset()
+            del calls[:]
+            ew.schedule_anchor(account, target)
+            said = open(account.log_file).read().splitlines()[-1]
+            check_true("the log names the moment in the reader's zone",
+                       ew.fmt_time(target) in said)
+            check_true("and not in the encoding systemd was handed",
+                       booked()[-1] not in said)
+        finally:
+            if saved_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved_tz
+            time.tzset()
+
         # An older systemd that will not take a timezone suffix.
         del calls[:]
         refusals = [1]

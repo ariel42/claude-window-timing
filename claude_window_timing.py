@@ -2304,8 +2304,17 @@ def next_window_start(limits, refusal_text, was_limited, now=None):
 # The anchor fixes the phase in one shot. It starts the *same* service unit, so
 # systemd's OnUnitActiveSec=30min re-anchors the regular series off it too: an
 # anchor at 17:00:30 slides the whole series to 17:30:30, 18:00:30 … 22:00:30 —
-# back exactly on the next boundary. After one correction the series is in phase
-# again and the anchor goes quiet until something else knocks it out.
+# back exactly on the next boundary.
+#
+# One is booked before *every* boundary, not only after a phase has been lost,
+# and that is deliberate rather than belt-and-braces. A timer that fires "every
+# 30 minutes" fires when systemd gets to it, and a ping landing a quarter of a
+# second on the early side of the boundary does not open the new window at all
+# -- it goes into the old one, and the window then opens at the next tick, half
+# an hour late, with every later window inheriting that. The anchor puts the
+# first ping of each window at a known number of seconds *after* the boundary
+# instead of within a coin-flip of it. It costs one extra cache-served ping per
+# window and buys a phase that does not decay.
 
 class _NoSystemd(object):
     """Stand-in result for when the systemd binaries are not installed."""
@@ -2432,8 +2441,13 @@ def schedule_anchor(account, target_epoch):
              "systemctl", "--user", "start", "--no-block",
              account.service_unit])
         if result.returncode == 0:
+            # The stamp above is an instruction to systemd and is written in
+            # UTC for the reason in the docstring. The log is read by a person,
+            # in their own zone, and every other line in it is -- so a UTC
+            # stamp here named a moment three hours in the past on the machine
+            # that wrote it. Say the instant, not the encoding.
             log(account, "Anchor scheduled for {} (in {})".format(
-                stamp, fmt_delta(target_epoch - time.time())))
+                fmt_time(target_epoch), fmt_delta(target_epoch - time.time())))
             return True
     log(account, "WARNING: could not schedule anchor: {}".format(
         (result.stdout or "").strip() if result else "no answer"))
