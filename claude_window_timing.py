@@ -39,6 +39,11 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 
+try:                                    # 3.9 and later
+    from zoneinfo import ZoneInfo
+except ImportError:                     # 3.6 to 3.8: read it in local time only
+    ZoneInfo = None
+
 # ---------------------------------------------------------------------------
 # Paths — all derived from the script's own location, no hardcoded user paths
 # ---------------------------------------------------------------------------
@@ -2136,10 +2141,17 @@ def parse_reset_from_text(text, now=None):
         "You've hit your session limit · resets 9:30pm (Asia/Jerusalem)"
         "You've hit your weekly limit · resets Aug 10, 10pm (Asia/Jerusalem)"
 
-    Returns (epoch_seconds, "session"|"weekly"), or None when the message names no
-    limit we recognise, has no parseable time, or reports a timezone other than
-    this machine's — Python 3.6 has no zoneinfo, so rather than guess at an offset
-    we decline. The statusLine source is unaffected either way.
+    Returns (epoch_seconds, "session"|"weekly"), or None when the message names
+    no limit we recognise or has no parseable time.
+
+    The message names the timezone it is quoting, and that is the account's,
+    not the machine's: a server in UTC pinging an account whose resets are
+    reported in Asia/Jerusalem was declining every refusal it ever got, because
+    the two names differ and guessing at an offset is not an option. Where the
+    interpreter can look a zone up — 3.9 and later — it is looked up, and the
+    two agree again. Where it cannot, a foreign zone is still declined rather
+    than read as local, which would be wrong by whatever the offset is; the
+    statusLine source is unaffected either way.
     """
     if not text:
         return None
@@ -2163,11 +2175,19 @@ def parse_reset_from_text(text, now=None):
     elif meridiem.lower() == "am" and hour == 12:
         hour = 0
 
-    local_tz = _local_tz_name()
-    if local_tz and tz.strip() and tz.strip() != local_tz:
-        return None
+    reported, local_tz = tz.strip(), _local_tz_name()
+    zone = None
+    if reported and local_tz and reported != local_tz:
+        if ZoneInfo is None:
+            return None
+        try:
+            zone = ZoneInfo(reported)
+        except Exception:               # not a zone this machine has data for
+            return None
 
-    now_dt = datetime.fromtimestamp(now if now is not None else time.time())
+    stamp = now if now is not None else time.time()
+    now_dt = datetime.fromtimestamp(stamp, zone) if zone \
+        else datetime.fromtimestamp(stamp)
     try:
         if month_name:
             month = _MONTHS.get(month_name.lower()[:3])

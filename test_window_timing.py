@@ -174,9 +174,40 @@ def test_refusal_text():
     check("an unrecognised limit is not acted on",
           ew.parse_reset_from_text(
               "You've hit some other limit · resets 9pm (Asia/Jerusalem)", now), None)
-    check("a foreign timezone is declined rather than guessed",
-          ew.parse_reset_from_text(
-              "You've hit your session limit · resets 9pm (America/New_York)", now), None)
+    # The zone in the message is the *account's*, not the machine's. A server
+    # in UTC pinging an account whose resets are reported in Asia/Jerusalem was
+    # declining every refusal it ever got — seen on a real second machine,
+    # whose only fault was being left on the timezone its image shipped with.
+    foreign = "You've hit your session limit · resets 9pm (America/New_York)"
+    if ew.ZoneInfo is not None:
+        read = ew.parse_reset_from_text(foreign, now)
+        check_true("a foreign timezone is looked up rather than declined",
+                   bool(read))
+        # An instant, not a local wall clock: 9pm in New York is one moment
+        # whatever this machine calls it, and writing it the other way is how
+        # a test starts passing only where it was written.
+        check("and read as that zone's 9pm, not this one's", read[0],
+              datetime(2026, 8, 6, 21, 0,
+                       tzinfo=ew.ZoneInfo("America/New_York")).timestamp())
+        check("a zone this machine has no data for is still declined",
+              ew.parse_reset_from_text(
+                  "You've hit your session limit · resets 9pm (Mars/Olympus)",
+                  now),
+              None)
+
+    # Where the interpreter cannot look a zone up at all — 3.6 to 3.8 — reading
+    # it as local time would be wrong by the offset, so it declines as before.
+    saved_zoneinfo, ew.ZoneInfo = ew.ZoneInfo, None
+    try:
+        check("without zoneinfo, a foreign zone is declined",
+              ew.parse_reset_from_text(foreign, now), None)
+        check("while the machine's own zone is read as it always was",
+              ew.parse_reset_from_text(
+                  "You've hit your session limit · resets 9pm ({})".format(ZONE),
+                  now),
+              (T(2026, 8, 6, 21, 0), "session"))
+    finally:
+        ew.ZoneInfo = saved_zoneinfo
     check("ordinary reply text yields nothing",
           ew.parse_reset_from_text("Bye! Have a good one.", now), None)
     check("empty text yields nothing", ew.parse_reset_from_text("", now), None)
