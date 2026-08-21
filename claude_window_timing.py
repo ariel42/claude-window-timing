@@ -3346,6 +3346,7 @@ def switch_only_findings(accounts):
     """
     findings = switch_findings(accounts)
     findings.extend(_stray_unit_findings(accounts))
+    findings.extend(_onboarding_findings())
     if installed_units():
         findings.append(Finding(
             "error",
@@ -3495,6 +3496,7 @@ def doctor(accounts):
     findings.extend(unit_cli_findings())
     findings.extend(linger_findings(pings))
     findings.extend(_launcher_findings())
+    findings.extend(_onboarding_findings())
     findings.extend(_user_account_findings(accounts))
     findings.extend(switch_findings(accounts))
     findings.extend(unit_target_findings())
@@ -3614,6 +3616,44 @@ def account_auth_ok(account):
     if plan in ("free", "none", ""):
         return False, "no paid subscription ({})".format(plan or "unknown")
     return True, plan
+
+
+def onboarding_pending():
+    """
+    Whether Claude Code will open on its first-run screen despite being logged
+    in.
+
+    That screen starts by asking how you want to sign in, and it comes back
+    whenever the onboarding version last completed is older than the CLI
+    installed -- with a perfectly good credential sitting beside it. On a
+    machine where `switch` has just run, the natural conclusion is that the
+    switch broke the login and the natural response is to sign in again: a
+    second login for an account that already had one, and a browser trip for
+    nothing.
+
+    Read-only, like everything else this tool does with ~/.claude. Setting the
+    flag would skip a first run that is Claude Code's to give and the user's
+    to see.
+    """
+    if not os.path.exists(credentials_path(user_login())):
+        return False                  # no login: being asked for one is right
+    # Explicitly false, not merely absent. Claude Code writes the flag itself,
+    # and reading its absence as "not done" would put a warning on every
+    # machine whose version keeps that state somewhere else.
+    return _read_json(USER_CONFIG_JSON).get("hasCompletedOnboarding") is False
+
+
+def _onboarding_findings():
+    if not onboarding_pending():
+        return []
+    return [Finding(
+        "warning",
+        "Claude Code is logged in but has not finished its first-run setup, so "
+        "it opens on the sign-in screen",
+        "That is not a login problem — `claude auth status` reports you signed "
+        "in, and switching accounts does not change it. Run `claude` once and "
+        "finish the first-run questions; it writes hasCompletedOnboarding into "
+        "{} and stops asking.".format(USER_CONFIG_JSON))]
 
 
 def _user_account_findings(accounts):
@@ -5158,6 +5198,17 @@ def _perform_switch(account, current, states):
         print("  Dropped {} cached account setting{} that belonged to the old "
               "account; Claude Code refetches them.".format(
                   len(dropped), "" if len(dropped) == 1 else "s"))
+
+    if onboarding_pending():
+        # Said here because this is the moment somebody would blame the switch
+        # for it: the next `claude` opens on the sign-in screen, having just
+        # been handed a working login.
+        print("  Claude Code has not finished its first-run setup, so it opens "
+              "on the")
+        print("  sign-in screen. That is not this switch: `claude auth status` "
+              "reports")
+        print("  you signed in. Finish the first-run questions once and it "
+              "stops asking.")
 
     print()
     # Measured rather than assumed, and not what was assumed first: a session

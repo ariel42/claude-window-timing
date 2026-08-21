@@ -6838,6 +6838,76 @@ def test_an_unknown_login_is_backed_up_rather_than_lost():
         restore()
 
 
+def test_being_asked_to_log_in_is_not_always_a_login_problem():
+    """
+    Claude Code's first-run flow opens on the sign-in screen, and it comes back
+    whenever the onboarding version it last completed is older than the CLI
+    installed — with a perfectly good credential sitting beside it.
+
+    On a machine where `switch` has just run, the conclusion writes itself: the
+    switch broke my login. It did not, and acting on it means a browser trip
+    and a second login for an account that already had one. Seen exactly that
+    way on a real machine, with `claude auth status` reporting the account
+    signed in while the CLI asked to sign in.
+    """
+    section("Being asked to log in is not always a login problem")
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        def with_flag(value):
+            config = json.load(open(ew.USER_CONFIG_JSON))
+            if value is None:
+                config.pop("hasCompletedOnboarding", None)
+            else:
+                config["hasCompletedOnboarding"] = value
+            with open(ew.USER_CONFIG_JSON, "w") as f:
+                json.dump(config, f)
+
+        with_flag(False)
+        check("an unfinished first run is noticed", ew.onboarding_pending(), True)
+        findings = ew._onboarding_findings()
+        check("and reported as a warning, because nothing is broken",
+              [f.level for f in findings], ["warning"])
+        check_true("saying plainly that it is not a login problem",
+                   "not a login problem" in findings[0].hint)
+        check_true("and what does clear it",
+                   "hasCompletedOnboarding" in findings[0].hint)
+
+        with_flag(True)
+        check("a finished one says nothing", ew._onboarding_findings(), [])
+        # Absent, not false: Claude Code writes the flag itself, and reading
+        # its absence as "not done" would warn on every machine whose version
+        # keeps that state somewhere else.
+        with_flag(None)
+        check("nor does a machine that never wrote the flag",
+              ew._onboarding_findings(), [])
+
+        # And with no login at all, being asked for one is the right answer.
+        with_flag(False)
+        os.remove(ew.credentials_path(ew.user_login()))
+        check("with no credential, nothing here second-guesses the prompt",
+              ew.onboarding_pending(), False)
+
+        # The switch says it too, where the confusion is created.
+        restore()
+        restore2, home2, accounts2 = _switch_sandbox(signed_in_as="1",
+                                                     parked=("2",))
+        try:
+            config = json.load(open(ew.USER_CONFIG_JSON))
+            config["hasCompletedOnboarding"] = False
+            with open(ew.USER_CONFIG_JSON, "w") as f:
+                json.dump(config, f)
+            out, _, code = _capture(
+                lambda: ew.switch_account(accounts2, "2", sign_in=False))
+            check("the switch still succeeds", code, 0)
+            check_true("and says the sign-in screen is not its doing",
+                       "not this switch" in out)
+        finally:
+            restore2()
+        restore = lambda: None
+    finally:
+        restore()
+
+
 def test_doctor_notices_a_store_going_stale():
     """
     Both failures here are invisible until the day you need to switch: a parked
@@ -7771,6 +7841,7 @@ def main():
                  test_a_switch_backs_up_what_it_replaces,
                  test_an_unknown_login_is_backed_up_rather_than_lost,
                  test_nothing_after_the_swap_turns_a_switch_into_a_traceback,
+                 test_being_asked_to_log_in_is_not_always_a_login_problem,
                  test_doctor_notices_a_store_going_stale,
                  test_only_one_function_writes_to_the_users_own_files,
                  test_running_sessions_are_looked_for_without_counting_our_own_pings,
