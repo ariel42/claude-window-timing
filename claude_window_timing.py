@@ -30,6 +30,7 @@ import pty
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -874,6 +875,104 @@ def describe_availability(state, avail, now):
     return "unusable — {}".format(avail.note)
 
 
+# How recently another machine must have published for its pings to still be
+# running. Two intervals: one to be due, one to be late.
+FOREIGN_PINGER_SEC = 2 * INTERVAL_MIN * 60
+
+# How long a sighting keeps being worth reporting. Long enough to survive a
+# machine being off for a weekend, short enough that a fixed setup goes quiet.
+FOREIGN_PINGER_REPORT_SEC = 7 * 24 * 3600
+
+
+def machine_id():
+    """
+    Something stable that tells this machine apart from the other one.
+
+    /etc/machine-id survives a rename and is the same for every user on the
+    box, which is what is wanted: the question is "is a second *machine*
+    pinging these accounts", and two accounts on one machine are fine.
+    Hostname is the fallback, and is enough -- being wrong here means missing
+    a warning, not raising a false one, because a collision needs two machines
+    with no machine-id and the same name.
+    """
+    try:
+        with open("/etc/machine-id") as f:
+            found = f.read().strip()
+            if found:
+                return found
+    except (IOError, OSError):
+        pass
+    return socket.gethostname() or "unknown"
+
+
+def pingers_file():
+    """
+    Where a sighting of another machine's pings is recorded.
+
+    A function rather than a module constant because STATE_ROOT is rebound --
+    by the tests, and by anything running against another checkout -- and a
+    constant derived from it at import time would go on pointing at wherever
+    it was first computed.
+    """
+    return os.path.join(STATE_ROOT, "pingers.json")
+
+
+def note_foreign_pinger(document, now):
+    """
+    Record that somebody else published this schedule recently.
+
+    The pings are meant to run on exactly one machine. Two machines pinging
+    the same accounts doubles what those accounts consume and buys nothing --
+    the wizard says so in as many words -- and each machine's pings open the
+    window the other is holding back, so the spacing cannot work either.
+
+    Nothing could see it happening. The evidence is destroyed by the act:
+    schedule.json is *the* file a second machine copies to answer `which`, and
+    the moment that machine starts pinging it overwrites the copy with its
+    own. So the sighting is taken here, in the instant before the overwrite,
+    and kept -- otherwise it lasts thirty minutes and nobody is looking.
+    """
+    theirs = (document or {}).get("pinged_by")
+    if not theirs or theirs == machine_id():
+        return
+    if now - (document.get("written_at") or 0) > FOREIGN_PINGER_SEC:
+        return                     # a copy from a machine that has since stopped
+    try:
+        if not os.path.isdir(STATE_ROOT):
+            os.makedirs(STATE_ROOT, 0o700)
+        target = pingers_file()
+        tmp = _temp_name(target)
+        with open(tmp, "w") as f:
+            json.dump({"machine_id": theirs,
+                       "hostname": document.get("pinged_by_host"),
+                       "their_written_at": document.get("written_at"),
+                       "seen_at": now}, f, indent=2, sort_keys=True)
+        os.replace(tmp, target)
+    except (IOError, OSError):
+        pass                       # a warning is not worth failing a ping over
+
+
+def foreign_pinger_findings(now=None):
+    """What to say if another machine has been seen pinging these accounts."""
+    now = time.time() if now is None else now
+    seen = _read_json(pingers_file())
+    if not seen:
+        return []
+    when = seen.get("seen_at") or 0
+    if now - when > FOREIGN_PINGER_REPORT_SEC:
+        return []
+    where = seen.get("hostname") or seen.get("machine_id") or "another machine"
+    return [Finding(
+        "error",
+        "Another machine ({}) was pinging these same accounts, as recently "
+        "as {}".format(where, fmt_time(when)),
+        "Two machines pinging one set of accounts doubles what they consume "
+        "and buys nothing, and each one's pings undo the other's spacing. "
+        "Run ./install.sh --no-pings on whichever machine should not be "
+        "doing it — it keeps switching, which needs no timers. Delete {} "
+        "once only one machine pings.".format(_tilde(pingers_file())))]
+
+
 def publish_schedule(accounts):
     """
     Write what other machines need in order to choose an account themselves.
@@ -924,7 +1023,17 @@ def publish_schedule(accounts):
             "last_run": state.get("last_run"),
         })
 
+    # Taken before the overwrite, because the overwrite is what destroys it.
+    # Read raw rather than through read_schedule: who published a file is
+    # worth knowing even when what they published is not usable here.
+    note_foreign_pinger(_read_json(SCHEDULE_FILE), now)
+
     document = {"written_at": now, "window_hours": WINDOW_HOURS,
+                # Which machine published this. A second machine copies this
+                # file to answer `which`; if it is also pinging, this is the
+                # only field that says so.
+                "pinged_by": machine_id(),
+                "pinged_by_host": socket.gethostname(),
                 "accounts": entry}
     tmp = _temp_name(SCHEDULE_FILE)
     with open(tmp, "w") as f:
@@ -3641,6 +3750,10 @@ def doctor(accounts):
 
     findings = validate_accounts(accounts)
     now = time.time()
+    # Before the timers, because a second pinger makes every figure below it
+    # describe consumption this machine did not cause.
+    findings.extend(foreign_pinger_findings(now))
+    findings.extend(orphaned_timer_findings(accounts))
     # Whether anything here can see systemd at all. Every timer question below
     # answers "no" when the bus is out of reach, which is a different thing
     # entirely and has a different remedy.
@@ -3876,7 +3989,23 @@ def _stray_unit_findings(accounts):
         unit = line.split()[0] if line.split() else ""
         if not unit or unit in ours:
             continue
-        if "claude" in unit and "window" in unit:
+        if unit.startswith("claude-window-timing@"):
+            # This tool's own naming, for an account that is not configured
+            # any more. Calling that "not part of this install" was a
+            # confident wrong answer to the commonest way it happens: losing
+            # accounts.json -- `git clean -xdf` removes it, everything runtime
+            # here being gitignored -- drops the config to one account while
+            # both timers go on firing.
+            findings.append(Finding(
+                "warning",
+                "{} is in a failed state, and no account here is called "
+                "{}".format(unit, _instance_of(unit) or "that"),
+                "This tool installed it, for an account that is no longer "
+                "configured — check accounts.json still lists every account "
+                "you expect. To stop it: `systemctl --user disable --now {}` "
+                "then `systemctl --user reset-failed {}`.".format(
+                    _timer_for(unit), unit)))
+        elif "claude" in unit and "window" in unit:
             findings.append(Finding(
                 "warning",
                 "{} is in a failed state but is not part of this "
@@ -3887,6 +4016,45 @@ def _stray_unit_findings(accounts):
                 "`systemctl --user list-timers --all` names it, and "
                 "`systemctl --user disable --now <that timer>` stops it "
                 "firing.".format(unit)))
+    return findings
+
+
+def _instance_of(unit):
+    """The account name out of one of this tool's own unit names, or None."""
+    found = re.match(r"^claude-window-timing@(.+?)\.(timer|service)$", unit)
+    return found.group(1) if found else None
+
+
+def _timer_for(unit):
+    """The timer that starts `unit`, which for a .timer is itself."""
+    name = _instance_of(unit)
+    return "claude-window-timing@{}.timer".format(name) if name else unit
+
+
+def orphaned_timer_findings(accounts):
+    """
+    Timers enabled for accounts that are no longer configured.
+
+    `load_accounts` falls back to a single default account when accounts.json
+    is missing, so losing that one file quietly halves a two-account setup --
+    while systemd goes on firing the timer for the account that vanished, for
+    ever, against a config directory nothing here still knows about. Nothing
+    compared the two lists, so nothing said a word.
+    """
+    configured = {account.name for account in accounts}
+    findings = []
+    for name in sorted(installed_instances() - configured):
+        findings.append(Finding(
+            "error",
+            "A timer is enabled for account {}, which is not in "
+            "accounts.json".format(name),
+            "Either accounts.json has lost an account — {} is where it "
+            "lives, and everything runtime here is gitignored, so a `git "
+            "clean -xdf` takes it — or the account was removed by hand and "
+            "its timer was left behind. Re-run ./install.sh to make the "
+            "timers match the file, or stop this one with `systemctl --user "
+            "disable --now claude-window-timing@{}.timer`.".format(
+                _tilde(ACCOUNTS_FILE), name)))
     return findings
 
 

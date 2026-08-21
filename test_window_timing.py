@@ -8950,6 +8950,134 @@ def test_a_machine_that_cannot_switch_never_reports_itself_healthy():
         ew.sys.platform = original
 
 
+
+def test_a_second_machine_pinging_the_same_accounts_is_caught():
+    """
+    The pings belong on exactly one machine. Two machines pinging one set of
+    accounts doubles what they consume and buys nothing -- and nothing could
+    see it happening, because the evidence is destroyed by the act:
+    schedule.json is the file the second machine copies in order to answer
+    `which`, and the moment it starts pinging it overwrites that copy with its
+    own.
+    """
+    section("A second machine pinging the same accounts")
+    root = tempfile.mkdtemp()
+    saved = (ew.STATE_ROOT, ew.SCHEDULE_FILE)
+    ew.STATE_ROOT = os.path.join(root, "state")
+    ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
+    now = 1000000.0
+    try:
+        os.makedirs(ew.STATE_ROOT)
+
+        def publish(by, host, written_at):
+            with open(ew.SCHEDULE_FILE, "w") as f:
+                json.dump({"written_at": written_at, "pinged_by": by,
+                           "pinged_by_host": host, "accounts": []}, f)
+
+        # Our own file, republished after every ping. Not a second machine.
+        publish(ew.machine_id(), "here", now - 60)
+        ew.note_foreign_pinger(ew._read_json(ew.SCHEDULE_FILE), now)
+        check("republishing our own schedule says nothing",
+              len(ew.foreign_pinger_findings(now)), 0)
+
+        # A copy from a machine that published minutes ago is a machine that
+        # is still pinging.
+        publish("other-machine-id", "big", now - 60)
+        ew.note_foreign_pinger(ew._read_json(ew.SCHEDULE_FILE), now)
+        findings = ew.foreign_pinger_findings(now)
+        check("a live second pinger is an error", len(findings), 1)
+        check("and it is an error, not a warning", findings[0].level, "error")
+        check_true("naming the machine", "big" in findings[0].message)
+        check_true("and saying which install to change",
+                   "--no-pings" in findings[0].hint)
+
+        # It has to outlive the overwrite, or it lasts one interval and
+        # nobody is looking when it does.
+        publish(ew.machine_id(), "here", now)
+        check("the sighting survives our own next publish",
+              len(ew.foreign_pinger_findings(now)), 1)
+
+        # And it has to stop eventually, or fixing it never clears the screen.
+        check("but not for ever",
+              len(ew.foreign_pinger_findings(
+                  now + ew.FOREIGN_PINGER_REPORT_SEC + 1)), 0)
+
+        # A stale copy from a machine that has since stopped is not evidence
+        # of anything: that is the ordinary switch-only workflow.
+        os.remove(ew.pingers_file())
+        publish("other-machine-id", "big", now - 5 * 3600)
+        ew.note_foreign_pinger(ew._read_json(ew.SCHEDULE_FILE), now)
+        check("an old copy from a machine that stopped is not reported",
+              len(ew.foreign_pinger_findings(now)), 0)
+    finally:
+        ew.STATE_ROOT, ew.SCHEDULE_FILE = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_timer_for_an_account_nobody_configured_is_reported():
+    """
+    `load_accounts` falls back to one default account when accounts.json is
+    missing -- and everything runtime in this repo is gitignored, so `git
+    clean -xdf` takes it. A two-account setup then quietly becomes a
+    one-account setup while systemd goes on firing the vanished account's
+    timer for ever. Nothing compared the two lists.
+    """
+    section("A timer for an account nobody configured")
+    root = tempfile.mkdtemp()
+    saved = ew.UNIT_DIR
+    ew.UNIT_DIR = os.path.join(root, "user")
+    wants = os.path.join(ew.UNIT_DIR, "timers.target.wants")
+    try:
+        os.makedirs(wants)
+        for name in ("1", "2"):
+            open(os.path.join(
+                wants, "claude-window-timing@{}.timer".format(name)), "w").close()
+
+        both = [ew.Account("1", "/tmp/c1", 0), ew.Account("2", "/tmp/c2", 1)]
+        check("a matching pair says nothing",
+              len(ew.orphaned_timer_findings(both)), 0)
+
+        only_one = [ew.Account("1", "/tmp/c1", 0)]
+        findings = ew.orphaned_timer_findings(only_one)
+        check("the account that vanished is named", len(findings), 1)
+        check("and it is an error", findings[0].level, "error")
+        check_true("saying which account", "account 2" in findings[0].message)
+        check_true("and where the file that lost it lives",
+                   "accounts.json" in findings[0].hint)
+
+        # The other half: systemd remembers a failed unit long after its file
+        # is gone, and this tool's own naming used to be reported as somebody
+        # else's leftovers -- a confident wrong answer.
+        original = ew._systemctl
+        try:
+            ew._systemctl = lambda *a: type("R", (), {
+                "returncode": 0,
+                "stdout": "claude-window-timing@2.service loaded failed failed\n"})()
+            stray = ew._stray_unit_findings(only_one)
+            check("a failed unit of ours is reported", len(stray), 1)
+            check_true("not as somebody else's",
+                       "not part of this install" not in stray[0].message)
+            check_true("but as an account that is no longer configured",
+                       "no account here is called 2" in stray[0].message)
+            check_true("and the fix disables the timer, not just the service",
+                       "disable --now claude-window-timing@2.timer"
+                       in stray[0].hint)
+
+            ew._systemctl = lambda *a: type("R", (), {
+                "returncode": 0,
+                "stdout": "claude-window-keeper.service loaded failed failed\n"})()
+            other = ew._stray_unit_findings(only_one)
+            check("something genuinely foreign still reads that way",
+                  len(other), 1)
+            check_true("and says so",
+                       "not part of this install" in other[0].message)
+        finally:
+            ew._systemctl = original
+    finally:
+        ew.UNIT_DIR = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     # Every path the tool reads or writes is redirected into one disposable
     # directory before a single test runs.
@@ -9054,6 +9182,8 @@ def main():
                  test_running_out_of_input_is_not_consent,
                  test_a_figure_from_another_program_is_rendered_not_raised_on,
                  test_a_machine_that_cannot_switch_never_reports_itself_healthy,
+                 test_a_second_machine_pinging_the_same_accounts_is_caught,
+                 test_a_timer_for_an_account_nobody_configured_is_reported,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
                  test_install_uninstall_purge_and_install_again,
