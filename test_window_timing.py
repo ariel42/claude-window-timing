@@ -2565,7 +2565,9 @@ def test_the_status_display_shows_the_unusual_parts():
         check_true("an account that cannot be used says when it can",
                    "Usable again  :" in said and "5-hour limit is spent" in said)
         check_true("a boundary already gone says it is waiting, not that it is due",
-                   "passed, awaiting next ping" in said)
+                   "which has passed — awaiting the next ping" in said)
+        check_true("a reset already behind us does not count down backwards",
+                   "(in -" not in said)
         check_true("the figures say when they were read, and from what",
                    "Figures from  :" in said
                    and "last ping's refusal message" in said)
@@ -2576,6 +2578,25 @@ def test_the_status_display_shows_the_unusual_parts():
                    "refusal-text" not in said and "statusline" not in said)
         check_true("a hold in force is stated with its reason",
                    "Holding       : until" in said and "spacing" in said)
+
+        # The figure nobody has refreshed: its reset is two days behind. This
+        # is what a machine whose pings stopped looks like, and it printed
+        # "(in -47h00m40s)" on the one screen people open when they suspect
+        # something is wrong.
+        ew.write_state(account, {
+            "last_run": now - 2 * 86400, "limits_read_at": now - 2 * 86400,
+            "rate_limits": {"five_hour": {"resets_at": now - 47 * 3600,
+                                          "used_percentage": 100}}})
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            ew.status([account])
+        finally:
+            sys.stdout = out
+        stale = buf.getvalue()
+        check_true("a reset in the past says so in words",
+                   "which has passed" in stale)
+        check_true("rather than counting down backwards", "(in -" not in stale)
     finally:
         ew._systemctl, ew._run, ew.SCHEDULE_FILE = saved
 
@@ -6323,6 +6344,71 @@ def test_the_numbers_mean_the_same_accounts_everywhere():
         restore()
 
 
+def test_a_schedule_nobody_refreshed_stops_speaking_with_authority():
+    """
+    A copied schedule carries verdicts as well as numbers, and the numbers age
+    differently from the verdicts. A window *phase* is durable -- windows tile,
+    so an expiry that has passed rolls forward and is still right weeks later.
+    "This account's limit is spent until 14:30" is a snapshot, and it was being
+    copied out verbatim however old the file was: an account excluded from
+    every recommendation for ever, printed with a countdown to a date in the
+    past, because the machine that publishes stopped and nobody noticed.
+
+    The README's own instruction produces this -- copy the file across -- with
+    no mechanism that ever copies it again.
+    """
+    section("A schedule nobody refreshed stops speaking with authority")
+    restore, home, accounts = _switch_sandbox(names=("1", "2"))
+    try:
+        now = time.time()
+        long_ago = now - 8 * 86400
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"written_at": long_ago, "window_hours": 5, "accounts": [
+                {"name": "1", "account_uuid": "uuid-1", "tier": "waiting",
+                 "usable_now": False,
+                 "unusable_until": long_ago + 3600,   # six days in the past
+                 "unusable_because": "its weekly limit is spent",
+                 "last_run": long_ago, "expires_at": long_ago + 7200},
+                {"name": "2", "account_uuid": "uuid-2", "tier": "usable",
+                 "usable_now": True, "last_run": long_ago,
+                 "expires_at": long_ago + 9000}]}, f)
+
+        known, states, avail, written = ew.schedule_view(accounts)
+        first = avail["1"]
+        check("a verdict that outlived its own deadline is no longer a verdict",
+              first.tier, ew.UNKNOWN)
+        check_true("and says so, naming the moment that passed",
+                   "has passed" in first.note and "nothing has checked" in first.note)
+        check("with no time to count down to", first.until, None)
+
+        # The phase is still usable, which is the half of the file that keeps.
+        said = _capture(lambda: ew.which(known, states, avail, written))[0]
+        check_true("nothing counts down to a moment in the past",
+                   "(in -" not in said)
+        check_true("and the file's age is on screen", "published" in said)
+
+        # And `doctor` says the copy is old. Reporting an absent schedule and
+        # not a rotten one is the wrong way round: absent is the harmless case.
+        findings = [f for f in ew.switch_only_findings(accounts)
+                    if "published" in f.message]
+        check("a stale schedule is reported", len(findings), 1)
+        check_true("saying how old it is", "192h" in findings[0].message)
+        check_true("and that the window times in it are still good",
+                   "phase does not move" in findings[0].hint)
+
+        # A fresh one says nothing, or the warning is noise on every machine.
+        with open(ew.SCHEDULE_FILE) as f:
+            document = json.load(f)
+        document["written_at"] = now - 60
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump(document, f)
+        check("a schedule from a minute ago is not complained about",
+              [f for f in ew.switch_only_findings(accounts)
+               if "published" in f.message], [])
+    finally:
+        restore()
+
+
 def test_a_copied_schedule_is_matched_by_account_not_by_slot():
     """
     Slot names are positional: they fall out of the order somebody signed in
@@ -8554,6 +8640,7 @@ def main():
                  test_a_spent_account_is_never_recommended,
                  test_a_live_reading_beats_a_cached_one,
                  test_the_numbers_mean_the_same_accounts_everywhere,
+                 test_a_schedule_nobody_refreshed_stops_speaking_with_authority,
                  test_a_copied_schedule_is_matched_by_account_not_by_slot,
                  test_the_schedule_is_treated_as_input_not_configuration,
                  test_the_refusals_fire_where_the_readme_says_to_switch,

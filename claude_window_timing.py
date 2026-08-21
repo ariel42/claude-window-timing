@@ -1048,10 +1048,21 @@ def schedule_view(accounts):
         # as observed.
         until = entry.get("unusable_until")
         exact = entry.get("unusable_until_exact", True) is not False
+        note = entry.get("unusable_because") or ""
         if tier == WAITING and not until:
             until, exact = now + WINDOW_HOURS * 3600, False
-        avail[account.name] = Availability(
-            tier, until, entry.get("unusable_because") or "", exact)
+        elif tier == WAITING and until <= now:
+            # The verdict has outlived the moment it named. On the machine that
+            # publishes, the next ping replaces it within half an hour; on a
+            # copy nobody refreshed it would otherwise exclude the account from
+            # every recommendation for ever, and print a countdown to a date in
+            # the past. What is known is that it *was* waiting until a moment
+            # that has since passed, and that nothing has looked since.
+            tier, until, exact = UNKNOWN, None, True
+            note = ("the schedule here said it was waiting until {}, which has "
+                    "passed and nothing has checked since".format(
+                        fmt_time(entry["unusable_until"])))
+        avail[account.name] = Availability(tier, until, note, exact)
 
     if not published:
         return None
@@ -3367,11 +3378,17 @@ def status(accounts):
                     print("  {:<14}: {} used, no reset time reported".format(
                         label, fmt_pct(window.get("used_percentage"))))
                 continue
-            print("  {:<14}: {} used, resets {} (in {})".format(
+            # A reset already behind us is a figure nobody has refreshed, not
+            # a window that resets in negative time. `fmt_delta` will happily
+            # print "(in -47h00m40s)", and did, on the one screen people open
+            # when they suspect something is wrong.
+            when = window["resets_at"]
+            print("  {:<14}: {} used, resets {} ({})".format(
                 label,
                 fmt_pct(window.get("used_percentage")),
-                fmt_time(window["resets_at"]),
-                fmt_delta(window["resets_at"] - now)))
+                fmt_time(when),
+                "in {}".format(fmt_delta(when - now)) if when > now
+                else "which has passed — this figure is from before then"))
 
         usable = avail[account.name]
         if account.name in absent:
@@ -3392,9 +3409,14 @@ def status(accounts):
         if pings:
             boundary = state.get("boundary")
             if boundary:
-                stale = "" if boundary > now else " — passed, awaiting next ping"
-                print("  Next start-of-window opportunity: {} (in {}){}".format(
-                    fmt_time(boundary), fmt_delta(boundary - now), stale))
+                # The same rule as the limit lines above: a moment already
+                # behind us is described, not counted down to. This said
+                # "(in -0h01m00s) — passed, awaiting next ping", which is the
+                # right sentence attached to a nonsense number.
+                print("  Next start-of-window opportunity: {} ({})".format(
+                    fmt_time(boundary),
+                    "in {}".format(fmt_delta(boundary - now)) if boundary > now
+                    else "which has passed — awaiting the next ping"))
                 # Both halves are omitted rather than printed as "?" when
                 # missing: a state file written before either field existed
                 # would otherwise explain the line above with a punctuation
@@ -3485,12 +3507,27 @@ def switch_only_findings(accounts):
             "This machine switches accounts but has no logins parked",
             "Run ./install.sh, or sign in as you need them: `{} switch` "
             "offers the one it needs, when it needs it.".format(COMMAND)))
-    if not read_schedule():
+    document = read_schedule()
+    if not document:
         findings.append(Finding(
             "warning",
             "No schedule.json here, so nothing knows which account to spend",
             "Copy it from the machine running the pings; `{} which` reads "
             "it and needs nothing else.".format(COMMAND)))
+    else:
+        # An absent schedule was reported and a rotten one was not, which is
+        # the wrong way round: absent is the harmless case -- the tool says it
+        # knows nothing -- while a stale copy answers confidently from figures
+        # nobody has refreshed. The window phase in it stays true for ever; the
+        # verdicts beside it are a snapshot, and it is rewritten on every ping.
+        age = time.time() - (document.get("written_at") or 0)
+        if age > WINDOW_HOURS * 3600:
+            findings.append(Finding(
+                "warning",
+                "The schedule here was published {} ago".format(fmt_delta(age)),
+                "The window times in it are still right — a phase does not "
+                "move — but which account is spent is a snapshot from then. "
+                "Copy schedule.json across again from the machine that pings."))
     return findings
 
 
