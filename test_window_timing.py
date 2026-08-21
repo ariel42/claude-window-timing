@@ -5638,6 +5638,93 @@ def test_a_live_reading_beats_a_cached_one():
         restore()
 
 
+def test_the_numbers_mean_the_same_accounts_everywhere():
+    """
+    Which account is 1 and which is 2 is each machine's own business. Being
+    *consistent about it* is not optional: status, which, switch, doctor and
+    the published schedule all have to mean the same Claude account by the same
+    number, on the machine you are typing on.
+
+    The hard case is a machine holding a schedule copied from one that numbers
+    them the other way round, because then there are two numberings in play and
+    only one of them is this machine's. Walked here as a whole: the same
+    machine, the same moment, every component asked what each number means, and
+    all of them answered by the account rather than by the slot.
+    """
+    section("The numbers mean the same accounts everywhere on one machine")
+    restore, home, accounts = _switch_sandbox(names=("1", "2"),
+                                              signed_in_as="1", parked=("2",))
+    saved = (ew._systemctl, ew._run)
+
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+
+    try:
+        ew._systemctl = lambda *a: Ok()
+        ew._run = lambda cmd: Ok()
+        now = time.time()
+        # The other machine's file: its account 1 is this machine's account 2,
+        # and that is the window about to expire.
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"written_at": now, "window_hours": 5, "accounts": [
+                {"name": "1", "label": "theirs-first", "account_uuid": "uuid-2",
+                 "tier": "usable", "usable_now": True, "last_run": now - 60,
+                 "expires_at": now + 600},
+                {"name": "2", "label": "theirs-second", "account_uuid": "uuid-1",
+                 "tier": "usable", "usable_now": True, "last_run": now - 60,
+                 "expires_at": now + 9000}]}, f)
+
+        def uuid_of(name):
+            """The Claude account this machine means by that number."""
+            account = ew.find_account(accounts, name)
+            return (ew.account_identity(account)["account_uuid"]
+                    or ew.account_identity(ew.switch_store(account))
+                    ["account_uuid"])
+
+        # The window that expires first belongs to uuid-2, which is this
+        # machine's account 2. Every component has to agree on that.
+        view = ew.schedule_view(accounts)
+        chosen, _ = ew.choose_account(view[0], view[1], now, view[2])
+        check("`which` recommends a number this machine uses", chosen.name, "2")
+        check("meaning the account whose window is about to end",
+              uuid_of(chosen.name), "uuid-2")
+
+        said, _, _ = _capture(lambda: ew.which(*view))
+        check_true("and says so on screen, with this machine's label",
+                   "Use account 2 (label2)" in said)
+        check_true("offering the switch that matches it",
+                   "{} switch 2".format(ew.COMMAND) in said)
+
+        said, _, _ = _capture(lambda: ew.status(accounts))
+        check_true("`status` heads with the same account",
+                   "Use account 2 (label2)" in said)
+        check_true("and lists both under this machine's numbers",
+                   "Account 1 (label1)" in said and "Account 2 (label2)" in said)
+
+        check("`current_account` names the account ~/.claude holds",
+              ew.current_account(accounts).name, "1")
+        check("which is the account this machine calls 1", uuid_of("1"),
+              ew.account_identity(ew.user_login())["account_uuid"])
+
+        # And the switch itself: the store it installs from is the one holding
+        # the account the recommendation was about.
+        out, err, code = _capture(
+            lambda: ew.switch_account(accounts, None, sign_in=False))
+        check("the switch it was offered succeeds", code, 0)
+        check("and lands on the account the number meant",
+              ew.account_identity(ew.user_login())["account_uuid"], "uuid-2")
+        check_true("saying which number that was", "account 2 (label2)" in out)
+
+        # Nothing about any of this is a fault to report.
+        findings = [f for f in ew.switch_findings(accounts)
+                    if f.level == "error"]
+        check("and none of it is an error", [f.message for f in findings], [])
+    finally:
+        (ew._systemctl, ew._run) = saved
+        restore()
+
+
 def test_a_copied_schedule_is_matched_by_account_not_by_slot():
     """
     Slot names are positional: they fall out of the order somebody signed in
@@ -7595,6 +7682,7 @@ def main():
                  test_an_interrupted_switch_never_leaves_a_login_in_two_places,
                  test_a_spent_account_is_never_recommended,
                  test_a_live_reading_beats_a_cached_one,
+                 test_the_numbers_mean_the_same_accounts_everywhere,
                  test_a_copied_schedule_is_matched_by_account_not_by_slot,
                  test_the_schedule_is_treated_as_input_not_configuration,
                  test_the_refusals_fire_where_the_readme_says_to_switch,
