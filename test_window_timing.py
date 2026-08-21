@@ -29,7 +29,8 @@ import sys
 import tempfile
 import time
 import traceback
-from datetime import datetime
+import email.utils
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import claude_window_timing as ew
@@ -254,16 +255,105 @@ def test_refusal_text():
           ew.parse_reset_from_text("Bye! Have a good one.", now), None)
     check("empty text yields nothing", ew.parse_reset_from_text("", now), None)
 
-    # A machine whose own zone cannot be read: the comparison cannot be made,
-    # so it is not made. Declining every refusal there would throw away the
-    # only reading a rate-limited account ever produces.
+    # A machine whose own zone cannot be read -- /etc/localtime a copy rather
+    # than a symlink and no /etc/timezone, which is RHEL, Alma, Rocky and a
+    # good many Dockerfiles. The comparison cannot be made, so every quoted
+    # zone has to be resolved on its own terms. Reading it as local instead
+    # was silently wrong by the whole offset.
     ew._local_tz_name = lambda: ""
-    check("a machine with no zone name of its own does not decline",
-          ew.parse_reset_from_text(
-              "You've hit your session limit · resets 9pm (America/New_York)",
-              now),
-          (T(2026, 8, 6, 21, 0), "session"))
+    quoted = ew.parse_reset_from_text(
+        "You've hit your session limit · resets 9pm (America/New_York)", now)
+    expected = datetime(2026, 8, 6, 21, 0,
+                        tzinfo=ew.ZoneInfo("America/New_York")).timestamp()
+    check("a zone this machine cannot compare is still resolved, not assumed",
+          quoted, (expected, "session"))
+    check_true("and that is not the local reading",
+               quoted[0] != T(2026, 8, 6, 21, 0))
+
+    # A bare abbreviation names no single offset. The dangerous ones are the
+    # handful tzdata does define -- EST, MST, HST -- which resolve cleanly and
+    # are an hour out for half the year.
+    for ambiguous in ("EST", "PST", "IST", "MST", "HST", "UTC+3", "+03:00"):
+        check("an abbreviation is declined rather than guessed at: "
+              "{}".format(ambiguous),
+              ew.parse_reset_from_text(
+                  "You've hit your session limit · resets 9pm "
+                  "({})".format(ambiguous), now), None)
+    # UTC is not an abbreviation in the ambiguous sense, and is what Claude
+    # Code quotes on a machine set to UTC -- which is most servers.
+    check_true("but UTC is read",
+               ew.parse_reset_from_text(
+                   "You've hit your session limit · resets 9pm (UTC)",
+                   now) is not None)
     restore()
+
+
+def test_a_reset_in_the_hour_that_happens_twice():
+    """
+    When the clocks go back, a wall time occurs twice. Taking the first
+    occurrence made a reset that was still ahead of us look like one that had
+    already passed, so it was read as tomorrow -- a full day out, which the
+    5h10m horizon then threw away. Once a year, per zone, the only reading a
+    rate-limited account produces was silently lost.
+    """
+    section("A reset in the hour that happens twice")
+    saved = ew._local_tz_name
+
+    def ambiguous_wall_time(zone):
+        """A 2026 wall time in `zone` that happens twice, on the half hour."""
+        for step in range(366 * 48):
+            naive = (datetime(2026, 1, 1, 0, 30) +
+                     timedelta(minutes=30 * step))
+            first = naive.replace(tzinfo=zone, fold=0).timestamp()
+            second = naive.replace(tzinfo=zone, fold=1).timestamp()
+            # A repeated hour, not a skipped one: in a gap the two folds
+            # also differ, but the later fold resolves *earlier*.
+            if second > first:
+                return naive
+        return None
+
+    try:
+        for name in ("Asia/Jerusalem", "America/New_York",
+                     "America/Santiago", "Australia/Lord_Howe",
+                     "Pacific/Chatham"):
+            zone = ew.ZoneInfo(name)
+            naive = ambiguous_wall_time(zone)
+            check_true("{} has an hour that repeats in 2026".format(name),
+                       naive is not None)
+            later = naive.replace(tzinfo=zone, fold=1)
+            wall = "{}:{:02d}{}".format((naive.hour % 12) or 12, naive.minute,
+                                        "pm" if naive.hour >= 12 else "am")
+            text = "You've hit your session limit · resets {} ({})".format(
+                wall, name)
+            # Standing ten minutes before the later of the two occurrences,
+            # which is inside the repeat and after the earlier one.
+            now = later.timestamp() - 600
+            # Through the lookup path: the machine's own zone is named as
+            # something else, so the quoted one has to be resolved.
+            ew._local_tz_name = lambda: "Etc/UTC"
+            parsed = ew.parse_reset_from_text(text, now)
+            check_true("{} is read as minutes away, not a day".format(name),
+                       parsed is not None
+                       and abs(parsed[0] - later.timestamp()) < 1)
+
+            # And through the naive path, which is the one that actually runs:
+            # Claude Code quotes the pinging process's own zone.
+            ew._local_tz_name = lambda name=name: name
+            os.environ["TZ"] = name
+            time.tzset()
+            try:
+                parsed = ew.parse_reset_from_text(text, now)
+                check_true("{} too when it is the machine's own "
+                           "zone".format(name),
+                           parsed is not None
+                           and abs(parsed[0] - later.timestamp()) < 1)
+            finally:
+                os.environ["TZ"] = ZONE
+                time.tzset()
+    finally:
+        ew._local_tz_name = saved
+        os.environ["TZ"] = ZONE
+        time.tzset()
 
 
 # ---------------------------------------------------------------------------
@@ -9078,6 +9168,64 @@ def test_a_timer_for_an_account_nobody_configured_is_reported():
         shutil.rmtree(root, ignore_errors=True)
 
 
+
+def test_a_clock_that_is_wrong_is_measured_against_claudes():
+    """
+    A machine two minutes fast books every anchor two minutes before the
+    boundary -- inside the window that is still running, which opens nothing,
+    and the phase that ping was meant to set is lost for good. The reading and
+    the arithmetic are both self-consistent; they are just both wrong about
+    when now is. The only clock check anywhere compared a reported reset
+    against a five-hour window, so twenty minutes of skew was invisible.
+
+    Every HTTP response carries a Date header, refusals included, so the
+    comparison costs nothing.
+    """
+    section("A clock measured against Claude's own")
+    root = tempfile.mkdtemp()
+    saved = ew.STATE_ROOT
+    ew.STATE_ROOT = os.path.join(root, "state")
+    now = 1700000000.0
+    try:
+        def headers_saying(offset):
+            return {"Date": email.utils.formatdate(now - offset, usegmt=True)}
+
+        check("no reading yet means nothing to say",
+              len(ew.clock_skew_findings(now)), 0)
+
+        ew.note_clock_skew(headers_saying(0), now)
+        check("a clock that agrees is not reported",
+              len(ew.clock_skew_findings(now)), 0)
+
+        ew.note_clock_skew(headers_saying(45), now)
+        findings = ew.clock_skew_findings(now)
+        check("a small drift is a warning", len(findings), 1)
+        check("and only a warning", findings[0].level, "warning")
+        check_true("saying which way", "ahead" in findings[0].message)
+
+        ew.note_clock_skew(headers_saying(-20 * 60), now)
+        findings = ew.clock_skew_findings(now)
+        check("twenty minutes out is an error", len(findings), 1)
+        check("and an error", findings[0].level, "error")
+        check_true("saying which way", "behind" in findings[0].message)
+        check_true("and what it costs",
+                   "phase is lost" in findings[0].hint)
+        check_true("and how to fix it", "set-ntp" in findings[0].hint)
+
+        # A measurement from last month describes last month's clock.
+        check("an old measurement stops being reported",
+              len(ew.clock_skew_findings(now + 8 * 24 * 3600)), 0)
+
+        # Nothing here may raise: it runs inside a live reading.
+        for junk in ({}, {"Date": ""}, {"Date": "not a date"},
+                     {"Date": None}, None):
+            ew.note_clock_skew(junk, now)
+        check_true("junk from the other end is ignored, not raised on", True)
+    finally:
+        ew.STATE_ROOT = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     # Every path the tool reads or writes is redirected into one disposable
     # directory before a single test runs.
@@ -9184,6 +9332,8 @@ def main():
                  test_a_machine_that_cannot_switch_never_reports_itself_healthy,
                  test_a_second_machine_pinging_the_same_accounts_is_caught,
                  test_a_timer_for_an_account_nobody_configured_is_reported,
+                 test_a_reset_in_the_hour_that_happens_twice,
+                 test_a_clock_that_is_wrong_is_measured_against_claudes,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
                  test_install_uninstall_purge_and_install_again,

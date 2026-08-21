@@ -21,6 +21,7 @@ run `python3 claude_window_timing.py <command>` directly.
 """
 
 import argparse
+import email.utils
 import collections
 import fcntl
 import hashlib
@@ -2106,6 +2107,80 @@ def _limits_from_headers(headers):
     return limits
 
 
+# How far this machine's clock can be from Claude's before it matters.
+#
+# It matters more than it looks. Every anchor is booked as a wall-clock
+# calendar stamp computed from this clock, so a machine running two minutes
+# early books its ping two minutes before the boundary -- inside the window
+# that is still running, which opens nothing, and the phase that ping was
+# meant to set is lost for good. The next boundary inherits it. Nothing else
+# here would notice: the reading and the arithmetic are both self-consistent,
+# they are just both wrong about when now is.
+CLOCK_SKEW_WARN_SEC = 30
+CLOCK_SKEW_ERROR_SEC = 120
+
+
+def clock_file():
+    """Where the last comparison against Claude's clock is kept."""
+    return os.path.join(STATE_ROOT, "clock.json")
+
+
+def note_clock_skew(headers, now=None):
+    """
+    Record how far this machine's clock is from the one Claude answered with.
+
+    Free: every HTTP response carries a Date header, including the refusals.
+    Before this, the only clock check anywhere compared a reported reset
+    against a +/-5h10m window, so a machine could be twenty minutes out --
+    quite enough to lose a window boundary on every anchor it books -- and
+    nothing anywhere would say a word.
+    """
+    stamp = (headers or {}).get("Date") if hasattr(headers, "get") else None
+    if not stamp:
+        return
+    try:
+        theirs = email.utils.parsedate_to_datetime(stamp).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return
+    now = time.time() if now is None else now
+    try:
+        if not os.path.isdir(STATE_ROOT):
+            os.makedirs(STATE_ROOT, 0o700)
+        target = clock_file()
+        tmp = _temp_name(target)
+        with open(tmp, "w") as f:
+            json.dump({"skew_sec": now - theirs, "seen_at": now,
+                       "their_date": stamp}, f, indent=2, sort_keys=True)
+        os.replace(tmp, target)
+    except (IOError, OSError):
+        pass                    # a diagnostic is not worth failing a read over
+
+
+def clock_skew_findings(now=None):
+    """What to say about this machine's clock, from the last live reading."""
+    now = time.time() if now is None else now
+    seen = _read_json(clock_file())
+    skew = seen.get("skew_sec")
+    if not isinstance(skew, (int, float)) or isinstance(skew, bool):
+        return []
+    if now - (seen.get("seen_at") or 0) > 7 * 24 * 3600:
+        return []               # too old to be describing the clock now
+    if abs(skew) < CLOCK_SKEW_WARN_SEC:
+        return []
+    level = "error" if abs(skew) >= CLOCK_SKEW_ERROR_SEC else "warning"
+    return [Finding(
+        level,
+        "This machine's clock is {} {} than Claude's, as of {}".format(
+            fmt_delta(abs(skew)), "ahead" if skew > 0 else "behind",
+            fmt_time(seen.get("seen_at") or now)),
+        "Every boundary anchor is a wall-clock time computed from this clock, "
+        "so a ping meant to land just after a window ends lands {} early — "
+        "inside the window still running, which opens nothing, and the phase "
+        "is lost for good. Turn on time synchronisation: `timedatectl "
+        "set-ntp true`, or `sudo systemctl enable --now systemd-timesyncd`."
+        .format(fmt_delta(abs(skew))))]
+
+
 def read_live_limits(account):
     """
     Ask Claude what this account's limits are *now*, as (limits, problem).
@@ -2146,6 +2221,7 @@ def read_live_limits(account):
             # hours from now, days early. Where it does not, all that is known
             # is that something is spent, and the 5-hour limit is the one that
             # nearly always is.
+            note_clock_skew(e.headers or {})
             refused = _limits_from_headers(e.headers or {})
             if not any((window.get("used_percentage") or 0) >= LIMIT_SPENT_PCT
                        for window in refused.values()):
@@ -2180,6 +2256,7 @@ def read_live_limits(account):
     except (urllib.error.URLError, OSError) as e:
         return {}, "could not reach Claude: {}".format(e)
 
+    note_clock_skew(headers)
     limits = _limits_from_headers(headers)
     if not limits:
         return {}, ("Claude answered, but sent no rate-limit headers — the "
@@ -2439,14 +2516,35 @@ def parse_reset_from_text(text, now=None):
     Returns (epoch_seconds, "session"|"weekly"), or None when the message names
     no limit we recognise or has no parseable time.
 
-    The message names the timezone it is quoting, and that is the account's,
-    not the machine's: a server in UTC pinging an account whose resets are
-    reported in Asia/Jerusalem was declining every refusal it ever got, because
-    the two names differ and guessing at an offset is not an option. Where the
-    interpreter can look a zone up — 3.9 and later — it is looked up, and the
-    two agree again. Where it cannot, a foreign zone is still declined rather
-    than read as local, which would be wrong by whatever the offset is; the
-    statusLine source is unaffected either way.
+    The message names the timezone it is quoting. That zone is the *pinging
+    process's* local one, not the account's — the same two accounts are
+    reported as (Asia/Jerusalem) from a machine in Jerusalem and as (UTC) from
+    a machine in UTC — so in normal use the reported zone and the local zone
+    agree and no lookup is needed. The lookup exists for when they do not:
+    where the interpreter can resolve a zone (3.9 and later) it is resolved,
+    and where it cannot, a foreign zone is declined rather than read as local,
+    which would be wrong by whatever the offset is.
+
+    Three things this is careful about, each of which was once wrong here:
+
+      * A machine whose zone cannot be named at all — /etc/localtime a copy
+        rather than a symlink and no /etc/timezone, which is RHEL, Alma, Rocky
+        and a good many Dockerfiles — used to skip the comparison entirely and
+        read whatever zone was quoted as local. Silently, and wrong by the
+        offset. An unnameable local zone now means every quoted zone gets
+        resolved properly or declined.
+      * A bare abbreviation is not a zone. Some resolve (EST, MST, HST are
+        real fixed-offset entries in tzdata and are an hour out for half the
+        year); most do not (PST, IST). Accepting the ones that happen to
+        resolve is worse than declining all of them, so all of them are
+        declined — bar UTC and GMT, which are unambiguous.
+      * In the hour that repeats when the clocks go back, a wall time occurs
+        twice, and taking the first occurrence made a reset that was still
+        ahead of us look like one that had passed — so it was read as being
+        tomorrow, a full day out. The second occurrence is tried before the
+        day is advanced.
+
+    The statusLine source, which carries an epoch, is unaffected by all of it.
     """
     if not text:
         return None
@@ -2472,8 +2570,8 @@ def parse_reset_from_text(text, now=None):
 
     reported, local_tz = tz.strip(), _local_tz_name()
     zone = None
-    if reported and local_tz and reported != local_tz:
-        if ZoneInfo is None:
+    if reported and reported != local_tz:
+        if not _is_a_zone_name(reported) or ZoneInfo is None:
             return None
         try:
             zone = ZoneInfo(reported)
@@ -2490,16 +2588,57 @@ def parse_reset_from_text(text, now=None):
                 return None
             target = now_dt.replace(month=month, day=int(day), hour=hour,
                                     minute=minute, second=0, microsecond=0)
-            if target < now_dt:                       # the date is next year
+            if _before(target, now_dt):               # the date is next year
                 target = target.replace(year=now_dt.year + 1)
         else:
             target = now_dt.replace(hour=hour, minute=minute,
                                     second=0, microsecond=0)
-            if target <= now_dt:                      # the reset is tomorrow
-                target += timedelta(days=1)
-    except ValueError:                                # e.g. Feb 30, or Feb 29 rolled
+            if not _after(target, now_dt):
+                # In the repeated hour this wall time happens twice. The later
+                # of the two may still be ahead of us; only if it is not is
+                # the reset genuinely tomorrow.
+                second_pass = target.replace(fold=1)
+                target = second_pass if _after(second_pass, now_dt) \
+                    else target + timedelta(days=1)
+    except (ValueError, OverflowError, OSError):      # e.g. Feb 30, or Feb 29 rolled
         return None
-    return target.timestamp(), kind
+    try:
+        return target.timestamp(), kind
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+# Zone names that are not region/city but mean exactly one offset anyway.
+# Claude Code quotes "(UTC)" on a machine set to UTC, which is most servers.
+_PLAIN_ZONES = ("utc", "gmt", "etc/utc", "etc/gmt", "z")
+
+
+def _is_a_zone_name(reported):
+    """
+    Whether `reported` is specific enough to resolve to one offset.
+
+    A bare abbreviation is not. "IST" is India, Ireland and Israel; "PST" is
+    two countries. The dangerous ones are the handful that tzdata does define
+    as fixed offsets — EST, MST, HST — because those resolve cleanly and are
+    an hour wrong for half the year, in a way nothing downstream can detect.
+    """
+    lowered = reported.strip().lower()
+    return "/" in lowered or lowered in _PLAIN_ZONES
+
+
+def _after(target, moment):
+    """Whether `target` is genuinely later than `moment`, folds and all."""
+    try:
+        return target.timestamp() > moment.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return target > moment
+
+
+def _before(target, moment):
+    try:
+        return target.timestamp() < moment.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return target < moment
 
 
 # A ping has to satisfy *both* limits, so both decide when the next one can land.
@@ -3754,6 +3893,7 @@ def doctor(accounts):
     # describe consumption this machine did not cause.
     findings.extend(foreign_pinger_findings(now))
     findings.extend(orphaned_timer_findings(accounts))
+    findings.extend(clock_skew_findings(now))
     # Whether anything here can see systemd at all. Every timer question below
     # answers "no" when the bus is out of reach, which is a different thing
     # entirely and has a different remedy.
