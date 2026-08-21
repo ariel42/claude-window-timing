@@ -3874,6 +3874,30 @@ def test_doctor_notices_a_deployment_going_wrong():
                 sys.stdout = out
             return buf.getvalue()
 
+        # A ping that is still running has written its opening log line and
+        # not its closing one, and systemd has no next elapse for the timer
+        # until the service it triggered finishes. Both are true of the
+        # healthiest possible moment, and `doctor` run inside those twenty
+        # seconds reported a dead timer and a run that died. Seen on a real
+        # machine, which is the only way it was going to be noticed.
+        with open(account.log_file, "w") as f:
+            f.write("[x] Starting ping run\n" * 5)
+            f.write("[x] Ping run finished\n" * 4)
+        enabled = {"is-enabled": Reply("enabled"), "NextElapse": Reply("")}
+        replies = dict(enabled, **{"is-active": Reply("active")})
+        said = doctor_says()
+        check("a timer whose ping is running is not called dead",
+              "never fire again" in said, False)
+        check("nor is the run in flight called one that did not finish",
+              "did not finish" in said, False)
+
+        replies = dict(enabled, **{"is-active": Reply("inactive")})
+        said = doctor_says()
+        check_true("once it has finished, both are reported again",
+                   "never fire again" in said and "did not finish" in said)
+        with open(account.log_file, "w") as f:
+            f.write("[x] Starting ping run\n[x] Ping run finished\n")
+
         # No bus, no answers. Every timer question fails exactly as a missing
         # timer does, and reporting one per account -- with a fix that fails
         # the same way -- is the diagnostic crying wolf about the one thing it

@@ -3446,7 +3446,11 @@ def doctor(accounts):
         # ping has already succeeded still leaves the ping counted, but skips the
         # state write and the boundary anchor. Comparing the two counts is the
         # cheapest way to notice it.
+        # A run in flight has written its opening line and not its closing
+        # one, which is not the same as a run that died.
         started, finished = _log_run_counts(account)
+        if ping_in_flight(account):
+            finished += 1
         if started and finished < started:
             findings.append(Finding(
                 "warning",
@@ -3522,6 +3526,18 @@ def doctor(accounts):
 _NO_ELAPSE = ("", "infinity", "n/a", "0")
 
 
+def ping_in_flight(account):
+    """
+    Whether a ping for this account is running right now.
+
+    Two of the checks below are about what a *finished* run leaves behind, and
+    a run that is still going has left half of it. Asked once, so that neither
+    of them reports the healthiest possible moment as a fault.
+    """
+    return (_systemctl("is-active", account.service_unit).stdout
+            or "").strip() in ("active", "activating")
+
+
 def _timer_will_fire_again(account):
     """
     Whether systemd still has a next elapse for this account's timer.
@@ -3533,7 +3549,15 @@ def _timer_will_fire_again(account):
     than no diagnostic at all.
 
     Unknown counts as fine: without systemd there is nothing to report.
+
+    So does "while the ping is running". OnUnitActiveSec measures from the last
+    activation, so systemd has no next elapse to report until the service it
+    triggers has finished -- and a `doctor` that happened to run inside those
+    twenty seconds called a perfectly healthy timer dead. Seen on a real
+    machine, which is the only way this was ever going to be noticed.
     """
+    if ping_in_flight(account):
+        return True
     for prop in ("NextElapseUSecMonotonic", "NextElapseUSecRealtime"):
         result = _systemctl("show", account.timer_unit,
                             "--property=" + prop, "--value")
