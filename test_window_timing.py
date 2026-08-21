@@ -527,7 +527,7 @@ def test_anchor_scheduling():
           _anchor_timer_count(account), 1)
 
     ew.cancel_anchor(account)
-    check("cancelling leaves nothing pending", ew.anchor_pending(account), "")
+    check("cancelling leaves nothing pending", ew.anchor_pending(account), None)
     check("cancelling removes the unit", _anchor_timer_count(account), 0)
 
 
@@ -780,7 +780,7 @@ def test_without_systemd():
         check_true("scheduling an anchor does not raise", True)
         check_true("no anchor is recorded that was never created",
                    "anchor_target" not in state)
-        check("no anchor is reported as pending", ew.anchor_pending(account), "")
+        check("no anchor is reported as pending", ew.anchor_pending(account), None)
     except Exception as exc:                                  # noqa: BLE001
         check("scheduling an anchor does not raise",
               "{}: {}".format(type(exc).__name__, exc), "no exception")
@@ -1321,8 +1321,35 @@ def test_the_command_surface():
               ew.normalise_help(form, commands), form)
     check("bare `help` means the general help", ew.normalise_help(["help"], commands),
           ["--help"])
-    check("`help` and a word that is not a command still helps",
-          ew.normalise_help(["help", "nonsense"], commands), ["--help"])
+    # A word that is not a command used to print the general help and exit 0,
+    # which reads as an answer: the reader scans it for the word they typed,
+    # does not find it, and has been told nothing.
+    stopped, said = None, io.StringIO()
+    err, sys.stderr = sys.stderr, said
+    try:
+        ew.normalise_help(["help", "nonsense"], commands)
+    except SystemExit as exit_code:
+        stopped = exit_code
+    finally:
+        sys.stderr = err
+    check_true("`help` and a word that is not a command is refused",
+               stopped is not None)
+    check("with the code a misuse gets", stopped.code, 2)
+    check_true("naming the word that was typed", "nonsense" in said.getvalue())
+    check_true("and listing what there is instead",
+               "switch" in said.getvalue())
+
+    # And where it is a near miss, say so rather than make them look.
+    said = io.StringIO()
+    err, sys.stderr = sys.stderr, said
+    try:
+        ew.normalise_help(["help", "swithc"], commands)
+    except SystemExit:
+        pass
+    finally:
+        sys.stderr = err
+    check_true("a near miss is named", "switch" in said.getvalue()
+               and "Did you mean" in said.getvalue())
     # Nothing here may quietly turn a real command into a help request.
     check("an ordinary command is untouched",
           ew.normalise_help(["ping", "2"], commands), ["ping", "2"])
@@ -5514,7 +5541,12 @@ def test_every_command_routes_to_the_thing_it_names():
         check_true("and answers the question it is named after", "Use account" in said)
 
         code, said, _ = run(["accounts"])
-        check("accounts lists them one per line", said.split(), ["1", "2"])
+        lines = [l for l in said.splitlines() if l.strip()]
+        check("accounts lists them one per line", len(lines), 2)
+        check_true("each naming the slot",
+                   lines[0].startswith("1") and lines[1].startswith("2"))
+        check_true("and more than the bare slot number, which names nobody",
+                   len(lines[0].split()) > 1 and len(lines[1].split()) > 1)
 
         code, said, _ = run(["log"])
         check("log succeeds", code, 0)
@@ -9350,6 +9382,66 @@ def test_uninstall_finds_the_path_line_whatever_the_shell_says():
         shutil.rmtree(root, ignore_errors=True)
 
 
+
+def test_an_anchor_that_could_not_be_booked_is_not_silent():
+    """
+    The anchor is what puts a ping just after a window ends, and it is the
+    whole of how a missed ping's phase is recovered. A failure to book one
+    went into the log and nowhere else: `status` printed "Anchor: none
+    scheduled" -- byte for byte what a healthy account between boundaries
+    prints -- and `doctor` had no check at all. A machine where systemd-run
+    had been rejecting every booking looked exactly like a machine with no
+    boundary coming up.
+    """
+    section("An anchor that could not be booked")
+    root = tempfile.mkdtemp()
+    saved = (ew.STATE_ROOT, ew._run, ew._systemctl)
+    ew.STATE_ROOT = os.path.join(root, "state")
+    now = 1700000000.0
+    try:
+        account = ew.Account("1", os.path.join(root, "cfg"), 0)
+        account.ensure_state_dir()
+
+        def answering(code, text=""):
+            return lambda *a: type("R", (), {"returncode": code,
+                                             "stdout": text})()
+
+        check("a healthy account has nothing to report",
+              len(ew.anchor_findings([account], now)), 0)
+
+        # systemd-run refuses -- no systemd-run, no bus, a unit name clash.
+        ew._systemctl = answering(0)
+        ew._run = answering(1, "Failed to connect to bus")
+        booked = ew.schedule_anchor(account, now + 600)
+        check("booking reports that it failed", booked, False)
+        findings = ew.anchor_findings([account], now)
+        check("and doctor has something to say about it", len(findings), 1)
+        check("as an error", findings[0].level, "error")
+        check_true("naming the account", "Account 1" in findings[0].message)
+        check_true("quoting what systemd said",
+                   "Failed to connect to bus" in findings[0].message)
+        check_true("and saying what is lost without it",
+                   "phase is never recovered" in findings[0].hint)
+
+        # The next booking that works clears it, so a fixed machine goes quiet.
+        ew._run = answering(0)
+        check("booking succeeds once it can", ew.schedule_anchor(account, now + 600), True)
+        check("and the finding clears itself",
+              len(ew.anchor_findings([account], now)), 0)
+
+        # A failure from a fortnight ago is not describing this machine now.
+        ew._run = answering(1, "nope")
+        ew.schedule_anchor(account, now + 600)
+        # Stamped with the real clock by the code under test, so the horizon
+        # has to be measured from there too.
+        check("a stale failure stops being reported",
+              len(ew.anchor_findings([account],
+                                     time.time() + 8 * 24 * 3600)), 0)
+    finally:
+        ew.STATE_ROOT, ew._run, ew._systemctl = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     # Every path the tool reads or writes is redirected into one disposable
     # directory before a single test runs.
@@ -9461,6 +9553,7 @@ def main():
                  test_an_install_says_what_it_cannot_write_before_it_asks,
                  test_rebuilding_a_checkpoint_waits_for_a_ping_in_flight,
                  test_uninstall_finds_the_path_line_whatever_the_shell_says,
+                 test_an_anchor_that_could_not_be_booked_is_not_silent,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
                  test_install_uninstall_purge_and_install_again,
@@ -9524,6 +9617,17 @@ def main():
         # indistinguishable from checks that passed.
         try:
             test()
+        except SystemExit as exc:
+            # SystemExit is not an Exception, so it walked straight out of the
+            # handler below and took the whole run with it -- which is exactly
+            # the abort this block exists to prevent. The tool exits
+            # deliberately in a few places (a misused command, a question with
+            # nobody there to answer it), and a test that reaches one of them
+            # is a failing test, not a reason to stop.
+            FAILURES.append("{} exited with code {}".format(
+                test.__name__, exc.code))
+            print("  ERROR  {} exited with code {}".format(
+                test.__name__, exc.code))
         except Exception as exc:                              # noqa: BLE001
             FAILURES.append("{} raised {}: {}".format(
                 test.__name__, type(exc).__name__, exc))

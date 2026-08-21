@@ -23,6 +23,7 @@ run `python3 claude_window_timing.py <command>` directly.
 import argparse
 import email.utils
 import collections
+import difflib
 import fcntl
 import hashlib
 import json
@@ -2780,13 +2781,33 @@ def cancel_anchor(account):
 
 
 def anchor_pending(account):
-    """Return the pending anchor's scheduled time as a string, or '' if none."""
-    result = _systemctl("show", account.anchor_unit + ".timer",
-                        "--property=NextElapseUSecRealtime", "--value")
-    if result.returncode != 0:
-        return ""
-    value = (result.stdout or "").strip()
-    return value if value and value not in ("n/a", "0") else ""
+    """
+    When the pending anchor fires: an epoch, or systemd's own words, or None.
+
+    systemd renders this in the *system's* timezone and its own format, so
+    `Anchor: pending — Fri 2026-08-21 07:30:30 UTC` used to appear verbatim in
+    the middle of a screen of the reader's local times, with nothing to say it
+    was a different clock. Asked for as a Unix timestamp it can be printed
+    like every other moment here. `--timestamp=unix` needs systemd 247, so
+    where it is not understood the raw string is still returned rather than
+    losing the line altogether.
+    """
+    def ask(*extra):
+        result = _systemctl("show", *(extra + (account.anchor_unit + ".timer",
+                                               "--property=NextElapseUSecRealtime",
+                                               "--value")))
+        if result.returncode != 0:
+            return ""
+        value = (result.stdout or "").strip()
+        return value if value and value not in ("n/a", "0") else ""
+
+    value = ask("--timestamp=unix")
+    if value.startswith("@"):
+        try:
+            return float(value[1:])
+        except ValueError:
+            pass
+    return value or ask() or None
 
 
 def _system_local(epoch):
@@ -2862,10 +2883,62 @@ def schedule_anchor(account, target_epoch):
             # that wrote it. Say the instant, not the encoding.
             log(account, "Anchor scheduled for {} (in {})".format(
                 fmt_time(target_epoch), fmt_delta(target_epoch - time.time())))
+            _record_anchor_outcome(account, "")
             return True
-    log(account, "WARNING: could not schedule anchor: {}".format(
-        (result.stdout or "").strip() if result else "no answer"))
+    problem = (result.stdout or "").strip() if result else "no answer"
+    log(account, "WARNING: could not schedule anchor: {}".format(problem))
+    _record_anchor_outcome(account, problem or "systemd-run gave no answer")
     return False
+
+
+def _record_anchor_outcome(account, problem):
+    """
+    Remember whether the last anchor was booked, so something can say so.
+
+    A failure here used to go into the log and nowhere else. `status` printed
+    "Anchor: none scheduled" -- byte for byte what a healthy account between
+    boundaries prints -- and `doctor` had no check at all, so a machine where
+    systemd-run had been rejecting every booking looked exactly like a machine
+    that simply had no boundary coming up. The one correction the schedule
+    relies on can stop happening entirely and nothing on any screen changes.
+    """
+    try:
+        state = read_state(account)
+        if problem:
+            state["anchor_problem"] = problem
+            state["anchor_problem_at"] = time.time()
+        else:
+            state.pop("anchor_problem", None)
+            state.pop("anchor_problem_at", None)
+            state["anchor_booked_at"] = time.time()
+        account.ensure_state_dir()
+        write_state(account, state)
+    except (IOError, OSError):
+        pass                    # the log line already went out
+
+
+def anchor_findings(accounts, now=None):
+    """Accounts whose last attempt to book a boundary anchor failed."""
+    now = time.time() if now is None else now
+    findings = []
+    for account in accounts:
+        state = read_state(account)
+        problem = state.get("anchor_problem")
+        if not problem:
+            continue
+        when = state.get("anchor_problem_at") or 0
+        if now - when > 7 * 24 * 3600:
+            continue
+        findings.append(Finding(
+            "error",
+            "Account {}'s last window-boundary anchor could not be booked "
+            "({}), as of {}".format(account.name, problem, fmt_time(when)),
+            "The anchor is what puts a ping just after a window ends, and "
+            "without it a missed ping's phase is never recovered — the "
+            "schedule drifts and nothing else says so. Check systemd-run is "
+            "installed and that `systemctl --user` works here; the next "
+            "successful booking clears this."))
+    return findings
 
 
 def maybe_schedule_anchor(account, boundary, horizon, label, state, was_limited):
@@ -3795,8 +3868,16 @@ def status(accounts):
                     fmt_time(hold["until"]), hold.get("reason", "alignment")))
 
             pending = anchor_pending(account)
-            print("  Anchor        : {}".format(
-                "pending — " + pending if pending else "none scheduled"))
+            if isinstance(pending, float):
+                print("  Anchor        : fires {} (in {})".format(
+                    fmt_time(pending), fmt_delta(pending - now)))
+            elif pending:
+                # systemd too old to answer in epoch seconds. Its words, said
+                # to be its words, in the system's clock rather than yours.
+                print("  Anchor        : fires {} (system clock)".format(
+                    pending))
+            else:
+                print("  Anchor        : none scheduled")
 
             result = _systemctl("list-timers", "--all", account.timer_unit)
             for line in (result.stdout or "").splitlines():
@@ -3913,6 +3994,7 @@ def doctor(accounts):
     findings.extend(foreign_pinger_findings(now))
     findings.extend(orphaned_timer_findings(accounts))
     findings.extend(clock_skew_findings(now))
+    findings.extend(anchor_findings(accounts, now))
     # Whether anything here can see systemd at all. Every timer question below
     # answers "no" when the bus is out of reach, which is a different thing
     # entirely and has a different remedy.
@@ -7420,13 +7502,37 @@ def normalise_help(argv, commands):
 
     `help which` is the git habit and just as fair. Both are rewritten into the
     form argparse understands, rather than corrected at the person typing.
+
+    A word that is not a command is a different matter. `help swithc` used to
+    print the general help and exit 0, which reads as an answer: the reader
+    scans it for `swithc`, does not find it, and has been told nothing. It is
+    named and refused now, with the exit code a misuse gets.
     """
     if not argv or argv[0] not in ("-h", "--help", "help"):
         return argv
     for word in argv[1:]:
         if word in commands:
             return [word, "--help"]
+    asked = [word for word in argv[1:] if not word.startswith("-")]
+    if asked:
+        near = _closest_command(asked[0], commands)
+        sys.stderr.write(
+            "There is no command called {!r}.{}\n  The commands are: {}\n"
+            .format(asked[0],
+                    "  Did you mean `{}`?".format(near) if near else "",
+                    ", ".join(sorted(commands))))
+        sys.exit(2)
     return ["--help"]
+
+
+def _closest_command(typed, commands):
+    """The command `typed` was probably meant to be, or None."""
+    best, best_score = None, 0.0
+    for command in commands:
+        score = difflib.SequenceMatcher(None, typed, command).ratio()
+        if score > best_score:
+            best, best_score = command, score
+    return best if best_score >= 0.6 else None
 
 
 def not_a_pinging_machine(clause):
@@ -7693,7 +7799,12 @@ def cli(argv=None):
                                    else switch_only_findings(accounts))
         if command == "accounts":
             for account in accounts:
-                print(account.name)
+                identity = account_identity(account)
+                who = account.label or identity.get("email") or ""
+                print("{}{}{}".format(
+                    account.name,
+                    "  " + who if who else "",
+                    "  " + _tilde(account.config_dir)))
             return 0
         if command == "uninstall":
             for item in uninstall(accounts, purge=args.purge):
