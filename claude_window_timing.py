@@ -549,6 +549,15 @@ UNHEALTHY_AFTER = 3
 # refuses real work at 100, while the ping — a cache read — may still be served.
 LIMIT_SPENT_PCT = 100
 
+# How long a live reading stays good enough to hand back instead of taking
+# another. Without this, every invocation spent one request per account -- and
+# `which` is exactly the shape of thing people put in a prompt, a tmux status
+# line or `watch`, which would bill hundreds of requests an hour against the
+# quota this tool exists to protect. A minute of staleness is invisible against
+# a five-hour window, and it is what makes a reading cheap enough to take by
+# default everywhere.
+LIVE_REUSE_SEC = 60
+
 # How little of a window has to be left before the recommendation says so. An
 # account with 4% left is genuinely usable and genuinely the most perishable
 # thing you own, so it is still the right one to spend -- but being sent to it
@@ -2046,6 +2055,11 @@ def refresh_limits(accounts):
         state = read_state(account)
         if not probe_is_safe(state, now):
             continue
+        # Already fresh: hand back what is on disk rather than asking again.
+        read_at = state.get("limits_read_at") or 0
+        if now - read_at < LIVE_REUSE_SEC:
+            taken[account.name] = state.get("rate_limits") or {}
+            continue
         limits, problem = read_live_limits(account)
         if problem:
             # Loud on the way past, and recorded so `doctor` keeps saying it
@@ -3322,6 +3336,20 @@ def status(accounts):
         if state.get("last_run"):
             print("  Last ping     : {} ({} ago)".format(
                 fmt_time(state["last_run"]), fmt_delta(now - state["last_run"])))
+        # When the percentages below were read, and from what. `which` has said
+        # this since it existed; `status` did not, and "Last ping" was the only
+        # timestamp on screen -- so a figure refreshed by a live reading looked
+        # as old as the last ping, and one that really was half an hour old
+        # looked current. Two machines then disagreed about the same account,
+        # correctly, with nothing on either screen to explain why.
+        # Falling back to the ping's own time, the way `which` does: figures
+        # with no reading stamp are the ones the last ping brought back.
+        read_at = state.get("limits_read_at") or state.get("last_run")
+        source = fmt_source(state.get("limits_source"))
+        if read_at and (state.get("rate_limits") or {}):
+            print("  Figures from  : {}, {} ago{}".format(
+                fmt_time(read_at), fmt_delta(now - read_at),
+                " ({})".format(source) if source else ""))
         failures = state.get("consecutive_failures", 0)
         if failures:
             print("  Failed pings  : {} in a row".format(failures))
@@ -4727,6 +4755,56 @@ def _existing_mode(path, fallback=0o600):
         return fallback
 
 
+def report_live_usage(account):
+    """
+    What the account just switched to actually has left, read from Claude now.
+
+    Read with the login this switch has just installed, not with the account's
+    ping directory: on a machine that only switches there is no ping directory,
+    and on one that pings it is a different login to the same account. The
+    reading is stored as the account's own, because that is whose it is.
+
+    Prints nothing rather than an error if it cannot be taken. A switch that
+    worked must not end in a paragraph about a failed status request -- the
+    figures are what `status` is for, and it says how old they are.
+    """
+    state = read_state(account)
+    now = time.time()
+    # The same rule every other reading obeys: a billed request starts a window
+    # if none is running, and choosing that moment belongs to the anchoring
+    # machinery rather than to a report. In ordinary use a window is always
+    # running -- that is the entire point of this tool -- so this almost never
+    # declines.
+    if not probe_is_safe(state, now):
+        return
+    limits, problem = read_live_limits(user_login())
+    if problem or not limits:
+        return
+    merged = dict(state.get("rate_limits") or {})
+    for key, window in limits.items():
+        merged[key] = dict(merged.get(key) or {}, **window)
+    state["rate_limits"] = merged
+    state["limits_source"] = "live"
+    state["limits_read_at"] = now
+    account.ensure_state_dir()
+    write_state(account, state)
+
+    five = merged.get("five_hour") or {}
+    used, resets = five.get("used_percentage"), five.get("resets_at")
+    if used is None and not resets:
+        return
+    parts = []
+    if used is not None:
+        parts.append("{}% used, {}% left".format(used, max(0, 100 - used)))
+    if resets:
+        parts.append("ends {} (in {})".format(fmt_time(resets),
+                                              fmt_delta(resets - now)))
+    print("  Its window right now: {}.".format(", ".join(parts)))
+    weekly = merged.get("seven_day") or {}
+    if weekly.get("used_percentage") is not None:
+        print("  Weekly limit: {}% used.".format(weekly["used_percentage"]))
+
+
 def switch_marker():
     """
     Where a switch records that it is part-way through. Computed, not a
@@ -5163,6 +5241,19 @@ def switch_blockers(account, usable=None):
             "Account {}'s parked login expired {}".format(
                 account.display, fmt_time(expires)),
             "Sign in again: {}".format(sign_in_command(store))))
+    # Judged on the login that is about to be installed, which is the only one
+    # that decides whether the session works. The account's *ping* directory is
+    # a different login and answers a different question -- see the warning at
+    # the end of this function, which used to answer this one from there.
+    plan = (identity["subscription"] or "").lower()
+    if plan in ("free", "none"):
+        findings.append(Finding(
+            "error",
+            "The login parked for account {} is on no paid plan ({})".format(
+                account.display, identity["subscription"]),
+            "Switching to it would leave your Claude Code signed in to an "
+            "account that cannot serve a request. Sign in as a subscriber: "
+            "{}".format(sign_in_command(store))))
 
     # Who this slot is, where this machine can say: its ping directory. A
     # machine that only switches has none, and the slot is then defined by the
@@ -5250,11 +5341,22 @@ def switch_blockers(account, usable=None):
                 "" if usable.exact else "no later than ",
                 fmt_time(usable.until))))
     elif usable.tier == NEEDS_ACTION:
+        # `usable` is worked out from the account's *ping* directory, which is
+        # a different login from the one about to be installed. Announcing that
+        # "switching will not get you a working session" on that evidence was
+        # wrong twice over: the parked login is checked above on its own
+        # merits, and in the case that produced this the ping login had expired
+        # while the parked one had four days left -- the switch worked
+        # perfectly and the tool said it would not. The README's promise that
+        # it refuses when it would not work is kept by the errors above; this
+        # is a different fault, on a different login, and now says so.
         findings.append(Finding(
             "warning",
-            "Account {} needs attention — {}".format(account.display, usable.note),
-            "Run `{} doctor`. Switching to it now will not get you a working "
-            "session.".format(COMMAND)))
+            "Account {}'s own pings are not working — {}".format(
+                account.display, usable.note),
+            "That is this machine's ping directory for the account, not the "
+            "login being installed, so the switch itself is unaffected. `{} "
+            "doctor` says how to repair the pings.".format(COMMAND)))
 
     return findings
 
@@ -5570,6 +5672,11 @@ def _perform_switch(account, current, states):
               "reports")
         print("  you signed in. Finish the first-run questions once and it "
               "stops asking.")
+
+    # Read from Claude, now, with the login just installed. Somebody switching
+    # is about to spend this account, and the figure they most want is the one
+    # thing no stored state can tell them: what is actually left of it.
+    report_live_usage(account)
 
     print()
     # Measured rather than assumed, and not what was assumed first: a session
@@ -6653,6 +6760,12 @@ def build_parser():
                            help="read the limits from Claude now ({})".format(
                                default_note))
 
+    # The bare `claude-window` reports status and now takes a reading like the
+    # named form, so it needs the same way of being told not to. Without this,
+    # `claude-window --no-live` was a usage error and the only cheap form was
+    # the longer `claude-window status --no-live`.
+    add_live(parser, "the default")
+
     status = add("status", "What every account is doing, and which to use now.")
     status.add_argument("--json", action="store_true",
                         help="report it as JSON instead, for scripting")
@@ -6959,12 +7072,17 @@ def cli(argv=None):
             # therefore none of its options.
             live = getattr(args, "live", None)
             if live is None:
-                # Neither flag given. A person gets a reading; the bare
-                # `claude-window` does not, because it is what people type
-                # idly and it stays free; and `--json` does not, because a
-                # scripting interface is the thing something polls in a loop.
-                live = args.command is not None and not getattr(args, "json",
-                                                                False)
+                # Neither flag given. Everybody typing this gets a reading,
+                # including the bare `claude-window` -- which used not to, on
+                # the grounds that it is what people type idly and should stay
+                # free. What that actually bought was the tool's own name
+                # printing a percentage up to half an hour old with nothing on
+                # screen to say so, and two machines disagreeing about the same
+                # account because one had pinged more recently than the other.
+                # A reading is reused for a minute, so typing it repeatedly is
+                # free anyway. `--json` still does not: a scripting interface is
+                # the thing something polls in a loop.
+                live = not getattr(args, "json", False)
             if live:
                 refresh_limits(accounts)
             if getattr(args, "json", False):

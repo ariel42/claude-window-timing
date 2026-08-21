@@ -2210,6 +2210,63 @@ def test_what_it_says_in_every_state_it_can_be_in():
                "doctor" in ew.choose_account([one], {one.name: fresh}, now)[1])
 
 
+def test_a_reading_taken_a_moment_ago_is_not_taken_again():
+    """
+    Every live reading is a real billed request. Nothing stopped `which` or
+    `status` from taking one per account on every invocation -- and `which` is
+    exactly the shape of thing people put in a shell prompt, a tmux status line
+    or `watch`, which would spend hundreds of requests an hour against the very
+    quota this tool exists to protect. A reading is good for a minute; inside
+    that minute the one on disk is handed back.
+    """
+    section("A reading taken a moment ago is not taken again")
+    root = tempfile.mkdtemp()
+    saved = (ew.STATE_ROOT, ew.pings_here, ew.read_live_limits)
+    ew.STATE_ROOT = root
+    try:
+        account = ew.Account("1", os.path.join(root, "cfg"), 0)
+        account.ensure_state_dir()
+        os.makedirs(account.config_dir, 0o700)
+        taken = []
+        ew.pings_here = lambda: True
+        ew.read_live_limits = lambda a: (
+            taken.append(a.name)
+            or ({"five_hour": {"used_percentage": 7,
+                               "resets_at": time.time() + 3600}}, None))
+
+        now = time.time()
+        ew.write_state(account, {"last_run": now - 300, "available_at": now - 300,
+                                 "limits_read_at": now - 5,
+                                 "rate_limits": {"five_hour": {
+                                     "used_percentage": 3,
+                                     "resets_at": now + 3600}}})
+        got = ew.refresh_limits([account])
+        check("a reading five seconds old is not taken again", taken, [])
+        check("and the figures already on disk are what comes back",
+              got["1"]["five_hour"]["used_percentage"], 3)
+
+        ew.write_state(account, {"last_run": now - 300, "available_at": now - 300,
+                                 "limits_read_at": now - ew.LIVE_REUSE_SEC - 1,
+                                 "rate_limits": {"five_hour": {
+                                     "used_percentage": 3,
+                                     "resets_at": now + 3600}}})
+        got = ew.refresh_limits([account])
+        check("one older than the reuse window is", taken, ["1"])
+        check("and its answer is what comes back",
+              got["1"]["five_hour"]["used_percentage"], 7)
+
+        # An account that has never been read has no timestamp to reuse.
+        del taken[:]
+        ew.write_state(account, {"last_run": now - 300, "available_at": now - 300,
+                                 "rate_limits": {"five_hour": {
+                                     "resets_at": now + 3600}}})
+        ew.refresh_limits([account])
+        check("a first reading is always taken", taken, ["1"])
+    finally:
+        ew.STATE_ROOT, ew.pings_here, ew.read_live_limits = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_the_age_of_the_figures_is_never_overstated():
     """
     `which` ends by saying how old its numbers are, which is the reader's only
@@ -2273,6 +2330,186 @@ def test_the_age_of_the_figures_is_never_overstated():
                "1970" not in said and "Figures from" in said)
 
 
+def test_one_usage_figure_reaches_every_surface_unchanged():
+    """
+    The 5-hour usage figure is the number this whole tool exists to report, and
+    one stored value is rendered by six independent code paths: `status`,
+    `status --json`, `which`'s per-account line, `which`'s recommendation,
+    `window_left_pct`, and -- after a trip through `schedule.json` -- the same
+    two on another machine. Nothing made them agree; each formatted the figure
+    itself.
+
+    That is how "— only 90% of it left" reached the first line of the flagship
+    command: one path compared a *remaining* percentage against a *used*
+    threshold, and the test beside it sampled the single value where the two
+    are indistinguishable. So this sweeps the whole range and pins every
+    surface to the same number at once, including the ones that have no
+    interesting behaviour today and would acquire some silently.
+    """
+    section("One usage figure, every surface, unchanged")
+    now = time.time()
+    root = tempfile.mkdtemp()
+    saved = (ew.STATE_ROOT, ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE,
+             ew._systemctl, ew._run, ew.pings_here)
+
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+
+    ew.STATE_ROOT = root
+    ew.ALIGNMENT_FILE = os.path.join(root, "alignment.json")
+    ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
+    ew._systemctl = lambda *a: Ok()
+    ew._run = lambda cmd: Ok()
+    ew.pings_here = lambda: True
+    try:
+        one = ew.Account("1", os.path.join(root, "cfg-1"), 0, "first")
+        two = ew.Account("2", os.path.join(root, "cfg-2"), 1, "second")
+        for account in (one, two):
+            account.ensure_state_dir()
+            os.makedirs(account.config_dir, 0o700)
+            with open(account.config_json, "w") as f:
+                json.dump({"oauthAccount": {
+                    "accountUuid": "uuid-" + account.name,
+                    "emailAddress": "a{}@example.com".format(account.name)}}, f)
+            with open(os.path.join(account.config_dir, ".credentials.json"),
+                      "w") as f:
+                json.dump({"claudeAiOauth": {
+                    "accessToken": "t", "refreshToken": "r-" + account.name,
+                    "subscriptionType": "pro",
+                    "refreshTokenExpiresAt": int((now + 30 * 86400) * 1000)}}, f)
+            with open(account.session_id_file, "w") as f:
+                f.write("sid-{}\n".format(account.name))
+            open(account.checkpoint_backup, "w").close()
+        ew.write_alignment({})
+
+        def store(used, read_ago=90):
+            """One figure on disk, for account 1. Account 2 stays untouched."""
+            ew.write_state(one, {
+                "last_run": now - read_ago, "available_at": now - read_ago,
+                "limits_read_at": now - read_ago, "limits_source": "live",
+                "rate_limits": {
+                    "five_hour": dict({"resets_at": now + 2 * HOUR},
+                                      **({} if used is None
+                                         else {"used_percentage": used})),
+                    "seven_day": {"used_percentage": 12,
+                                  "resets_at": now + 4 * 86400}}})
+            ew.write_state(two, {
+                "last_run": now - read_ago, "available_at": now - read_ago,
+                "limits_read_at": now - read_ago, "limits_source": "live",
+                "rate_limits": {
+                    "five_hour": {"used_percentage": 1,
+                                  "resets_at": now + 4 * HOUR},
+                    "seven_day": {"used_percentage": 12,
+                                  "resets_at": now + 4 * 86400}}})
+
+        # Every value the API can report, including the ones that only turn up
+        # on a bad day: nothing read yet, a window untouched, one exhausted,
+        # and the over-100 figure Claude really does return.
+        for used in (None, 0, 1, 3, 9, 10, 11, 37, 50, 89, 90, 99, 100, 108):
+            store(used)
+            state = ew.read_state(one)
+            said = _capture(lambda: ew.status([one, two]))[0]
+            listing = _capture(lambda: ew.which([one, two]))[0]
+            document = json.loads(_capture(lambda: ew.status_json([one, two]))[0])
+            entry = [a for a in document["accounts"] if a["name"] == "1"][0]
+            left = ew.window_left_pct(state)
+            # Account 1's own line in the list, since account 2 is on screen
+            # too and its figure must not be mistaken for this one.
+            # The list line, not the headline: "Use account 1 (first)" also
+            # names the account, and matching it instead made the checks below
+            # look at a line that never carries a figure.
+            mine = [l for l in listing.splitlines()
+                    if l.startswith("  1 (first)")]
+            mine = mine[0] if mine else ""
+            check_true("account 1 has a line of its own in the list", bool(mine))
+
+            if used is None:
+                check("nothing read means nothing claimed ({})".format(used),
+                      left, None)
+                check_true("and status does not invent a percentage",
+                           "5-hour window : ?%" in said or
+                           "5-hour window" not in said)
+                check_true("nor does which", mine and "% left" not in mine)
+                check("and the JSON reports no figure",
+                      (entry["rate_limits"].get("five_hour") or {}).get(
+                          "used_percentage"), None)
+                continue
+
+            # 1. the arithmetic
+            check("{}% used leaves {}%".format(used, max(0, 100 - used)),
+                  left, max(0, 100 - used))
+            # 2. what `status` prints
+            check_true("status prints {}% used".format(used),
+                       "5-hour window : {}% used".format(used) in said)
+            # 3. what the JSON carries -- the raw figure, not a rendering
+            check("the JSON carries {} unrounded".format(used),
+                  entry["rate_limits"]["five_hour"]["used_percentage"], used)
+            # 4. what `which` prints per account, when it can be used at all
+            if used < 100:
+                check_true("which says {}% left".format(left),
+                           "usable — {}% left".format(left) in mine)
+            else:
+                check_true("a spent window is not offered as usable",
+                           "unusable" in mine)
+            # 5. the recommendation's caution, which is the one that regressed
+            best, reason = ew.choose_account(
+                [one, two], {one.name: state, two.name: ew.read_state(two)}, now)
+            if used < 100:
+                check("{}% used is still the most perishable".format(used),
+                      best.name, "1")
+                # Ten, written out, not `ew.LITTLE_LEFT_PCT`. Expecting the
+                # constant means the expectation moves with the bug: the
+                # regression this test exists for was a wrong threshold, and
+                # an assertion phrased against that threshold agrees with it
+                # whatever it says.
+                check("the caution appears exactly when little is left ({}%)"
+                      .format(used), "of it left" in reason, left <= 10)
+                if "of it left" in reason:
+                    check_true("and names the same figure",
+                               "only {}% of it left".format(left) in reason)
+            else:
+                check("a spent account is not recommended", best.name, "2")
+
+        # 6. and the same figure after a round trip through schedule.json,
+        # which is how a second machine sees it. Read back through the real
+        # publisher and the real reader, not by rebuilding the state by hand.
+        store(37)
+        ew.publish_schedule([one, two])
+        published = json.load(open(ew.SCHEDULE_FILE))
+        theirs = [a for a in published["accounts"] if a["name"] == "1"][0]
+        check("the published figure is the stored one", theirs["used_percentage"], 37)
+        # As the *other* machine sees it: it has the file and no readings of
+        # its own, which is the only state in which the schedule is consulted.
+        for account in (one, two):
+            os.remove(account.state_file)
+        view = ew.schedule_view([one, two])
+        check_true("a copy of the schedule is enough to answer from", bool(view))
+        elsewhere = view[1]["1"]
+        check("and it arrives as the same number",
+              ew.window_left_pct(elsewhere), 63)
+        check_true("rendered identically on the other machine",
+                   "63% left" in ew.describe_availability(
+                       elsewhere, view[2]["1"], now))
+
+        # 7. the age travels with it everywhere it is shown. A figure with no
+        # age is what let two machines disagree in public with nothing on
+        # either screen to explain it.
+        store(37, read_ago=900)
+        said = _capture(lambda: ew.status([one, two]))[0]
+        listing = _capture(lambda: ew.which([one, two]))[0]
+        check_true("status says when the figures were read",
+                   "Figures from  :" in said and "0h15m00s ago" in said)
+        check_true("and which says the same age",
+                   "Figures from a live reading, 0h15m00s ago" in listing)
+        check_true("status distinguishes that from the ping's own time",
+                   "Last ping     :" in said)
+    finally:
+        (ew.STATE_ROOT, ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE,
+         ew._systemctl, ew._run, ew.pings_here) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_the_status_display_shows_the_unusual_parts():
     """
     Most of `status` only appears when something is worth saying — a run of
@@ -2329,6 +2566,9 @@ def test_the_status_display_shows_the_unusual_parts():
                    "Usable again  :" in said and "5-hour limit is spent" in said)
         check_true("a boundary already gone says it is waiting, not that it is due",
                    "passed, awaiting next ping" in said)
+        check_true("the figures say when they were read, and from what",
+                   "Figures from  :" in said
+                   and "last ping's refusal message" in said)
         check_true("and says which limit set it, and where that came from",
                    "set by the weekly limit" in said
                    and "as reported by the last ping's refusal message" in said)
@@ -4982,11 +5222,16 @@ def test_every_command_routes_to_the_thing_it_names():
             len(accounts)) or {}
         try:
             run([])
-            check("the bare command never reads the limits", readings, [])
+            check("the bare command reads the limits like every other "
+                  "human-facing form", readings, [2])
+            del readings[:]
             run(["status", "--json"])
-            check("and neither does the scripting interface", readings, [])
+            check("the scripting interface still does not", readings, [])
             run(["status", "--json", "--live"])
             check("unless it is asked to", readings, [2])
+            del readings[:]
+            run(["--no-live"])
+            check("and the bare form can still be told not to", readings, [])
             del readings[:]
             run(["status"])
             check("a person running status gets a reading", readings, [2])
@@ -6903,6 +7148,75 @@ def test_switching_says_what_it_will_and_will_not_fix():
         restore()
 
 
+def test_a_switch_says_what_the_account_it_moved_to_actually_has_left():
+    """
+    The reason to switch is that the account you are on is spent, so the first
+    question after switching is what the new one has. Stored figures cannot
+    answer it -- they are the last ping's, up to half an hour old, and the
+    account may have been spent from another machine since. So the switch takes
+    a reading, with the login it has just installed.
+    """
+    section("A switch says what the account it moved to has left")
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    saved = (ew.read_live_limits, ew.probe_is_safe)
+    try:
+        now = time.time()
+        asked = []
+        ew.probe_is_safe = lambda state, when: True
+        ew.read_live_limits = lambda login: (
+            asked.append(ew.credentials_path(login))
+            or ({"five_hour": {"used_percentage": 30, "resets_at": now + 3600},
+                 "seven_day": {"used_percentage": 45,
+                               "resets_at": now + 4 * 86400}}, None))
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("the switch succeeds", code, 0)
+        check_true("it says what the account actually has left, now",
+                   "Its window right now: 30% used, 70% left" in out)
+        check_true("and when that window ends", "ends " in out)
+        check_true("and the weekly limit beside it",
+                   "Weekly limit: 45% used." in out)
+        check("read with the login it just installed, not a ping directory",
+              asked, [ew.credentials_path(ew.user_login())])
+        check("and the reading is kept as that account's own",
+              ew.read_state(accounts[1]).get("limits_source"), "live")
+
+        # A reading that cannot be taken must not turn a switch that worked
+        # into a paragraph about a failed status request.
+        restore2, home2, accounts2 = _switch_sandbox(signed_in_as="1",
+                                                     parked=("2",))
+        try:
+            ew.read_live_limits = lambda login: ({}, "network is unreachable")
+            out, err, code = _capture(
+                lambda: ew.switch_account(accounts2, "2", sign_in=False))
+            check("a failed reading leaves the switch reported as it was", code, 0)
+            check_true("with nothing said about the window",
+                       "Its window right now" not in out)
+            check_true("and no error about the reading",
+                       "unreachable" not in out and "unreachable" not in err)
+        finally:
+            restore2()
+
+        # And an account with no window running is not probed at all: the
+        # request would start one, which is the anchoring machinery's decision.
+        restore3, home3, accounts3 = _switch_sandbox(signed_in_as="1",
+                                                     parked=("2",))
+        try:
+            ew.probe_is_safe = lambda state, when: False
+            ew.read_live_limits = lambda login: (
+                asked.append("probed anyway") or ({}, ""))
+            del asked[:]
+            out, err, code = _capture(
+                lambda: ew.switch_account(accounts3, "2", sign_in=False))
+            check("a switch still succeeds", code, 0)
+            check("and no request is made between windows", asked, [])
+        finally:
+            restore3()
+    finally:
+        ew.read_live_limits, ew.probe_is_safe = saved
+        restore()
+
+
 def test_a_switch_killed_between_its_two_writes_is_finished_not_believed():
     """
     A switch rewrites two files: the credential, then the identity saying whose
@@ -8203,7 +8517,9 @@ def main():
                  test_a_login_that_stopped_working_is_reported,
                  test_the_account_it_recommends_says_how_much_is_left,
                  test_what_it_says_in_every_state_it_can_be_in,
+                 test_a_reading_taken_a_moment_ago_is_not_taken_again,
                  test_the_age_of_the_figures_is_never_overstated,
+                 test_one_usage_figure_reaches_every_surface_unchanged,
                  test_the_status_display_shows_the_unusual_parts,
                  test_every_reading_a_figure_can_come_from_can_be_said_in_words,
                  test_spacing_optimiser,
@@ -8251,6 +8567,7 @@ def main():
                  test_the_token_and_the_identity_move_together,
                  test_switching_refuses_what_cannot_possibly_work,
                  test_switching_says_what_it_will_and_will_not_fix,
+                 test_a_switch_says_what_the_account_it_moved_to_actually_has_left,
                  test_a_switch_killed_between_its_two_writes_is_finished_not_believed,
                  test_switching_with_no_account_named_follows_which,
                  test_the_user_is_told_which_account_they_are_on,
