@@ -3289,7 +3289,26 @@ def init(account):
     """
     Create the frozen checkpoint session with a single 'hi' message and back it up.
     Must be run once per account before its systemd timer starts.
+
+    Takes the account's ping lock, because it lands on the same files a ping
+    does and `ping` has always taken it. Re-running setup on a live machine
+    while a timer's ping was mid-run put two `claude` processes on one config
+    directory and one session file -- the exact collision the lock exists to
+    prevent, entered through the one door that was not asking for it.
     """
+    lock = acquire_ping_lock(account)
+    if lock is None:
+        print("Account {}: a ping is running right now. Its checkpoint is "
+              "left alone rather than rebuilt underneath it — try again in a "
+              "minute.".format(account.display))
+        return
+    try:
+        _init(account)
+    finally:
+        os.close(lock)          # releases the flock with it
+
+
+def _init(account):
     if os.path.exists(account.session_id_file) and \
        os.path.exists(account.checkpoint_backup) and \
        not checkpoint_is_for_this_cwd(account):
@@ -4681,6 +4700,24 @@ def shell_rc_file():
     if shell in ("sh", "dash", "ksh"):
         return os.path.join(HOME, ".profile")
     return ""
+
+
+def shell_rc_candidates():
+    """
+    Every startup file the PATH line might have been written to.
+
+    Used when taking the line *out*. Putting it in has to guess one file and
+    be right; taking it out only has to find it, and the line is marked, so
+    looking in a file this tool never wrote to costs nothing.
+    """
+    guessed = shell_rc_file()
+    names = [".bashrc", ".zshrc", ".profile", ".bash_profile"]
+    found = [guessed] if guessed else []
+    for name in names:
+        candidate = os.path.join(HOME, name)
+        if candidate not in found:
+            found.append(candidate)
+    return found
 
 
 def path_line_present(path):
@@ -6422,6 +6459,34 @@ def _command_exists(name):
     return bool(shutil.which(name))
 
 
+def writability_blockers():
+    """
+    Whether this checkout can hold the files an install has to put in it.
+
+    install.sh checks python3, its version and the CLI, and never checked
+    this -- though accounts.json, state/, schedule.json and bin/ all live
+    here. Cloned into /opt as root and run as the user, or on an NFS home with
+    root squashed, the wizard got as far as "Go ahead?" and then produced a
+    PermissionError traceback: the stack trace instead of a sentence that
+    install.sh exists to prevent.
+    """
+    probe = _temp_name(os.path.join(SCRIPT_DIR, ".writable"))
+    try:
+        with open(probe, "w") as f:
+            f.write("")
+        os.remove(probe)
+        return []
+    except (IOError, OSError) as e:
+        return [Finding(
+            "error",
+            "This checkout is not writable, and an install has to write to "
+            "it: {}".format(e),
+            "accounts.json, state/, schedule.json and bin/ all live in {}. "
+            "Either put the checkout somewhere you own, or give yourself "
+            "write access to it — `sudo chown -R $USER {}` if it was cloned "
+            "as another user.".format(SCRIPT_DIR, SCRIPT_DIR))]
+
+
 def systemd_blockers(pings):
     """
     What stops this machine running the pings, as Findings. Empty if nothing.
@@ -6591,7 +6656,7 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
         print()
         pings = _ask_yes("Run the pings from this machine?", default=pings_here())
 
-    blockers = systemd_blockers(pings)
+    blockers = writability_blockers() + systemd_blockers(pings)
     if blockers:
         print()
         report_findings(blockers)
@@ -6895,7 +6960,13 @@ OnUnitActiveSec={interval}min
 # systemd's default accuracy is 1 minute, which would let each ping land up to a
 # minute late and quietly stretch the cadence. Tighten it so the interval holds.
 AccuracySec=1s
-Persistent=true
+# This timer is monotonic, and deliberately carries no catch-up setting: the
+# one systemd offers applies to wall-clock timers only, so it was set here for
+# years and did nothing at all. Nothing is caught up after downtime, and a
+# monotonic timer does not advance across a suspend either -- a machine asleep
+# for four hours resumes and pings up to one interval of *awake* time later.
+# Right for a server; the thing to fix for a laptop. What it is not is
+# something a setting here was quietly handling.
 
 [Install]
 WantedBy=timers.target
@@ -7144,9 +7215,15 @@ def uninstall(accounts, purge=False):
                 removed.append(link)
             except OSError:
                 pass
-        rc = shell_rc_file()
-        if rc and remove_path_line(rc):
-            removed.append("the PATH line in " + _tilde(rc))
+        # Every file the line could be in, not the one $SHELL points at now.
+        # $SHELL is unset under cron, in a systemd unit and in a script, and
+        # the login shell may have changed since install -- in which case the
+        # marked line stayed behind, pointing at a bin/ that had just been
+        # deleted. The line carries our own marker, so removing it from a file
+        # we never wrote to is a no-op.
+        for rc in shell_rc_candidates():
+            if remove_path_line(rc):
+                removed.append("the PATH line in " + _tilde(rc))
         for path in (STATE_ROOT, SCHEDULE_FILE, ACCOUNTS_FILE,
                      os.path.join(BIN_DIR, COMMAND), BIN_DIR):
             if os.path.isdir(path):

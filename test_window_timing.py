@@ -4977,8 +4977,13 @@ def test_a_clean_install_from_nothing():
                "OnActiveSec=" in timer)
     check_true("it is tightened past systemd's default minute of slack",
                "AccuracySec=1s" in timer)
-    check_true("it catches up after the machine was off",
-               "Persistent=true" in timer)
+    # Persistent= was set here for years and did nothing: systemd applies it
+    # only to OnCalendar= timers, and this one is monotonic. Asserting its
+    # absence, so that nobody puts it back believing it catches anything up.
+    check_true("it does not claim to catch up, which it never could",
+               "Persistent=" not in timer)
+    check_true("and it is monotonic, which is why",
+               "OnCalendar=" not in timer)
     check_true("and it is something `systemctl enable` can install",
                "[Install]" in timer and "WantedBy=timers.target" in timer)
     check_true("the manager is told to re-read the files just written",
@@ -9226,6 +9231,125 @@ def test_a_clock_that_is_wrong_is_measured_against_claudes():
         shutil.rmtree(root, ignore_errors=True)
 
 
+
+def test_an_install_says_what_it_cannot_write_before_it_asks():
+    """
+    accounts.json, state/, schedule.json and bin/ all live in the checkout.
+    install.sh checked python3, its version and the CLI, and never checked
+    that — so a clone in /opt owned by root, or an NFS home with root
+    squashed, got as far as "Go ahead?" and then produced a PermissionError
+    traceback: the stack trace instead of a sentence that install.sh exists to
+    prevent.
+    """
+    section("An install that cannot write says so first")
+    root = tempfile.mkdtemp()
+    saved = ew.SCRIPT_DIR
+    try:
+        ew.SCRIPT_DIR = root
+        check("a writable checkout is no blocker",
+              len(ew.writability_blockers()), 0)
+
+        os.chmod(root, 0o500)
+        try:
+            blockers = ew.writability_blockers()
+            # Running as root defeats the mode bits, so only assert the
+            # finding where the mode actually stops us.
+            if blockers:
+                check("an unwritable one blocks the install", len(blockers), 1)
+                check("and it is an error", blockers[0].level, "error")
+                check_true("naming the directory", root in blockers[0].hint)
+                check_true("and saying what has to go in it",
+                           "accounts.json" in blockers[0].hint)
+            else:
+                check_true("running as root, where the mode does not apply",
+                           os.geteuid() == 0)
+        finally:
+            os.chmod(root, 0o700)
+    finally:
+        ew.SCRIPT_DIR = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_rebuilding_a_checkpoint_waits_for_a_ping_in_flight():
+    """
+    `init` lands on the same files a ping does — the checkpoint is copied over
+    the session transcript at the start of every run — and `ping` has always
+    taken a lock for exactly that. `init` did not, so re-running setup while a
+    timer's ping was mid-run put two `claude` processes on one config
+    directory: the collision the lock exists to prevent, entered through the
+    one door not asking for it.
+    """
+    section("Rebuilding a checkpoint waits for a ping in flight")
+    root = tempfile.mkdtemp()
+    saved = ew.STATE_ROOT
+    ew.STATE_ROOT = os.path.join(root, "state")
+    try:
+        account = ew.Account("1", os.path.join(root, "cfg"), 0)
+        held = ew.acquire_ping_lock(account)
+        check_true("a ping holds the lock", held is not None)
+        try:
+            buf = io.StringIO()
+            out, sys.stdout = sys.stdout, buf
+            try:
+                ew.init(account)
+            finally:
+                sys.stdout = out
+            said = buf.getvalue()
+            check_true("init stands off rather than rebuilding underneath it",
+                       "a ping is running" in said)
+            check_true("and no checkpoint was written",
+                       not os.path.exists(account.session_id_file))
+        finally:
+            os.close(held)
+
+        # And with nothing holding it, init gets through to the real work --
+        # which here fails for want of a Claude, not for want of the lock.
+        check_true("the lock is released with the ping",
+                   ew.acquire_ping_lock(account) is not None)
+    finally:
+        ew.STATE_ROOT = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_uninstall_finds_the_path_line_whatever_the_shell_says():
+    """
+    $SHELL is unset under cron, in a systemd unit and in a script, and the
+    login shell may have changed since install. `shell_rc_file()` then
+    returned "" and the marked PATH line survived a --purge, pointing at a
+    bin/ that had just been deleted.
+    """
+    section("Uninstall finds the PATH line whatever $SHELL says")
+    root = tempfile.mkdtemp()
+    saved = (ew.HOME, ew.BIN_DIR, os.environ.get("SHELL"))
+    try:
+        ew.HOME = root
+        ew.BIN_DIR = os.path.join(root, "repo", "bin")
+        os.environ["SHELL"] = "/bin/bash"
+        rc = os.path.join(root, ".bashrc")
+        with open(rc, "w") as f:
+            f.write("# mine\n")
+        check_true("the line goes in", ew.add_path_line(rc))
+        check_true("and is found", ew.path_line_present(rc))
+
+        # The shell changes, or there is no shell at all.
+        del os.environ["SHELL"]
+        check("nothing can be guessed now", ew.shell_rc_file(), "")
+        check_true("but the file it is in is still a candidate",
+                   rc in ew.shell_rc_candidates())
+        removed = [f for f in ew.shell_rc_candidates() if ew.remove_path_line(f)]
+        check("the line is found and taken out", len(removed), 1)
+        check_true("and the user's own content is untouched",
+                   "# mine" in open(rc).read())
+        check_true("and it really is gone", not ew.path_line_present(rc))
+    finally:
+        ew.HOME, ew.BIN_DIR = saved[0], saved[1]
+        if saved[2] is None:
+            os.environ.pop("SHELL", None)
+        else:
+            os.environ["SHELL"] = saved[2]
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     # Every path the tool reads or writes is redirected into one disposable
     # directory before a single test runs.
@@ -9334,6 +9458,9 @@ def main():
                  test_a_timer_for_an_account_nobody_configured_is_reported,
                  test_a_reset_in_the_hour_that_happens_twice,
                  test_a_clock_that_is_wrong_is_measured_against_claudes,
+                 test_an_install_says_what_it_cannot_write_before_it_asks,
+                 test_rebuilding_a_checkpoint_waits_for_a_ping_in_flight,
+                 test_uninstall_finds_the_path_line_whatever_the_shell_says,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
                  test_install_uninstall_purge_and_install_again,
