@@ -343,6 +343,17 @@ def ensure_ping_config(account):
         os.makedirs(account.config_dir, 0o700)
     if not os.path.isdir(account.ping_cwd):
         os.makedirs(account.ping_cwd, 0o700)
+    # `readable_json` exists for exactly this and was not being asked. A
+    # half-written config -- Claude Code killed mid-save -- reads as {}, and
+    # merging three keys into {} and writing it back replaces the account's
+    # identity, its project history and its trust decisions with a stub. On the
+    # timer path that happens unattended, within half an hour, to a file a
+    # person could still have salvaged by hand.
+    if not readable_json(account.config_json):
+        log(account, "WARNING: {} cannot be parsed, so it has been left "
+                     "exactly as it is. The ping may prompt, and `{} doctor` "
+                     "will say so.".format(account.config_json, COMMAND))
+        return False
     config = _read_json(account.config_json)
     changed = False
     for key, value in ping_config(account.ping_cwd).items():
@@ -538,12 +549,18 @@ UNHEALTHY_AFTER = 3
 # refuses real work at 100, while the ping — a cache read — may still be served.
 LIMIT_SPENT_PCT = 100
 
-# At what point "usable" stops being the whole truth. An account with 4% of its
-# window left is genuinely usable and genuinely the most perishable thing you
-# own, so it is still the right one to spend -- but being sent to it with no
-# warning and thrown out four messages later reads as the tool being wrong.
-# The figure is shown for every account and called out for the recommended one.
-NEARLY_SPENT_PCT = 90
+# How little of a window has to be left before the recommendation says so. An
+# account with 4% left is genuinely usable and genuinely the most perishable
+# thing you own, so it is still the right one to spend -- but being sent to it
+# with no warning and thrown out four messages later reads as the tool being
+# wrong. The figure is shown for every account and called out for the
+# recommended one when it is under this.
+#
+# Named for what it measures. The first version of this called it
+# NEARLY_SPENT_PCT = 90 and compared it against the percentage *remaining*, so
+# the caution fired from 10% used onward and announced "only 90% of it left"
+# about an untouched window -- on the first line of the flagship command.
+LITTLE_LEFT_PCT = 10
 
 # How old the readings can get before `which` says so. Three missed pings is past
 # coincidence: by then the answer is being computed from history, not from facts.
@@ -770,7 +787,7 @@ def choose_account(accounts, states=None, now=None, avail=None):
     # without being told is what makes the advice look wrong four messages
     # later, so the figure travels with the recommendation.
     left = window_left_pct(states[best.name])
-    spent = ("" if left is None or left > NEARLY_SPENT_PCT
+    spent = ("" if left is None or left > LITTLE_LEFT_PCT
              else " — only {}% of it left".format(left))
     if only:
         return best, "the only account; its window ends {} (in {}){}".format(
@@ -3555,6 +3572,21 @@ def doctor(accounts):
         # just told to do.
         hold = active_hold(state, now)
         last_run = state.get("last_run")
+        # A run that started counts as a run, so `last_run` is fresh even when
+        # every one of them failed -- which made the staleness check below
+        # unreachable in the one case it most needed to fire. A timer that runs
+        # on time and fails every time is the commonest way this breaks: the
+        # CLI moved, an upgrade half-landed, the network is down. `which` and
+        # `status` both say so; `doctor`, the command whose whole job is to say
+        # when it is broken, said nothing and exited 0.
+        failures = state.get("consecutive_failures", 0)
+        if failures >= UNHEALTHY_AFTER:
+            findings.append(Finding(
+                "error",
+                "Account {}: the last {} pings all failed, so no window is "
+                "being started for it".format(account.name, failures),
+                "The run itself is what is failing, not the timer. The reason "
+                "is on the last lines of {}".format(account.log_file)))
         if hold:
             pass
         elif last_run and now - last_run > 3 * INTERVAL_MIN * 60:
@@ -3568,10 +3600,20 @@ def doctor(accounts):
         # on comparing the two.
         resets = ((state.get("rate_limits") or {}).get("five_hour")
                   or {}).get("resets_at")
-        if resets and not (now - 86400 < resets < now + FIVE_HOUR_HORIZON):
+        # Judged against the moment the figure was *read*, not against now. A
+        # reset time a day in the past is exactly what a correct reading looks
+        # like after the pings have been down for a day -- so this accused the
+        # user's clock of a fault it did not have, in the same run that failed
+        # to mention the fault it did have. Only a reading that was already
+        # impossible when it was taken says anything about the clock.
+        read_at = state.get("limits_read_at") or last_run
+        if resets and read_at and not (read_at - FIVE_HOUR_HORIZON < resets
+                                       < read_at + FIVE_HOUR_HORIZON):
             findings.append(Finding(
                 "warning", "Account {}'s reported reset time is implausible "
-                           "({})".format(account.name, fmt_time(resets)),
+                           "({}, read {})".format(
+                               account.name, fmt_time(resets),
+                               fmt_time(read_at)),
                 "The machine clock may be wrong; every schedule here depends "
                 "on it."))
 
@@ -4432,7 +4474,20 @@ def login_fingerprint(login):
     out. Two separate logins to one account have different grants and coexist
     indefinitely.
     """
-    creds = (_read_json(credentials_path(login)).get("claudeAiOauth") or {})
+    return grant_fingerprint(_read_text(credentials_path(login)))
+
+
+def grant_fingerprint(credential):
+    """
+    The same fingerprint, taken from a credential held in memory.
+
+    Needed wherever the question is asked *before* the file exists: what is
+    about to be written, and what is already sitting where it is going.
+    """
+    try:
+        creds = (json.loads(credential).get("claudeAiOauth") or {})
+    except (ValueError, AttributeError):
+        return ""
     token = creds.get("refreshToken") or ""
     return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
 
@@ -4656,6 +4711,81 @@ def _existing_mode(path, fallback=0o600):
         return fallback
 
 
+def switch_marker():
+    """
+    Where a switch records that it is part-way through. Computed, not a
+    constant: the tests move SWITCH_ROOT.
+    """
+    return os.path.join(SWITCH_ROOT, ".in-progress")
+
+
+def interrupted_switch():
+    """
+    What a switch that never finished left behind, or None.
+
+    A switch rewrites two files in ~/.claude: the credential, then the identity
+    that says whose credential it is. Nothing recorded that both were meant to
+    happen, so a machine killed between them came back with one account's token
+    filed under another account's name -- and no command could tell, because
+    `current_account` reads the identity and believes it. `switch` to the
+    account you are really on then answers "already signed in as it" and does
+    nothing, forever.
+    """
+    marker = _read_json(switch_marker())
+    return marker or None
+
+
+def repair_interrupted_switch(accounts):
+    """
+    Finish or discard a switch that was interrupted. Returns lines to print.
+
+    Which half landed is decided by the credential itself: if ~/.claude holds
+    the grant the switch was installing, the first write happened and only the
+    identity is missing, so it is written now. If it does not, nothing landed
+    and the marker is simply cleared.
+    """
+    marker = interrupted_switch()
+    if not marker:
+        return []
+    named = dict((a.name, a) for a in accounts).get(marker.get("account"))
+    display = named.display if named else "account {}".format(
+        marker.get("account"))
+    landed = (marker.get("grant")
+              and login_fingerprint(user_login()) == marker.get("grant"))
+    if not landed:
+        _clear_switch_marker()
+        return ["An earlier switch to {} stopped before it changed anything. "
+                "Nothing was left half-done.".format(display)]
+
+    identity = marker.get("identity") or {}
+    if not readable_json(USER_CONFIG_JSON):
+        return ["An earlier switch to {} left {} holding that account's "
+                "credential while {} cannot be parsed, so the name on it "
+                "cannot be corrected here.".format(
+                    display, USER_CONFIG_DIR, USER_CONFIG_JSON)]
+    config = _read_json(USER_CONFIG_JSON)
+    if identity:
+        config["oauthAccount"] = identity
+    for key in ACCOUNT_SCOPED_KEYS:
+        config.pop(key, None)
+    _write_atomically(USER_CONFIG_JSON,
+                      json.dumps(config, indent=2, sort_keys=True),
+                      _existing_mode(USER_CONFIG_JSON))
+    _clear_switch_marker()
+    return ["An earlier switch to {} was interrupted after it had installed "
+            "that account's login but before it recorded whose it was. "
+            "Finished now — you are on {}.".format(display, display),
+            "The login it replaced was never parked; it is in the most recent "
+            "backup under {}.".format(os.path.join(SWITCH_ROOT, ".backups"))]
+
+
+def _clear_switch_marker():
+    try:
+        os.remove(switch_marker())
+    except OSError:
+        pass
+
+
 def backup_user_login():
     """
     Copy ~/.claude/.credentials.json and ~/.claude.json somewhere safe.
@@ -4664,17 +4794,35 @@ def backup_user_login():
     signed-in Claude Code and a browser login, and this is the only command here
     that rewrites them.
     """
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     secure_dir(SWITCH_ROOT)
     secure_dir(os.path.join(SWITCH_ROOT, ".backups"))
-    directory = secure_dir(os.path.join(SWITCH_ROOT, ".backups", stamp))
+    # One second is not a name. Two switches inside the same second landed in
+    # one directory and the second copy overwrote the first -- the mechanism
+    # that exists to make a switch survivable taking out the only copy of the
+    # login before it. The suffix sorts after the bare stamp and before the
+    # next second, so pruning stays in order.
+    base = os.path.join(SWITCH_ROOT, ".backups",
+                        datetime.now().strftime("%Y%m%d-%H%M%S"))
+    directory, nth = base, 1
+    while os.path.exists(directory):
+        nth += 1
+        directory = "{}-{}".format(base, nth)
+    directory = secure_dir(directory)
     saved = []
     for source, name in ((credentials_path(user_login()), "credentials.json"),
                          (USER_CONFIG_JSON, "claude.json")):
         if os.path.exists(source):
             target = os.path.join(directory, name)
-            shutil.copyfile(source, target)
-            os.chmod(target, 0o600)
+            # 0600 from the first byte, and O_EXCL so a copy can never land on
+            # top of one. `copyfile` creates at the umask's mode and a chmod
+            # afterwards leaves a window with a live credential readable by
+            # anyone -- the exact pattern `_write_atomically` documents as not
+            # good enough, in the one function handling the last copy.
+            handle = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(handle, "wb") as out, open(source, "rb") as incoming:
+                shutil.copyfileobj(incoming, out)
+                out.flush()
+                os.fsync(out.fileno())
             saved.append(target)
     if not saved:
         os.rmdir(directory)              # nothing to say sorry about later
@@ -4784,8 +4932,23 @@ def park_login(account, taken):
     secure_dir(SWITCH_ROOT)
     secure_dir(store.config_dir)
     if credential is not None:
+        # The store is meant to be empty: a login is parked there on the way
+        # out and taken away on the way back. If something else is already in
+        # it, that something is a login too, and writing over it destroys it
+        # with no copy anywhere. Refused rather than clobbered.
+        held = login_fingerprint(store)
+        if held and held != grant_fingerprint(credential):
+            raise ConfigError(
+                "account {}'s store already holds a different login. Parking "
+                "here would overwrite it, so nothing was parked. Move "
+                "{} aside and re-run.".format(
+                    account.display, credentials_path(store)))
         _write_atomically(credentials_path(store), credential)
     if identity:
+        if not readable_json(store.config_json):
+            raise ConfigError(
+                "{} cannot be parsed; refusing to overwrite it".format(
+                    store.config_json))
         config = _read_json(store.config_json)
         config["oauthAccount"] = identity
         _write_atomically(store.config_json,
@@ -4866,6 +5029,10 @@ def prepare_store(store):
     """
     secure_dir(SWITCH_ROOT)
     secure_dir(store.config_dir)
+    if not readable_json(store.config_json):
+        raise ConfigError(
+            "{} cannot be parsed; refusing to overwrite it".format(
+                store.config_json))
     config = _read_json(store.config_json)
     for key, value in ping_config(store.config_dir).items():
         if key == "projects":
@@ -5158,8 +5325,18 @@ def switch_account(accounts, name=None, sign_in=True):
         sys.stderr.write("\nNothing was changed.\n")
         return 1
 
-    current = current_account(accounts)
-    if current is not None and current.name == account.name:
+    # Anything left half-done by an earlier switch is finished before this one
+    # is considered, because every question below -- which account am I on,
+    # is there anything to do -- is answered from the file that switch may not
+    # have got to.
+    for line in repair_interrupted_switch(accounts):
+        print(line)
+
+    # A cheap answer to the commonest case, before any of the work below. It is
+    # deliberately *not* the value the switch acts on: see the re-read under
+    # the lock.
+    if current_account(accounts) is not None \
+            and current_account(accounts).name == account.name:
         print("Your Claude Code is already signed in as account {}.".format(
             account.display))
         return 0
@@ -5197,6 +5374,19 @@ def switch_account(accounts, name=None, sign_in=True):
         return 1
 
     try:
+        # Read *here*, not above. Between the two lies `offer_sign_in`, which
+        # blocks on a browser round trip -- minutes, on the first switch to any
+        # account. A second switch finishing in that gap changes which account
+        # ~/.claude holds, and acting on the earlier answer parks the login now
+        # in ~/.claude into the store belonging to the account it *used* to be:
+        # a login written over another login, with no copy of either left. The
+        # lock has always been here; the value it was meant to protect was read
+        # before it was taken.
+        current = current_account(accounts)
+        if current is not None and current.name == account.name:
+            print("Your Claude Code is already signed in as account {}.".format(
+                account.display))
+            return 0
         return _perform_switch(account, current, states)
     finally:
         os.close(lock)          # releases the flock with it
@@ -5213,6 +5403,23 @@ def _perform_switch(account, current, states):
     # costs nothing -- but it still arrives as a traceback unless it is caught,
     # and a traceback from a command that touches ~/.claude reads as though it
     # had got half way. It has not.
+    # The store this login is about to be parked in has to be empty, or hold
+    # this very login. Anything else in it is a *different* login, and parking
+    # writes over it with no copy left anywhere. Checked here rather than in
+    # `park_login`, which runs last: by then ~/.claude has been overwritten and
+    # refusing leaves the outgoing login in the backup and nowhere else.
+    if current is not None:
+        held = login_fingerprint(switch_store(current))
+        mine = login_fingerprint(user_login())
+        if held and mine and held != mine:
+            sys.stderr.write(
+                "Account {}'s store already holds a different login.\n"
+                "  Parking the one you are using now would overwrite it, and "
+                "nothing else has a copy.\n  Move {} aside, then switch "
+                "again.\n\nNothing was changed.\n".format(
+                    current.display, credentials_path(switch_store(current))))
+            return 1
+
     try:
         taken = take_login()
         backup = backup_user_login()
@@ -5232,6 +5439,17 @@ def _perform_switch(account, current, states):
     # happened and where the copy is.
     where = ("\n  Your previous credentials are in {}.".format(backup)
              if backup else "")
+
+    # Say on disk that both writes are meant to happen, before either does.
+    # Without this a machine killed between them came back with this account's
+    # credential filed under the previous account's name, and nothing could
+    # tell: the identity is what every command reads, so it was believed.
+    store = switch_store(account)
+    _write_atomically(switch_marker(), json.dumps({
+        "account": account.name,
+        "grant": login_fingerprint(store),
+        "identity": _read_json(store.config_json).get("oauthAccount") or {},
+        "at": time.time()}, indent=2, sort_keys=True))
     try:
         dropped = install_login(switch_store(account))
     except KeyboardInterrupt:
@@ -5241,14 +5459,39 @@ def _perform_switch(account, current, states):
             "again.\n".format(account.display, where, COMMAND))
         return 1
     except (IOError, OSError) as e:
+        # Deliberately not "nothing has been moved": that was said here before,
+        # and it is only true if the failure came on the first of the two
+        # writes. On the second, ~/.claude already holds the new credential.
+        # The marker written above records which, and the next command reads it.
         sys.stderr.write(
             "Could not install account {}'s login: {}\n"
-            "  Nothing was parked, so no login has been moved.{}\n"
-            "  Run `{} status` to see which account you are on.\n".format(
-                account.display, e, where, COMMAND))
+            "  Whichever half happened is recorded in {}.{}\n"
+            "  Run `{} doctor`, which will say what is left to do.\n".format(
+                account.display, e, switch_marker(), where, COMMAND))
         return 1
+    _clear_switch_marker()       # both writes landed; nothing to repair
+
+    # The store's copy is removed at the end of install_login, and that removal
+    # is allowed to fail -- a store directory whose mode changed, a read-only
+    # mount. It is the single statement enforcing one-grant-one-place, so a
+    # silent failure hands back a success exit while two directories refresh
+    # one login and one of them is signed out a few hours later. `doctor`
+    # catches it eventually; the person who just ran the switch should not have
+    # to wait for that.
+    if os.path.exists(credentials_path(switch_store(account))):
+        sys.stderr.write(
+            "WARNING: account {}'s store still holds a copy of the login just "
+            "installed.\n  Two directories refreshing one login will sign one "
+            "of them out. Delete {}.\n".format(
+                account.display, credentials_path(switch_store(account))))
     try:
         parked = park_login(current, taken) if current is not None else None
+    except ConfigError as e:
+        sys.stderr.write(
+            "Switched to account {}, but the login it replaced could not be "
+            "parked: {}\n  That login now exists only in the backup.{}\n"
+            .format(account.display, e, where))
+        return 1
     except KeyboardInterrupt:
         sys.stderr.write(
             "\nSwitched to account {}, but was interrupted before the login "
@@ -5396,6 +5639,21 @@ def switch_findings(accounts):
     if not switching_configured(accounts):
         return []
     findings = []
+    # A switch that never finished is the first thing to say, because until it
+    # is finished every other answer here -- and in `status`, and in `which` --
+    # is computed from an identity that may not match the credential beside it.
+    left = interrupted_switch()
+    if left:
+        named = dict((a.name, a) for a in accounts).get(left.get("account"))
+        findings.append(Finding(
+            "error",
+            "A switch to {} did not finish. Until it does, the account this "
+            "machine reports being signed in as may not be the account it is "
+            "actually using.".format(
+                named.display if named else "account {}".format(
+                    left.get("account"))),
+            "Run `{} switch {}`. It finishes the half that was left, or says "
+            "that nothing had happened.".format(COMMAND, left.get("account"))))
     # One grant in one place is the rule the whole design rests on, and it is
     # checked here against the live login and against each account's ping
     # directory. Two *stores* holding the same grant was the gap: that is one

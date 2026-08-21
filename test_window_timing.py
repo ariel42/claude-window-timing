@@ -2074,10 +2074,30 @@ def test_the_account_it_recommends_says_how_much_is_left():
 
     # A window with plenty in it says so without the warning: the note exists
     # for the case that surprises somebody, and everywhere else it is noise.
-    plenty = {one.name: state(0, 4 * HOUR), two.name: state(0, HOUR)}
-    _, reason = ew.choose_account([one, two], plenty, now)
-    check_true("a window with plenty left carries no warning",
-               "of it left" not in reason)
+    #
+    # Swept rather than sampled at one value. The first version of this test
+    # checked only an untouched window, which is the single value that passes
+    # at *any* threshold -- so it passed while the caution was firing from 10%
+    # used onward and announcing "only 90% of it left".
+    for used in (0, 5, 25, 50, 80, 89):
+        _, reason = ew.choose_account(
+            [one, two], {one.name: state(used, HOUR),
+                         two.name: state(0, 4 * HOUR)}, now)
+        check_true("{}% used carries no warning".format(used),
+                   "of it left" not in reason)
+    for used in (90, 95, 97):
+        best, reason = ew.choose_account(
+            [one, two], {one.name: state(used, HOUR),
+                         two.name: state(0, 4 * HOUR)}, now)
+        check("{}% used is still the one to spend".format(used), best.name, "1")
+        check_true("{}% used does carry one".format(used),
+                   "of it left" in reason)
+    # And a window with nothing left is not recommended at all -- that is the
+    # availability tier's job, and the caution is for the range below it.
+    best, _ = ew.choose_account(
+        [one, two], {one.name: state(100, HOUR),
+                     two.name: state(0, 4 * HOUR)}, now)
+    check("a spent window is not recommended at all", best.name, "2")
 
     # Nothing read yet: no figure to report, and none invented.
     nothing = {"last_run": now, "available_at": now - 60,
@@ -4051,6 +4071,43 @@ def test_doctor_notices_a_deployment_going_wrong():
         ew.write_state(account, {"last_run": time.time() - 10 * ew.INTERVAL_MIN * 60})
         check_true("while one that is simply silent still is",
                    "has not pinged since" in doctor_says())
+
+        # A timer that fires on time and fails every time. `last_run` is
+        # written whether or not the run worked, so it stays fresh and the
+        # silence check above can never fire -- which left the commonest way
+        # this breaks (the CLI moved, an upgrade half-landed, the network is
+        # down) reported by `which` and `status` and *not* by the one command
+        # whose job is to say when it is broken. It exited 0 as well.
+        now = time.time()
+        ew.write_state(account, {
+            "last_run": now - 60, "limits_read_at": now - 60,
+            "consecutive_failures": ew.UNHEALTHY_AFTER,
+            "rate_limits": {"five_hour": {"resets_at": now + 3600}}})
+        said = doctor_says()
+        check_true("pings that keep failing are an error, not a silence",
+                   "the last {} pings all failed".format(ew.UNHEALTHY_AFTER)
+                   in said)
+        check_true("pointing at the log, where the reason is",
+                   account.log_file in said)
+        check_true("and it is not reported as not having pinged",
+                   "has not pinged since" not in said)
+
+        # The clock warning has to tell "your clock is wrong" apart from "this
+        # reading is simply old", and those look identical if you compare the
+        # reset time against *now*. It used to accuse the machine of a fault it
+        # did not have, in the same run where it missed the real one.
+        old_reading = now - 3 * 86400
+        ew.write_state(account, {
+            "last_run": old_reading, "limits_read_at": old_reading,
+            "rate_limits": {"five_hour": {"resets_at": old_reading + 3600}}})
+        check("a reading that was right when it was taken is not a clock fault",
+              "reset time is implausible" in doctor_says(), False)
+        ew.write_state(account, {
+            "last_run": now, "limits_read_at": now,
+            "rate_limits": {"five_hour": {"resets_at": now + 40 * 3600}}})
+        check_true("one that was impossible when it was taken still is",
+                   "reset time is implausible" in doctor_says())
+        ew.write_state(account, {"last_run": time.time() - 10 * ew.INTERVAL_MIN * 60})
 
         replies = {"is-enabled": Reply("disabled")}
         said = doctor_says()
@@ -6439,8 +6496,16 @@ def test_a_failure_mid_switch_is_a_sentence_not_a_traceback():
                                                             sign_in=False))
         check("it reports a failure rather than raising", code, 1)
         check_true("naming the cause", "No space left on device" in err)
-        check_true("and saying nothing was moved", "no login has been moved" in err)
+        # Not "nothing has been moved". A failure on the *second* of the two
+        # writes leaves the new credential installed under the old name, and
+        # saying otherwise sent people to `status`, which reads the stale name
+        # and confirms the false story.
+        check_true("and pointing at the record of which half happened",
+                   ".in-progress" in err)
+        check_true("and at the command that reads it", "doctor" in err)
         check_true("with the backup pointed at", ".backups" in err)
+        check_true("the record itself is on disk",
+                   os.path.exists(ew.switch_marker()))
         check("the parked login is still parked",
               ew.account_identity(ew.switch_store(accounts[1]))["has_token"], True)
     finally:
@@ -6759,6 +6824,119 @@ def test_switching_says_what_it_will_and_will_not_fix():
         restore()
 
 
+def test_a_switch_killed_between_its_two_writes_is_finished_not_believed():
+    """
+    A switch rewrites two files: the credential, then the identity saying whose
+    credential it is. Nothing recorded that both were meant to happen, and every
+    command reads the identity -- so a machine killed between them came back
+    holding account 2's token filed under account 1's name, and said "you are on
+    account 1" forever. `switch 1` answered "already signed in as it" and did
+    nothing; `doctor` saw only a duplicate and advised deleting the copy that
+    was the evidence. After that the tool reported perfect health while the
+    wrong account was being billed.
+
+    The fix is a marker written before either file and removed after both.
+    """
+    section("A switch killed between its two writes")
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    real_write = ew._write_atomically
+    try:
+        wanted = ew.login_fingerprint(ew.switch_store(accounts[1]))
+
+        def fail_on_the_identity(path, body, mode=0o600):
+            """A disk that fills between the 500-byte write and the 36 KB one."""
+            if path == ew.USER_CONFIG_JSON:
+                raise IOError("No space left on device")
+            return real_write(path, body, mode)
+
+        ew._write_atomically = fail_on_the_identity
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        ew._write_atomically = real_write
+
+        check("the switch reports the failure", code, 1)
+        check_true("the credential really did land",
+                   ew.login_fingerprint(ew.user_login()) == wanted)
+        check("while the name on it is still the old one",
+              ew.account_identity(ew.user_login())["account_uuid"], "uuid-1")
+        check_true("which is exactly what a marker has to be left for",
+                   os.path.exists(ew.switch_marker()))
+        left = ew.interrupted_switch()
+        check("and it names the account the switch was going to", left["account"], "2")
+
+        # Without the repair this is the trap: the tool believes the stale name,
+        # so the obvious command is a no-op and the user is stuck on the wrong
+        # account with no way back through the interface.
+        check("the stale name is what an unrepaired read still answers",
+              ew.current_account(accounts).name, "1")
+
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("re-running finishes it rather than refusing", code, 0)
+        check_true("saying what had been left half-done",
+                   "interrupted" in out and "Finished now" in out)
+        check_true("and where the login it replaced went",
+                   ".backups" in out)
+        check("the identity now matches the credential",
+              ew.account_identity(ew.user_login())["account_uuid"], "uuid-2")
+        check("so the tool agrees which account this is",
+              ew.current_account(accounts).name, "2")
+        check_true("and the marker is gone",
+                   not os.path.exists(ew.switch_marker()))
+    finally:
+        ew._write_atomically = real_write
+        restore()
+
+    # And somebody who does not re-run the switch is told by `doctor`, since
+    # every other line it prints is computed from the name that may be wrong.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        def fail_on_the_identity(path, body, mode=0o600):
+            if path == ew.USER_CONFIG_JSON:
+                raise IOError("No space left on device")
+            return real_write(path, body, mode)
+
+        ew._write_atomically = fail_on_the_identity
+        _capture(lambda: ew.switch_account(accounts, "2", sign_in=False))
+        ew._write_atomically = real_write
+
+        errors = [f for f in ew.switch_findings(accounts)
+                  if f.level == "error" and "did not finish" in f.message]
+        check("doctor reports the unfinished switch", len(errors), 1)
+        check_true("says which account it was going to",
+                   "2 (label2)" in errors[0].message)
+        check_true("and names the command that finishes it",
+                   "switch 2" in errors[0].hint)
+    finally:
+        ew._write_atomically = real_write
+        restore()
+
+    # The other half: the first write is the one that fails, so nothing landed.
+    # The marker must not then claim a repair is needed.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        def fail_on_the_credential(path, body, mode=0o600):
+            if path == ew.credentials_path(ew.user_login()):
+                raise IOError("No space left on device")
+            return real_write(path, body, mode)
+
+        ew._write_atomically = fail_on_the_credential
+        _capture(lambda: ew.switch_account(accounts, "2", sign_in=False))
+        ew._write_atomically = real_write
+
+        check_true("a marker is left either way", os.path.exists(ew.switch_marker()))
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check_true("but the repair sees nothing landed and says so",
+                   "stopped before it changed anything" in out)
+        check("and the switch it was asked for then happens", code, 0)
+        check("leaving the user on the account they asked for",
+              ew.current_account(accounts).name, "2")
+    finally:
+        ew._write_atomically = real_write
+        restore()
+
+
 def test_switching_with_no_account_named_follows_which():
     """
     The default has to be the useful one: the reason to switch is almost always
@@ -6767,8 +6945,11 @@ def test_switching_with_no_account_named_follows_which():
     """
     section("Switching with no account named follows `which`")
 
-    restore, home, accounts = _switch_sandbox(signed_in_as="1",
-                                              parked=("1", "2"))
+    # Nothing parked for account 1: that is the state a switch starts from,
+    # since the login for the account you are signed in as lives in ~/.claude
+    # and not in its store. A store holding a second, different login for the
+    # account you are on is now refused rather than overwritten.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
     try:
         now = time.time()
         for account, resets in ((accounts[0], now + 4 * 3600),
@@ -7196,8 +7377,12 @@ def test_only_one_function_writes_to_the_users_own_files():
             if "USER_CONFIG" in target or "user_login" in target:
                 writers.add(node.name)
 
-    check("exactly one function writes to the user's own files",
-          sorted(writers), ["install_login"])
+    # Two, now, and the second is the first one finishing: a switch killed
+    # between its two writes leaves the credential installed under the previous
+    # account's name, and `repair_interrupted_switch` writes the name that was
+    # missed. Both run only from `switch`, which is what the README promises.
+    check("only the switch and its repair write to the user's own files",
+          sorted(writers), ["install_login", "repair_interrupted_switch"])
 
     # Static analysis stops at a variable, so the same claim is made again from
     # the outside: a switch may touch those two files and nothing else under
@@ -7986,6 +8171,7 @@ def main():
                  test_the_token_and_the_identity_move_together,
                  test_switching_refuses_what_cannot_possibly_work,
                  test_switching_says_what_it_will_and_will_not_fix,
+                 test_a_switch_killed_between_its_two_writes_is_finished_not_believed,
                  test_switching_with_no_account_named_follows_which,
                  test_the_user_is_told_which_account_they_are_on,
                  test_a_switch_backs_up_what_it_replaces,
