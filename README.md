@@ -65,7 +65,7 @@ Use account 1 (personal)
   That is the window to spend; how you use the account is up to you.
   Point your own Claude Code at it:  claude-window switch 1
 
-  1 (personal)  usable — window ends in 4h00m00s   <- use this
+  1 (personal)  usable — 71% left, window ends in 4h00m00s   <- use this
   2 (work)      unusable until 2026-08-13 01:22:35 IDT — its 5-hour limit is spent
   3 (spare)     unusable until 2026-08-14 23:52:35 IDT — its weekly limit is spent
 
@@ -75,6 +75,8 @@ Use account 1 (personal)
 The `switch` line appears once switching is set up, and names the account rather than making you match it up yourself. Until then `which` says nothing about switching at all.
 
 Two questions, in that order. **Can this account serve a request at all?** and only then **how soon does its window expire?** Spending the most perishable window first is the right rule — quota does not carry over — but it is exactly the wrong answer for an account Claude is about to refuse.
+
+How much of that window is left is shown beside it, and said again in the recommendation when there is little of it: an account with 3% remaining is still the right one to spend, since that 3% is what expires next, but being sent there without being told reads as bad advice four messages later.
 
 So an account is skipped, and told to wait, when any of this is true: its 5-hour limit is reported spent, its weekly limit is reported spent, a ping came back refused, its sign-in has expired, or it is on no paid plan. Accounts that cannot serve are ranked by when they come back, and one that needs *you* — a lapsed subscription, a login that ran out — ranks below one that will recover on its own.
 

@@ -2038,6 +2038,61 @@ def test_a_login_that_stopped_working_is_reported():
 HOUR = 3600.0
 
 
+def test_the_account_it_recommends_says_how_much_is_left():
+    """
+    The most perishable window is the right one to spend even when little of it
+    remains -- that is precisely the quota about to expire. But "usable — window
+    ends in 1h58m" reads identically for an account with all of its window and
+    one with 3% of it, and the sort puts the nearly-spent one first, so that is
+    the one being recommended. Someone who follows that advice is refused a few
+    messages later and concludes the tool was wrong.
+    """
+    section("The recommendation says how much of the window is left")
+    now = time.time()
+    root = tempfile.mkdtemp()
+    one = ew.Account("1", os.path.join(root, "cfg-1"), 0, "nearly-spent")
+    two = ew.Account("2", os.path.join(root, "cfg-2"), 1, "fresh")
+
+    def state(used, ends_in):
+        return {"last_run": now, "available_at": now - 60,
+                "rate_limits": {"five_hour": {"used_percentage": used,
+                                              "resets_at": now + ends_in}}}
+
+    states = {one.name: state(97, 2 * HOUR), two.name: state(0, 4 * HOUR)}
+    best, reason = ew.choose_account([one, two], states, now)
+    check("the most perishable window is still the one to spend", best.name, "1")
+    check_true("and the recommendation says how little of it there is",
+               "only 3% of it left" in reason)
+
+    avail = ew.availabilities([one, two], states, now)
+    check("the list says it for the account being recommended",
+          ew.describe_availability(states["1"], avail["1"], now),
+          "usable — 3% left, window ends in {}".format(ew.fmt_delta(2 * HOUR)))
+    check_true("and for the one it is being chosen over",
+               ew.describe_availability(states["2"], avail["2"], now)
+               .startswith("usable — 100% left"))
+
+    # A window with plenty in it says so without the warning: the note exists
+    # for the case that surprises somebody, and everywhere else it is noise.
+    plenty = {one.name: state(0, 4 * HOUR), two.name: state(0, HOUR)}
+    _, reason = ew.choose_account([one, two], plenty, now)
+    check_true("a window with plenty left carries no warning",
+               "of it left" not in reason)
+
+    # Nothing read yet: no figure to report, and none invented.
+    nothing = {"last_run": now, "available_at": now - 60,
+               "rate_limits": {"five_hour": {"resets_at": now + HOUR}}}
+    check("an unknown figure is not guessed at",
+          ew.window_left_pct(nothing), None)
+    avail = ew.availabilities([one], {one.name: nothing}, now)
+    check("and the line falls back to the time alone",
+          ew.describe_availability(nothing, avail["1"], now),
+          "usable — window ends in {}".format(ew.fmt_delta(HOUR)))
+    check("a limit reported past spent does not go negative",
+          ew.window_left_pct({"rate_limits": {"five_hour":
+                                              {"used_percentage": 105}}}), 0)
+
+
 def test_what_it_says_in_every_state_it_can_be_in():
     """
     `which` and `status` are the whole product for most of a day, and each of
@@ -7882,6 +7937,7 @@ def main():
                  test_a_second_machine_answers_from_the_schedule,
                  test_an_account_the_schedule_has_never_heard_of,
                  test_a_login_that_stopped_working_is_reported,
+                 test_the_account_it_recommends_says_how_much_is_left,
                  test_what_it_says_in_every_state_it_can_be_in,
                  test_the_age_of_the_figures_is_never_overstated,
                  test_the_status_display_shows_the_unusual_parts,

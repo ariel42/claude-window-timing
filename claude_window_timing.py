@@ -538,6 +538,13 @@ UNHEALTHY_AFTER = 3
 # refuses real work at 100, while the ping — a cache read — may still be served.
 LIMIT_SPENT_PCT = 100
 
+# At what point "usable" stops being the whole truth. An account with 4% of its
+# window left is genuinely usable and genuinely the most perishable thing you
+# own, so it is still the right one to spend -- but being sent to it with no
+# warning and thrown out four messages later reads as the tool being wrong.
+# The figure is shown for every account and called out for the recommended one.
+NEARLY_SPENT_PCT = 90
+
 # How old the readings can get before `which` says so. Three missed pings is past
 # coincidence: by then the answer is being computed from history, not from facts.
 STALE_AFTER_SEC = UNHEALTHY_AFTER * INTERVAL_MIN * 60
@@ -695,6 +702,19 @@ def availabilities(accounts, states, now):
     return {a.name: account_availability(a, states[a.name], now) for a in accounts}
 
 
+def window_left_pct(state):
+    """
+    How much of the 5-hour window is left, as a percentage, or None if unknown.
+
+    `used_percentage` is what Claude reports; the complement is what a person
+    is actually deciding on. Clamped at zero because a limit can be reported
+    spent past 100 when a refusal fills the figure in.
+    """
+    used = ((state.get("rate_limits") or {}).get("five_hour") or {}
+            ).get("used_percentage")
+    return None if used is None else max(0, 100 - used)
+
+
 def rank_account(account, state, now, availability=None):
     """
     Sort key for choosing an account: lower is better.
@@ -745,17 +765,24 @@ def choose_account(accounts, states=None, now=None, avail=None):
                       "from the machine that runs the pings"
                       if not pings_here() else
                       "no window information yet — run a ping first")
+    # Being sent to the most perishable window is right even when little of it
+    # is left -- that is precisely the quota about to expire. Being sent there
+    # without being told is what makes the advice look wrong four messages
+    # later, so the figure travels with the recommendation.
+    left = window_left_pct(states[best.name])
+    spent = ("" if left is None or left > NEARLY_SPENT_PCT
+             else " — only {}% of it left".format(left))
     if only:
-        return best, "the only account; its window ends {} (in {})".format(
-            fmt_time(expiry), fmt_delta(expiry - now))
+        return best, "the only account; its window ends {} (in {}){}".format(
+            fmt_time(expiry), fmt_delta(expiry - now), spent)
     # "ends first" is a claim about the accounts it was chosen over, so it has to
     # be false when there was nothing to choose between: another account's window
     # may well end sooner and simply be unusable.
     if sum(1 for a in accounts if avail[a.name].tier == USABLE) == 1:
-        return best, "the only account usable right now; its window ends {} (in {})".format(
-            fmt_time(expiry), fmt_delta(expiry - now))
-    return best, "its window ends first, {} (in {})".format(
-        fmt_time(expiry), fmt_delta(expiry - now))
+        return best, "the only account usable right now; its window ends {} (in {}){}".format(
+            fmt_time(expiry), fmt_delta(expiry - now), spent)
+    return best, "its window ends first, {} (in {}){}".format(
+        fmt_time(expiry), fmt_delta(expiry - now), spent)
 
 
 def headline(chosen, avail, count):
@@ -785,7 +812,15 @@ def describe_availability(state, avail, now):
         expiry = next_expiry(state, now)
         if expiry == float("inf"):
             return "no window information yet"
-        return "usable — window ends in {}".format(fmt_delta(expiry - now))
+        left = window_left_pct(state)
+        if left is None:
+            return "usable — window ends in {}".format(fmt_delta(expiry - now))
+        # How much is left matters as much as how long is left, and this line
+        # used to carry only the second: an account with 3% remaining and one
+        # with all of it read identically, and the shorter of the two is the
+        # one this list recommends.
+        return "usable — {}% left, window ends in {}".format(
+            left, fmt_delta(expiry - now))
     if avail.tier == WAITING:
         return "unusable until {}{} — {}".format(
             "" if avail.exact else "no later than ",
