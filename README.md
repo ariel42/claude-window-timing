@@ -38,6 +38,8 @@ Same morning, with it running:
 
 Same capacity, less waiting. Where the window happens to sit when you arrive is luck — sometimes it just reset, sometimes it is about to. Averaged over many days that is **about 2.5 hours of waiting instead of a flat 5**.
 
+That average is real even if you start work at the same hour every day, and it is worth saying why: 5 does not divide 24. Each day's boundaries land an hour later than the last — 09:30 today, 10:30 tomorrow, 11:30 the day after — so the offset you meet at 9:00 walks through the whole cycle every five days rather than settling on one unlucky value. Two days of this machine's own logs, at the same hour: a 30-minute wait, then a 90-minute one.
+
 ## More than one subscription
 
 If one subscription is not enough, the usual answer is a second. Two accounts give you twice the quota — but left alone their windows drift into whatever arrangement chance produces, and that arrangement matters more than it looks.
@@ -353,7 +355,7 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 ## Notes and caveats
 
 - Not affiliated with or endorsed by Anthropic. Worth knowing what you are running: this sends one saved line to your subscription every 30 minutes, day and night, whether or not you are at the machine. Anthropic's [consumer terms](https://www.anthropic.com/legal/consumer-terms) address reaching the service by automated means; Anthropic also ships Claude Code for scripted and headless use. On the other side of the ledger, the pings create no capacity — every window holds exactly the quota you paid for, and nothing here exceeds a limit or asks for more. Running several subscriptions is a separate decision with its own considerations. Read the terms and decide for yourself.
-- Pings are cheap but not free, and they also draw a little from the separate **weekly** limit — about 48 pings a day per account.
+- Pings are cheap but not free, and they also draw a little from the separate **weekly** limit — about 48 pings a day per account. How little is below what can be measured from outside: the weekly figure is reported to the nearest 1%, and in this machine's logs it did not move across 13 consecutive pings that spent nothing at all of the 5-hour window. Read "a little" as an upper bound nobody has been able to tighten, not as a measurement.
 - Pings ask Claude for no thinking and never update the CLI. Thinking is billed as output and a ping's reply is discarded; an update rewrites the tool definitions that sit at the front of every cached prompt, which would make your own open sessions expensive to resume. Neither affects how you run Claude Code yourself.
 - Accounts must be genuinely different Claude accounts. Signing in twice as the same one looks like it works and buys nothing; setup checks for it.
 - **Do not point a ping directory at a *different* account with `/login`.** That directory's identity is how the tool knows which account it is pinging. Signing the *same* account in again is fine and is what `doctor` tells you to do when a login expires; changing which account lives there means editing `accounts.json` and re-running `./install.sh`.
