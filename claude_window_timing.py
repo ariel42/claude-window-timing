@@ -5507,14 +5507,30 @@ def _prune_backups():
 
     Only ever touches .backups. A login that could not be parked is written to
     .orphaned instead, precisely so that it is out of this function's reach.
+
+    Ordered by when each directory was made, not by its name. The names are
+    second-resolution with a `-2`, `-3` suffix for collisions, and neither
+    half of that sorts the way it looks: `-10` sorts before `-2`, and -- the
+    one that actually bit -- pruning frees an earlier name inside the same
+    second, so the next backup takes it back and two directories a minute
+    apart carry names that sort the wrong way round. mtime is what the
+    ordering was always trying to approximate, so use it.
     """
     root = os.path.join(SWITCH_ROOT, ".backups")
     try:
-        stamps = sorted(d for d in os.listdir(root)
-                        if os.path.isdir(os.path.join(root, d)))
+        directories = [d for d in os.listdir(root)
+                       if os.path.isdir(os.path.join(root, d))]
     except (IOError, OSError):
         return
-    for stamp in stamps[:max(0, len(stamps) - SWITCH_BACKUPS_KEPT)]:
+
+    def made_at(name):
+        try:
+            return os.stat(os.path.join(root, name)).st_mtime
+        except OSError:
+            return 0.0
+
+    oldest_first = sorted(directories, key=made_at)
+    for stamp in oldest_first[:max(0, len(oldest_first) - SWITCH_BACKUPS_KEPT)]:
         shutil.rmtree(os.path.join(root, stamp), ignore_errors=True)
 
 

@@ -9813,6 +9813,151 @@ def test_the_verdict_the_schedule_publishes_is_the_one_it_holds():
         shutil.rmtree(root, ignore_errors=True)
 
 
+
+def test_the_backup_that_makes_a_switch_survivable():
+    """
+    The two files this copies are the difference between a signed-in Claude
+    Code and a browser login, and `switch` is the only command that rewrites
+    them -- so this copy is the whole of what makes a switch reversible. Seven
+    of ten mutations to it survived, including the one that had two switches
+    in the same second overwrite each other's only copy.
+    """
+    section("The backup that makes a switch survivable")
+    root = tempfile.mkdtemp()
+    saved = (ew.SWITCH_ROOT, ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON,
+             ew.SWITCH_BACKUPS_KEPT)
+    try:
+        ew.HOME = root
+        ew.SWITCH_ROOT = os.path.join(root, ".claude-switch")
+        ew.USER_CONFIG_DIR = os.path.join(root, ".claude")
+        ew.USER_CONFIG_JSON = os.path.join(root, ".claude.json")
+        os.makedirs(ew.USER_CONFIG_DIR, 0o700)
+        with open(ew.credentials_path(ew.user_login()), "w") as f:
+            f.write('{"claudeAiOauth": {"accessToken": "first"}}')
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            f.write('{"oauthAccount": {"accountUuid": "u1"}}')
+
+        first = ew.backup_user_login()
+        check_true("a backup is made", first is not None)
+        check("both files travel",
+              sorted(os.listdir(first)), ["claude.json", "credentials.json"])
+        for name in os.listdir(first):
+            check("{} is readable by nobody else".format(name),
+                  stat.S_IMODE(os.stat(os.path.join(first, name)).st_mode),
+                  0o600)
+        check("and neither is the directory holding them",
+              stat.S_IMODE(os.stat(first).st_mode), 0o700)
+        check_true("the credential really is the one that was there",
+                   "first" in open(os.path.join(first, "credentials.json")).read())
+
+        # Two switches in the same second. This is the one that used to lose a
+        # login: same name, second copy over the first.
+        with open(ew.credentials_path(ew.user_login()), "w") as f:
+            f.write('{"claudeAiOauth": {"accessToken": "second"}}')
+        second = ew.backup_user_login()
+        check_true("a second backup in the same second gets its own place",
+                   second != first)
+        check_true("and the first is still there", os.path.isdir(first))
+        check_true("still holding what it held",
+                   "first" in open(os.path.join(first,
+                                                "credentials.json")).read())
+        check_true("while the second holds the newer one",
+                   "second" in open(os.path.join(second,
+                                                 "credentials.json")).read())
+        # The suffix has to sort after the bare stamp and before the next
+        # second, or pruning throws things away out of order.
+        check("the names sort in the order they were taken",
+              sorted([os.path.basename(first), os.path.basename(second)]),
+              [os.path.basename(first), os.path.basename(second)])
+
+        # Nothing to copy: no empty directory left behind, and it says so.
+        os.remove(ew.credentials_path(ew.user_login()))
+        os.remove(ew.USER_CONFIG_JSON)
+        before = len(os.listdir(os.path.join(ew.SWITCH_ROOT, ".backups")))
+        check("with nothing to save there is no backup", ew.backup_user_login(),
+              None)
+        check("and no empty directory left behind",
+              len(os.listdir(os.path.join(ew.SWITCH_ROOT, ".backups"))), before)
+
+        # Pruning keeps the newest, and only ever touches .backups.
+        ew.SWITCH_BACKUPS_KEPT = 3
+        with open(ew.USER_CONFIG_JSON, "w") as f:
+            f.write("{}")
+        kept = [ew.backup_user_login() for _ in range(6)]
+        living = sorted(os.listdir(os.path.join(ew.SWITCH_ROOT, ".backups")))
+        check("only the newest are kept", len(living), 3)
+        # Ordered by when they were made, not by name: pruning frees an
+        # earlier name inside the same second and the next backup takes it
+        # back, so two directories a minute apart can sort the wrong way.
+        check("and they are the three most recently made", living,
+              sorted(os.path.basename(k) for k in kept[-3:]))
+        check_true("each still holding a copy",
+                   all(os.listdir(os.path.join(ew.SWITCH_ROOT, ".backups", d))
+                       for d in living))
+
+        # An orphaned login is deliberately out of the pruner's reach: the
+        # switch that writes one says it is the only copy.
+        orphans = os.path.join(ew.SWITCH_ROOT, ".orphaned")
+        ew.secure_dir(orphans)
+        marker = os.path.join(orphans, "keep-me")
+        with open(marker, "w") as f:
+            f.write("x")
+        for _ in range(6):
+            ew.backup_user_login()
+        check_true("an orphaned login is never pruned", os.path.exists(marker))
+    finally:
+        (ew.SWITCH_ROOT, ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON,
+         ew.SWITCH_BACKUPS_KEPT) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_nothing_the_switch_path_creates_is_readable_by_anyone_else():
+    """
+    Every directory on this path holds, or will hold, a live OAuth token. No
+    test checked the mode of any of them -- so `secure_dir`'s mode argument,
+    and every call that relies on its default, could have been changed to 0755
+    with the suite still green.
+    """
+    section("Nothing the switch path creates is readable by anyone else")
+    root = tempfile.mkdtemp()
+    saved = (ew.SWITCH_ROOT, ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON,
+             ew.STATE_ROOT)
+    try:
+        ew.HOME = root
+        ew.SWITCH_ROOT = os.path.join(root, ".claude-switch")
+        ew.USER_CONFIG_DIR = os.path.join(root, ".claude")
+        ew.USER_CONFIG_JSON = os.path.join(root, ".claude.json")
+        ew.STATE_ROOT = os.path.join(root, "state")
+        os.makedirs(ew.USER_CONFIG_DIR, 0o700)
+        with open(ew.credentials_path(ew.user_login()), "w") as f:
+            f.write("{}")
+
+        account = ew.Account("1", os.path.join(root, "cfg1"), 0)
+        store = ew.switch_store(account)
+        ew.prepare_store(store)
+        ew.backup_user_login()
+        account.ensure_state_dir()
+
+        for path in (ew.SWITCH_ROOT,
+                     os.path.join(ew.SWITCH_ROOT, ".backups"),
+                     store.config_dir,
+                     account.state_dir):
+            check("{} is 0700".format(os.path.basename(path) or path),
+                  stat.S_IMODE(os.stat(path).st_mode), 0o700)
+
+        # And secure_dir tightens one that is already there and too open --
+        # an earlier version, or a umask nobody expected.
+        loose = os.path.join(root, "loose")
+        os.makedirs(loose, 0o755)
+        ew.secure_dir(loose)
+        check("an existing directory that is too open is tightened",
+              stat.S_IMODE(os.stat(loose).st_mode), 0o700)
+    finally:
+        (ew.SWITCH_ROOT, ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON,
+         ew.STATE_ROOT) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     # Every path the tool reads or writes is redirected into one disposable
     # directory before a single test runs.
@@ -9936,6 +10081,8 @@ def main():
                  test_the_sign_in_a_switch_offers_is_the_one_place_a_login_is_made,
                  test_every_condition_on_offering_a_sign_in_is_load_bearing,
                  test_the_verdict_the_schedule_publishes_is_the_one_it_holds,
+                 test_the_backup_that_makes_a_switch_survivable,
+                 test_nothing_the_switch_path_creates_is_readable_by_anyone_else,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
                  test_install_uninstall_purge_and_install_again,
