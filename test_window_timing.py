@@ -45,6 +45,47 @@ def stamp_checkpoint(account):
         f.write(account.ping_cwd)
 
 
+
+class _Answers(object):
+    """
+    Scripted answers on stdin, then Enter for ever.
+
+    Running out of input used to be indistinguishable from a user pressing
+    Enter, because `_ask` treated EOF as consent -- which is how an unattended
+    install could answer yes to every question in the wizard. It no longer
+    does. A test that means "and accept the rest of the defaults" still needs
+    a way to say so, and this says it explicitly rather than by running out.
+    """
+
+    def __init__(self, script):
+        self._lines = script.splitlines(True) if script else []
+        self._at = 0
+
+    def readline(self, *_ignored):
+        if self._at < len(self._lines):
+            self._at += 1
+            return self._lines[self._at - 1]
+        return "\n"
+
+    def read(self, *_ignored):
+        return "".join(self._lines[self._at:])
+
+
+
+def _systemd_stdout(command):
+    """
+    What a reachable systemd user manager answers, for stubs that need to be
+    faithful about it.
+
+    Every stub in this file used to answer the empty string to everything,
+    which is what a machine with *no* reachable manager answers. That made the
+    two indistinguishable, and hid a real defect: `setup` printed "Timer
+    running" and exited 0 on a machine where no timer could ever run.
+    """
+    words = [str(word) for word in command]
+    return "running\n" if "is-system-running" in words else ""
+
+
 def check(name, got, want):
     if got == want:
         print("  PASS  {}".format(name))
@@ -1858,7 +1899,7 @@ def test_a_second_machine_answers_from_the_schedule():
             sys.stdout = out
         said = buf.getvalue()
         check_true("the answer says where it came from",
-                   "schedule.json" in said and "72h00m" in said)
+                   "schedule.json" in said and "3d 00h00m" in said)
         check_true("and does not claim the local timers are late",
                    "check the timers" not in said)
 
@@ -3788,7 +3829,7 @@ def test_setup_and_init_refuse_the_obviously_wrong():
         def wizard(answers):
             buf = io.StringIO()
             out, sys.stdout = sys.stdout, buf
-            sys.stdin = io.StringIO(answers)
+            sys.stdin = _Answers(answers)
             try:
                 return ew.setup(), buf.getvalue()
             finally:
@@ -3860,7 +3901,7 @@ def test_the_first_run_screen_says_the_things_that_stop_people():
     try:
         buf = io.StringIO()
         out, sys.stdout = sys.stdout, buf
-        sys.stdin = io.StringIO("2\ny\n\n")
+        sys.stdin = _Answers("2\ny\n\n")
         try:
             code = ew.setup()
         finally:
@@ -3899,11 +3940,13 @@ def _launcher_sandbox():
     ew.ACCOUNTS_FILE = os.path.join(root, "repo", "accounts.json")
     ew.SCHEDULE_FILE = os.path.join(root, "repo", "schedule.json")
 
-    class Ok(object):
-        returncode = 0
-        stdout = ""
+    def reachable(*args):
+        class Ok(object):
+            returncode = 0
+            stdout = _systemd_stdout(args)
+        return Ok()
 
-    ew._systemctl = lambda *a: Ok()
+    ew._systemctl = reachable
     ew._run = lambda cmd: Ok()
     os.environ["SHELL"] = "/bin/bash"
     os.environ["PATH"] = "/usr/bin:/bin"
@@ -4623,7 +4666,7 @@ def _clean_install(answers, accounts=2, claude_control=None,
         calls.append(list(cmd))
         class Ok(object):
             returncode = 0
-            stdout = ""
+            stdout = _systemd_stdout(cmd)
         return Ok()
 
     ew.HOME = home
@@ -4648,7 +4691,7 @@ def _clean_install(answers, accounts=2, claude_control=None,
     ew.STARTUP_WAIT_SEC, ew.COMPLETION_TIMEOUT_SEC, ew.STATUSLINE_WAIT_SEC = \
         0.4, 15, 4
     os.environ["HOME"] = home
-    sys.stdin = io.StringIO(answers)
+    sys.stdin = _Answers(answers)
     if claude_control:
         for slot in range(1, accounts + 1):
             config = os.path.join(home, ".claude-{}".format(slot))
@@ -5059,7 +5102,7 @@ def test_removing_an_account_stops_its_timer():
         seen.append(list(cmd))
         class Ok(object):
             returncode = 0
-            stdout = ""
+            stdout = _systemd_stdout(cmd)
         return Ok()
 
     ew.UNIT_DIR, ew.HOME = units, home
@@ -6498,7 +6541,8 @@ def test_a_schedule_nobody_refreshed_stops_speaking_with_authority():
         findings = [f for f in ew.switch_only_findings(accounts)
                     if "published" in f.message]
         check("a stale schedule is reported", len(findings), 1)
-        check_true("saying how old it is", "192h" in findings[0].message)
+        check_true("saying how old it is, in days a reader can use",
+                   "8d 00h" in findings[0].message)
         check_true("and that the window times in it are still good",
                    "phase does not move" in findings[0].hint)
 
@@ -8748,6 +8792,164 @@ def test_setup_says_the_pings_belong_on_one_machine():
                "schedule.json" in said)
 
 
+
+def test_an_install_that_could_never_ping_is_refused():
+    """
+    Having systemctl is not having a manager to talk to. WSL without
+    systemd=true, `docker exec`, `su -` and `ssh host ./install.sh` all ship
+    the binary and reach no user bus. Every `systemctl --user` call there
+    fails, and this tool used to discard the exit code -- so setup printed
+    "Timer running" for both accounts and exited 0 on a machine where no ping
+    would ever run, having spent real API calls building checkpoints.
+    """
+    section("An install that could never ping says so")
+    original = ew._systemctl
+
+    def manager(answer):
+        def fake(*args):
+            class R(object):
+                returncode = 0 if answer else 1
+                stdout = answer
+            return R()
+        return fake
+
+    try:
+        ew._systemctl = manager("running\n")
+        check("a reachable manager is no blocker",
+              len(ew.systemd_blockers(True)), 0)
+
+        # What `systemctl --user is-system-running` prints with no bus. Not a
+        # state -- the absence of one.
+        for empty in ("", "Failed to connect to bus: No medium found\n"):
+            ew._systemctl = manager(empty)
+            blockers = ew.systemd_blockers(True)
+            check("an unreachable manager blocks the install", len(blockers), 1)
+            check("and it is an error, not a warning",
+                  blockers[0].level, "error")
+            check_true("naming the thing that is wrong",
+                       "cannot be reached" in blockers[0].message)
+            check_true("and offering the install that would work here",
+                       "--no-pings" in blockers[0].hint)
+
+        # A machine that was never going to ping is not asked the question.
+        ew._systemctl = manager("")
+        check("a switch-only install is unaffected",
+              len(ew.systemd_blockers(False)), 0)
+    finally:
+        ew._systemctl = original
+
+
+def test_running_out_of_input_is_not_consent():
+    """
+    `_ask` used to return the default on EOFError, so a run with no terminal
+    answered yes to every question in the wizard: it wrote accounts.json,
+    spent a real API call, enabled timers and edited the shell rc file. That
+    is how `ssh -n host ./install.sh`, a CI step or `nohup` could turn a
+    machine into a second pinger for the same accounts without anybody
+    deciding to.
+    """
+    section("EOF is not an answer")
+    saved_stdin, saved_yes = sys.stdin, ew.ASSUME_YES
+    try:
+        ew.ASSUME_YES = False
+        sys.stdin = io.StringIO("")
+        raised = None
+        try:
+            ew._ask_yes("Run the pings from this machine?")
+        except ew.NoAnswer as stopped:
+            raised = stopped
+        check_true("a question with nobody there stops the run",
+                   raised is not None)
+        check_true("and says which question it was",
+                   "Run the pings" in raised.prompt)
+
+        # Enter is still an answer. The fix must not turn accepting a default
+        # into an error, or every interactive install breaks.
+        sys.stdin = io.StringIO("\n")
+        check("pressing Enter still takes the default",
+              ew._ask_yes("Go ahead?", default=True), True)
+
+        # And --yes still means yes, without a terminal at all.
+        ew.ASSUME_YES = True
+        sys.stdin = io.StringIO("")
+        check("--yes answers without being asked",
+              ew._ask_yes("Go ahead?", default=True), True)
+    finally:
+        sys.stdin, ew.ASSUME_YES = saved_stdin, saved_yes
+
+
+def test_a_figure_from_another_program_is_rendered_not_raised_on():
+    """
+    Nothing between Claude Code's statusLine JSON and the formatters
+    range-checks a timestamp. A millisecond epoch (JS `Date.now()`), a string,
+    None or an infinity all reach them -- from a copied schedule.json, a
+    truncated state.json, or a change at the other end. `fmt_time` used to
+    raise, which took `status` down and `doctor` with it, from inside the very
+    finding that reports an implausible reset time.
+    """
+    section("A hostile figure is rendered, not raised on")
+    hostile = [1787000000000, 1e18, float("inf"), float("-inf"),
+               None, "soon", [], {}]
+    for value in hostile:
+        rendered = ew.fmt_time(value)
+        check_true("fmt_time renders {!r} rather than raising".format(value),
+                   isinstance(rendered, str) and rendered)
+        length = ew.fmt_delta(value)
+        check_true("fmt_delta renders {!r} rather than raising".format(value),
+                   isinstance(length, str) and length)
+
+    # Unreadable has to *look* unreadable. Rendering a millisecond epoch as
+    # some year in the far future would be worse than raising: it reads like a
+    # real answer.
+    check_true("and an unreadable moment says so",
+               "unreadable" in ew.fmt_time(1787000000000))
+
+    # The one that matters most: next_expiry feeds every ranking decision.
+    for value in hostile:
+        state = {"rate_limits": {"five_hour": {"resets_at": value}}}
+        check("an unusable reading is unknown, not a crash: {!r}".format(value),
+              ew.next_expiry(state, 1000.0), float("inf"))
+
+    # Days, because the weekly countdown is the one that gets long and
+    # "192h00m00s" is a number you have to do arithmetic on before it means
+    # anything.
+    check("a long wait is said in days", ew.fmt_delta(192 * 3600),
+          "8d 00h00m00s")
+    check("a short one is not", ew.fmt_delta(3665), "1h01m05s")
+    check("and a negative one keeps its sign",
+          ew.fmt_delta(-(50 * 3600)), "-2d 02h00m00s")
+
+
+def test_a_machine_that_cannot_switch_never_reports_itself_healthy():
+    """
+    A switch-only machine has exactly one command that matters. On macOS that
+    command hard-refuses -- the credential lives in the Keychain, not in a
+    file -- and `doctor` and `check` both said "Everything checks out"
+    anyway. A diagnostic being wrong about the only thing it was asked is
+    worse than no diagnostic.
+    """
+    section("A machine that cannot switch is not called healthy")
+    original = ew.sys.platform
+    try:
+        ew.sys.platform = "darwin"
+        blocker = ew.platform_blocker()
+        check_true("switching is refused off Linux", blocker is not None)
+        check("and refusing is an error", blocker.level, "error")
+
+        findings = ew.switch_only_findings([])
+        errors = [f for f in findings if f.level == "error"]
+        check_true("a switch-only machine reports it as a finding too",
+                   any("only supported on Linux" in f.message for f in errors))
+
+        ew.sys.platform = "linux"
+        findings = ew.switch_only_findings([])
+        check_true("and says nothing about the platform on Linux",
+                   not any("only supported on Linux" in f.message
+                           for f in findings))
+    finally:
+        ew.sys.platform = original
+
+
 def main():
     # Every path the tool reads or writes is redirected into one disposable
     # directory before a single test runs.
@@ -8848,6 +9050,10 @@ def main():
                  test_the_launcher_can_reach_the_user_manager,
                  test_the_timer_is_told_where_the_cli_is,
                  test_a_timer_that_will_never_fire_again_is_noticed,
+                 test_an_install_that_could_never_ping_is_refused,
+                 test_running_out_of_input_is_not_consent,
+                 test_a_figure_from_another_program_is_rendered_not_raised_on,
+                 test_a_machine_that_cannot_switch_never_reports_itself_healthy,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
                  test_install_uninstall_purge_and_install_again,

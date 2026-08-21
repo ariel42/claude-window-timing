@@ -614,6 +614,13 @@ UNPUBLISHED = Availability(
 SCHEDULE_FILE = os.path.join(SCRIPT_DIR, "schedule.json")
 
 
+# How far from now a reported reset can be and still be a reset. Both limits
+# this tool reads are days away at most; anything beyond a year is a unit
+# error or a corrupted file, not a window -- and believing one puts a
+# fabricated countdown on screen, which reads exactly like a real answer.
+READING_SANE_SEC = 366 * 24 * 3600
+
+
 def next_expiry(state, now):
     """
     When this account's current window ends, rolled forward if the reading is old.
@@ -623,6 +630,14 @@ def next_expiry(state, now):
     rather than to distrust the reading — it is still the right phase.
     """
     resets = ((state.get("rate_limits") or {}).get("five_hour") or {}).get("resets_at")
+    if not isinstance(resets, (int, float)) or isinstance(resets, bool) \
+            or resets != resets or abs(resets - now) > READING_SANE_SEC:
+        # Either not a number we can do arithmetic with, or a moment no reset
+        # could be at. A millisecond epoch is the one that actually happens --
+        # JS `Date.now()` at the other end -- and it is a perfectly good float,
+        # so only the range catches it. Unknown is the honest answer; raising
+        # would take every caller down, and one of them is doctor.
+        return float("inf")
     if not resets:
         return float("inf")
     window = WINDOW_HOURS * 3600
@@ -1803,17 +1818,47 @@ def fmt_time(epoch):
     2h19m48s on both, but only if you compare the right two lines.
 
     `astimezone()` because a naive datetime formats %Z as nothing at all.
+
+    Nothing upstream range-checks the epoch. Claude Code's statusLine payload
+    is JSON from another program, a copied schedule.json comes from another
+    machine, and a truncated state.json comes from a full disk -- so a
+    millisecond epoch (JS `Date.now()`), a string, None or an infinity all
+    reach here. Raising took `status` down, and `doctor` with it, from inside
+    the very finding that reports an implausible reset time: it detected the
+    fault and then died formatting it. A formatter's job is to render whatever
+    it is handed.
     """
-    return datetime.fromtimestamp(epoch).astimezone().strftime(
-        "%Y-%m-%d %H:%M:%S %Z")
+    try:
+        return datetime.fromtimestamp(epoch).astimezone().strftime(
+            "%Y-%m-%d %H:%M:%S %Z")
+    except (ValueError, OverflowError, OSError, TypeError):
+        return "an unreadable time ({!r})".format(epoch)
 
 
 def fmt_delta(seconds):
-    seconds = int(round(seconds))
+    """
+    A duration, in the largest units that stay readable.
+
+    Days appear once there are any, because the weekly countdown is the one
+    that gets long and `192h00m00s` is a number you have to do arithmetic on
+    before it means anything.
+
+    Guarded for the same reason as fmt_time: the value can come from a figure
+    another program wrote.
+    """
+    try:
+        seconds = int(round(seconds))
+    except (ValueError, OverflowError, TypeError):
+        return "an unreadable length of time ({!r})".format(seconds)
     sign = "-" if seconds < 0 else ""
     seconds = abs(seconds)
-    return "{}{}h{:02d}m{:02d}s".format(sign, seconds // 3600,
-                                        (seconds % 3600) // 60, seconds % 60)
+    days, seconds = divmod(seconds, 86400)
+    body = "{}h{:02d}m{:02d}s".format(seconds // 3600,
+                                      (seconds % 3600) // 60, seconds % 60)
+    if days:
+        return "{}{}d {:02d}{}".format(sign, days, seconds // 3600, body[
+            body.index("h"):])
+    return "{}{}".format(sign, body)
 
 
 # ---------------------------------------------------------------------------
@@ -3533,7 +3578,15 @@ def switch_only_findings(accounts):
     and sign into the very thing the install had just told them they did not
     need.
     """
-    findings = switch_findings(accounts)
+    findings = []
+    # First, because it decides whether anything below is worth saying. A
+    # switch-only machine has exactly one command that matters, and where that
+    # command refuses outright, reporting "Everything checks out" is the
+    # diagnostic being wrong about the only thing it was asked.
+    unsupported = platform_blocker()
+    if unsupported is not None:
+        findings.append(unsupported)
+    findings.extend(switch_findings(accounts))
     findings.extend(_stray_unit_findings(accounts))
     findings.extend(_onboarding_findings())
     if installed_units():
@@ -6016,6 +6069,20 @@ def switch_findings(accounts):
 ASSUME_YES = False
 
 
+class NoAnswer(Exception):
+    """
+    A question was asked with nobody there to answer it.
+
+    Raised rather than exited so it can be caught at the one place that knows
+    what to say, and so a test can assert the wizard stopped instead of having
+    the whole run torn down under it.
+    """
+
+    def __init__(self, prompt):
+        Exception.__init__(self, prompt)
+        self.prompt = prompt
+
+
 def _ask(prompt, default=""):
     if ASSUME_YES:
         # Echoed, so an unattended transcript still shows what was decided.
@@ -6024,7 +6091,13 @@ def _ask(prompt, default=""):
     try:
         answer = input("{} ".format(prompt)).strip()
     except EOFError:
-        return default
+        # Nobody is there. Taking the default here meant an unattended run --
+        # `ssh -n host ./install.sh`, a CI step, nohup -- silently answered
+        # yes to every question: it wrote accounts.json, spent a real API
+        # call building a checkpoint, enabled timers and edited the shell rc
+        # file, all without a human. Consent given by end-of-file is not
+        # consent. `--yes` is how you say yes without being asked.
+        raise NoAnswer(prompt)
     return answer or default
 
 
@@ -6059,6 +6132,21 @@ def systemd_blockers(pings):
             "error",
             "Running the pings needs systemd, and systemctl was not found",
             "This machine can still switch accounts, which needs no timers: "
+            "re-run with ./install.sh --no-pings"))
+    elif not systemd_reachable():
+        # Having the binary is not having a manager to talk to. WSL without
+        # systemd=true, `docker exec`, `su -` and `ssh host ./install.sh` on
+        # some distributions all ship systemctl and none of them can reach a
+        # user bus -- and every `systemctl --user` call there fails in a way
+        # this tool used to discard, so setup printed "Timer running" for
+        # timers that did not exist and exited 0. The install looked perfect
+        # and no ping ever ran.
+        findings.append(Finding(
+            "error",
+            "systemctl is here but this machine's systemd user manager "
+            "cannot be reached, so no timer would ever run",
+            "Log in directly (a real session sets XDG_RUNTIME_DIR), or on "
+            "WSL enable systemd; to install anyway for switching only, "
             "re-run with ./install.sh --no-pings"))
     elif not _command_exists("systemd-run"):
         # Not fatal: the pings still run on their fixed cadence. What is lost
@@ -7255,4 +7343,15 @@ def cli(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(cli())
+    try:
+        sys.exit(cli())
+    except NoAnswer as unanswered:
+        # The wizard asked something and there was no terminal to answer on.
+        # Stopping is the whole point: the alternative, taking the default,
+        # let an unattended run consent to writing config, spending an API
+        # call, enabling timers and editing a shell rc file.
+        sys.stderr.write(
+            "\n{}\nNo answer, and no terminal to ask on. Nothing further "
+            "was changed.\n  -> Run this from a terminal, or pass --yes to "
+            "accept the defaults deliberately.\n".format(unanswered.prompt))
+        sys.exit(2)
