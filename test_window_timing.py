@@ -5277,11 +5277,36 @@ def test_an_interrupted_switch_never_leaves_a_login_in_two_places():
         errors = [f for f in ew.switch_findings(accounts)
                   if f.level == "error" and "same login parked" in f.message]
         check("one login in two stores is an error", len(errors), 1)
+        check("and is not also reported as two logins to one account",
+              [f for f in ew.switch_findings(accounts)
+               if "parked as the same Claude account" in f.message], [])
         check_true("naming both accounts",
                    "1 (label1)" in errors[0].message
                    and "2 (label2)" in errors[0].message)
         check_true("and how to give one of them its own",
                    second.config_dir in errors[0].hint)
+    finally:
+        restore()
+
+    # Two *different* logins to one account is a different mistake with the
+    # same cost: the second slot buys no quota at all. The ping directories
+    # are checked for this; a machine that only switches has none.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                              parked=("1", "2"))
+    try:
+        store = ew.switch_store(accounts[1])
+        config = json.load(open(store.config_json))
+        config["oauthAccount"] = {"accountUuid": "uuid-1",
+                                  "emailAddress": "a1@example.com"}
+        with open(store.config_json, "w") as f:
+            json.dump(config, f)
+        errors = [f for f in ew.switch_findings(accounts)
+                  if "parked as the same Claude account" in f.message]
+        check("two slots on one subscription is an error", len(errors), 1)
+        check_true("naming the account they share",
+                   "a1@example.com" in errors[0].message)
+        check_true("and saying why a second slot there is worth nothing",
+                   "buys no quota" in errors[0].hint)
     finally:
         restore()
 

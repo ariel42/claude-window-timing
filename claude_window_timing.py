@@ -4316,12 +4316,21 @@ def current_account(accounts):
     # machine already publishes each account's UUID in schedule.json, which is
     # the file the README has people copy across, so use it rather than telling
     # somebody their own account is unrecognised.
+    # Only as a name for a slot this machine cannot name itself. Which slot is
+    # which falls out of the order somebody signed in, so the two machines need
+    # not agree -- and a slot this one knows means a different account must
+    # never be relabelled by a file from elsewhere.
     for entry in (read_schedule() or {}).get("accounts", []):
         if not isinstance(entry, dict) or entry.get("account_uuid") != mine:
             continue
         for account in accounts:
-            if account.name == str(entry.get("name")):
-                return account
+            if account.name != str(entry.get("name")):
+                continue
+            here = (account_identity(account)["account_uuid"]
+                    or account_identity(switch_store(account))["account_uuid"])
+            if here and here != mine:
+                continue
+            return account
     return None
 
 
@@ -4735,19 +4744,18 @@ def offer_sign_in(account, store):
     return bool(account_identity(store)["has_token"])
 
 
-def published_uuid(account):
+def published_accounts():
     """
-    This account's UUID as the pinging machine published it, or "".
+    Every account UUID the published schedule knows about.
 
-    A machine that only switches has no ping directory, so the checks that
-    compare a parked login against "who this account is" had nothing to compare
-    against and silently passed -- on exactly the machines the README tells
-    people to use for switching. The schedule carries the UUID already.
+    Not which slot each one is: slot names come from the order somebody signed
+    in, and two machines in one setup are free to differ. What the file can say
+    is which Claude accounts the setup is made of, which is enough to notice a
+    store signed in to something else entirely.
     """
-    for entry in (read_schedule() or {}).get("accounts", []):
-        if isinstance(entry, dict) and str(entry.get("name")) == account.name:
-            return entry.get("account_uuid") or ""
-    return ""
+    return set(entry.get("account_uuid")
+               for entry in (read_schedule() or {}).get("accounts", [])
+               if isinstance(entry, dict) and entry.get("account_uuid"))
 
 
 def switch_blockers(account, usable=None):
@@ -4799,8 +4807,22 @@ def switch_blockers(account, usable=None):
                 account.display, fmt_time(expires)),
             "Sign in again: {}".format(sign_in_command(store))))
 
-    want = account_identity(account)["account_uuid"] or published_uuid(account)
+    # Who this slot is, where this machine can say: its ping directory. A
+    # machine that only switches has none, and the slot is then defined by the
+    # login parked in it -- there is nothing else here to contradict it, and
+    # the numbering on the machine that pings is not that contradiction.
+    want = account_identity(account)["account_uuid"]
     got = identity["account_uuid"]
+    known = published_accounts()
+    if not want and got and known and got not in known:
+        findings.append(Finding(
+            "error",
+            "The login parked for account {} is signed in as {}, which is not "
+            "one of the accounts this setup is made of".format(
+                account.display, identity["email"] or got[:8]),
+            "The schedule copied here lists {} accounts, and that is not one "
+            "of them. Sign in as one that is: {}".format(
+                len(known), sign_in_command(store))))
     if not got:
         # Without it the identity in ~/.claude.json would keep naming the old
         # account while the new one is billed — the mixture this whole section
@@ -5200,6 +5222,34 @@ def switch_findings(accounts):
         grant = login_fingerprint(switch_store(account))
         if grant:
             grants.setdefault(grant, []).append(account)
+    # And two slots parked as the same Claude *account* -- two separate logins
+    # to one subscription, which is a different mistake with the same cost:
+    # the second slot buys nothing. `validate_accounts` catches this for ping
+    # directories; a machine that only switches has none, and until now had no
+    # check of its own.
+    subscriptions = {}
+    for account in accounts:
+        store = switch_store(account)
+        if not os.path.exists(credentials_path(store)):
+            continue
+        uuid_ = account_identity(store)["account_uuid"]
+        if uuid_:
+            subscriptions.setdefault(uuid_, []).append(account)
+    for shared in subscriptions.values():
+        # Where they are the same *login*, the check below says so instead —
+        # it is the sharper statement about the same two directories.
+        if len(shared) > 1 and len(set(
+                login_fingerprint(switch_store(a)) for a in shared)) > 1:
+            findings.append(Finding(
+                "error",
+                "Accounts {} are parked as the same Claude account ({})".format(
+                    " and ".join(a.display for a in shared),
+                    account_identity(switch_store(shared[0]))["email"]
+                    or "same account"),
+                "Two slots, one subscription: switching between them changes "
+                "nothing and the second buys no quota. Sign one of them in as "
+                "a different account: {}".format(
+                    sign_in_command(switch_store(shared[-1])))))
     for shared in grants.values():
         if len(shared) > 1:
             findings.append(Finding(
