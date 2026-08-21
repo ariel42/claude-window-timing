@@ -859,6 +859,14 @@ def read_schedule(path=None):
     return document
 
 
+def find_local(accounts, name):
+    """The configured account with this name, or None."""
+    for account in accounts:
+        if account.name == name:
+            return account
+    return None
+
+
 def schedule_view(accounts):
     """
     Accounts and readings taken from a published schedule, or None.
@@ -877,6 +885,20 @@ def schedule_view(accounts):
     Returns None whenever this machine has readings of its own: the machine
     doing the pinging is the authority on itself, and this is a fallback rather
     than a second opinion.
+
+    **Entries are matched to this machine's accounts by account, not by slot
+    name.** Slot names are positional -- they fall out of the order somebody
+    signed in at install time -- so account 1 on the machine that pings can
+    perfectly well be account 2 here, and that is nobody's mistake. What must
+    never happen is the two disagreeing *within* one machine: `which` naming
+    the file's account 1 while `switch 1` moves you to this machine's, which is
+    a different subscription and no error anywhere. The uuid published beside
+    each entry is what makes the mapping possible, and this is what reads it.
+
+    Where nothing can be matched on -- an older file with no uuids, or a
+    machine that has never signed in to anything and so knows no identities --
+    the slot name is used, which is all there ever was. A name is never
+    borrowed from a local account that is demonstrably somebody else.
     """
     if any(read_state(account).get("last_run") for account in accounts):
         return None
@@ -885,6 +907,17 @@ def schedule_view(accounts):
         return None
 
     published, states, avail, now = [], {}, {}, time.time()
+    # Who this machine's accounts are, where it can tell: the sign-in in the
+    # ping directory, or the one parked for switching.
+    mine, identified = {}, set()
+    for account in accounts:
+        uuid_ = (account_identity(account)["account_uuid"]
+                 or account_identity(switch_store(account))["account_uuid"])
+        if uuid_:
+            mine[uuid_] = account
+            identified.add(account.name)
+
+    taken = set()
     for index, entry in enumerate(document["accounts"]):
         if not isinstance(entry, dict) or not entry.get("name"):
             continue
@@ -898,7 +931,38 @@ def schedule_view(accounts):
         name = str(entry["name"])
         if not _NAME_RE.match(name):
             continue
-        account = Account(name, None, index, str(entry.get("label") or "")[:40])
+
+        theirs = entry.get("account_uuid")
+        account = mine.get(theirs) if theirs else None
+        if account is None:
+            local = find_local(accounts, name)
+            if local is None:
+                # An account this machine does not have. Answered for as the
+                # file describes it, under its own name, which is free because
+                # nothing here claims that name.
+                account = Account(name, None, index,
+                                  str(entry.get("label") or "")[:40])
+            elif theirs and local.name in identified:
+                # Positive evidence: the entry says which account it is, this
+                # machine knows which account that name means here, and they
+                # are not the same. Reading it onto the local account would
+                # put one account's window under another's name.
+                continue
+            else:
+                # Nothing contradicts the name -- an older file with no uuids,
+                # or a machine that has never signed in to anything and so
+                # knows no identities. The name is all there ever was.
+                account = local
+        if account.name in taken:
+            continue                     # two entries, one account: keep the first
+        taken.add(account.name)
+        # The name is this machine's -- that is the whole point -- but the
+        # label can be borrowed. Somebody who labelled their accounts on the
+        # machine that pings and took the defaults here should see the name
+        # they chose, not a bare number.
+        if not account.label and entry.get("label"):
+            account = Account(account.name, account.config_dir, account.index,
+                              str(entry["label"])[:40])
         published.append(account)
         states[account.name] = {
             "last_run": entry.get("last_run"),
@@ -3250,7 +3314,6 @@ def switch_only_findings(accounts):
     """
     findings = switch_findings(accounts)
     findings.extend(_stray_unit_findings(accounts))
-    findings.extend(schedule_conflict_findings(accounts))
     if installed_units():
         findings.append(Finding(
             "error",
@@ -3399,7 +3462,6 @@ def doctor(accounts):
 
     findings.extend(unit_cli_findings())
     findings.extend(linger_findings(pings))
-    findings.extend(schedule_conflict_findings(accounts))
     findings.extend(_launcher_findings())
     findings.extend(_user_account_findings(accounts))
     findings.extend(switch_findings(accounts))
@@ -3672,8 +3734,7 @@ def _read_text(path):
         return ""
 
 
-def which(accounts, states=None, avail=None, published_at=None, live=False,
-          conflicts=()):
+def which(accounts, states=None, avail=None, published_at=None, live=False):
     """
     Say which account to use, and why.
 
@@ -3682,9 +3743,7 @@ def which(accounts, states=None, avail=None, published_at=None, live=False,
     machine rather than from this one's own state files — see `schedule_view`.
 
     `live` says whether a live reading was taken before this ran, which decides
-    only one thing: whether to offer one. `conflicts` is what
-    `schedule_name_conflicts` found, said here because this is where advice
-    from a file that names accounts differently actually gets acted on.
+    only one thing: whether to offer one.
     """
     now = time.time()
     states = {a.name: read_state(a) for a in accounts} if states is None \
@@ -3762,12 +3821,6 @@ def which(accounts, states=None, avail=None, published_at=None, live=False,
               "the pings.".format(fmt_delta(now - published_at)))
         print("  Window phases hold whatever the file's age; which accounts are "
               "usable is as old as the file.")
-        for name, mine, theirs in conflicts:
-            print("  WARNING: account {} is {} in that file and {} here."
-                  .format(name, theirs, mine))
-            print("           The advice above is about the file's account; "
-                  "`{} switch {}` would move you to this machine's. Run `{} "
-                  "doctor`.".format(COMMAND, name, COMMAND))
     elif freshest and now - freshest > STALE_AFTER_SEC:
         print()
         print("  These readings are {} old. If that is not expected, check the "
@@ -4680,61 +4733,6 @@ def offer_sign_in(account, store):
         return False
     print()
     return bool(account_identity(store)["has_token"])
-
-
-def schedule_name_conflicts(accounts):
-    """
-    Names the copied schedule uses for a different account than this machine.
-
-    Returns [(name, who it is here, who it is there)], empty when they agree
-    or when there is nothing to compare.
-
-    Slot names are positional, and two machines set up independently order
-    their directories however the person happened to type: one person's
-    account 1 is the other's account 2. Everything then looks right and is
-    wrong -- `which` answers out of the file and names "account 1", and
-    `switch 1` here points at a different subscription entirely. This is the
-    reason the uuid travels in that file at all; nothing was comparing it.
-
-    Silent on the machine doing the pinging, whose schedule.json is its own.
-    """
-    document = read_schedule()
-    if not document:
-        return []
-    conflicts = []
-    for entry in document.get("accounts", []):
-        if not isinstance(entry, dict):
-            continue
-        theirs = entry.get("account_uuid")
-        name = str(entry.get("name") or "")
-        if not theirs or not name:
-            continue
-        for account in accounts:
-            if account.name != name:
-                continue
-            mine = (account_identity(account)["account_uuid"]
-                    or account_identity(switch_store(account))["account_uuid"])
-            if mine and mine != theirs:
-                conflicts.append((
-                    name,
-                    account.known_as() or mine[:8],
-                    str(entry.get("label") or "") or theirs[:8]))
-    return conflicts
-
-
-def schedule_conflict_findings(accounts):
-    """`schedule_name_conflicts` as findings, for `doctor`."""
-    return [Finding(
-        "error",
-        "Account {} is a different Claude account here than in the schedule "
-        "copied here — this machine: {}; that file: {}".format(
-            name, mine, theirs),
-        "Slot names are positional, so the advice out of that file names the "
-        "wrong account on this machine: `{} which` would recommend one account "
-        "and `{} switch {}` would move you to another. Give the same account "
-        "the same name in both machines' accounts.json, and copy the file "
-        "again.".format(COMMAND, COMMAND, name))
-        for name, mine, theirs in schedule_name_conflicts(accounts)]
 
 
 def published_uuid(account):
@@ -6495,10 +6493,7 @@ def cli(argv=None):
             live = True if live is None else live
             if not view and live:
                 refresh_limits(accounts)
-            if view:
-                return which(*view,
-                             conflicts=schedule_name_conflicts(accounts))
-            return which(accounts, live=live)
+            return which(*view) if view else which(accounts, live=live)
         if command == "switch":
             return switch_account(accounts, args.account, sign_in=args.sign_in)
         if command == "log":

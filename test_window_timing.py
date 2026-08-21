@@ -5613,74 +5613,94 @@ def test_a_live_reading_beats_a_cached_one():
         restore()
 
 
-def test_a_copied_schedule_that_means_a_different_account():
+def test_a_copied_schedule_is_matched_by_account_not_by_slot():
     """
-    Slot names are positional, and two machines set up independently order
-    their directories however the person happened to type. One machine's
-    account 1 is the other's account 2 — seen exactly that way on two real
-    machines, with the uuids swapped.
+    Slot names are positional: they fall out of the order somebody signed in
+    at install time, so account 1 on the machine that pings can perfectly well
+    be account 2 here. That is nobody's mistake, and two real machines in one
+    setup had exactly that, uuids swapped.
 
-    Everything then looks right and is wrong: `which` answers out of the copied
-    file and names "account 1", while `switch 1` here points at a different
-    subscription entirely. The uuid travels in that file for this reason and
-    nothing was comparing it.
+    What must never happen is the two disagreeing *within* one machine. Read by
+    slot name, the copied file made `which` recommend "account 1" -- the file's
+    -- while `switch 1` moved you to this machine's account 1, a different
+    subscription, with nothing anywhere reporting a problem. So entries are
+    matched to local accounts by the uuid published beside them, and the names
+    on screen are always this machine's.
     """
-    section("A copied schedule that means a different account")
+    section("A copied schedule is matched by account, not by slot")
     restore, home, accounts = _switch_sandbox(names=("1", "2"))
     try:
         now = time.time()
         # The other machine's file, with the two accounts the other way round.
+        # Its account 1 is this machine's account 2, and its window is the one
+        # about to expire.
         with open(ew.SCHEDULE_FILE, "w") as f:
             json.dump({"written_at": now, "window_hours": 5, "accounts": [
-                {"name": "1", "label": "theirs-one", "account_uuid": "uuid-2",
+                {"name": "1", "label": "theirs-first", "account_uuid": "uuid-2",
                  "tier": "usable", "usable_now": True, "last_run": now - 60,
                  "expires_at": now + 600},
-                {"name": "2", "label": "theirs-two", "account_uuid": "uuid-1",
-                 "tier": "usable", "usable_now": True, "last_run": now - 60,
-                 "expires_at": now + 9000}]}, f)
+                {"name": "2", "label": "theirs-second", "account_uuid": "uuid-1",
+                 "tier": "waiting", "usable_now": False,
+                 "unusable_until": now + 4000,
+                 "unusable_because": "its 5-hour limit is spent",
+                 "last_run": now - 60, "expires_at": now + 9000}]}, f)
 
-        conflicts = ew.schedule_name_conflicts(accounts)
-        check("both names are reported as meaning something else",
-              [name for name, _, _ in conflicts], ["1", "2"])
-        check("named as this machine knows them",
-              [mine for _, mine, _ in conflicts], ["a1", "a2"])
-        check("and as the file knows them",
-              [theirs for _, _, theirs in conflicts],
-              ["theirs-one", "theirs-two"])
+        known, states, avail, _written = ew.schedule_view(accounts)
+        check("the accounts are this machine's, by name",
+              sorted(a.name for a in known), ["1", "2"])
+        check("and by label", sorted(a.display for a in known),
+              ["1 (label1)", "2 (label2)"])
+        # The file's first entry is this machine's account 2, so that is where
+        # its window and its verdict have to land.
+        check("the window from the file lands on the account it belongs to",
+              round(ew.next_expiry(states["2"], now) - now), 600)
+        check("and so does the verdict",
+              [ew.TIER_NAMES[avail[n].tier] for n in ("1", "2")],
+              ["waiting", "usable"])
 
-        findings = ew.schedule_conflict_findings(accounts)
-        check("doctor calls it an error", [f.level for f in findings],
-              ["error", "error"])
-        check_true("saying which command would do the wrong thing",
-                   "switch 1" in findings[0].hint)
-        check_true("and naming both sides of the disagreement",
-                   "this machine: a1" in findings[0].message
-                   and "that file: theirs-one" in findings[0].message)
+        # The invariant: what `which` recommends and what `switch` would move
+        # to are the same account, and it is the one holding that window.
+        chosen, _reason = ew.choose_account(known, states, now, avail)
+        check("the recommendation is a local account", chosen.name, "2")
+        check_true("the same one `switch` would act on",
+                   ew.find_account(accounts, chosen.name) is accounts[1])
+        check("which is the Claude account the file was talking about",
+              ew.account_identity(ew.find_account(accounts,
+                                                  chosen.name))["account_uuid"],
+              "uuid-2")
 
-        # And it is said where the wrong advice is actually delivered.
-        view = ew.schedule_view(accounts)
-        said, _, _ = _capture(lambda: ew.which(*view, conflicts=conflicts))
-        check_true("`which` warns about the file it is answering from",
-                   "WARNING: account 1 is theirs-one in that file and a1 here."
-                   in said)
-        check_true("and points at the command that explains it",
-                   "doctor" in said)
-
-        # A file that agrees says nothing at all.
+        # An account this machine does not have is still answerable, under the
+        # name the file gives it: nothing here claims that name.
         with open(ew.SCHEDULE_FILE, "w") as f:
             json.dump({"written_at": now, "accounts": [
-                {"name": "1", "account_uuid": "uuid-1", "tier": "usable",
+                {"name": "3", "label": "spare", "account_uuid": "uuid-3",
+                 "tier": "usable", "usable_now": True, "last_run": now - 60,
+                 "expires_at": now + 600}]}, f)
+        known = ew.schedule_view(accounts)[0]
+        check("an account only the file knows about is answered for",
+              [a.display for a in known], ["3 (spare)"])
+
+        # But a name this machine uses for somebody else is never borrowed:
+        # that would put one account's window under another's name.
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"written_at": now, "accounts": [
+                {"name": "1", "label": "somebody-else",
+                 "account_uuid": "uuid-9", "tier": "usable",
                  "usable_now": True, "last_run": now - 60,
                  "expires_at": now + 600}]}, f)
-        check("a file that agrees is not a finding",
-              ew.schedule_name_conflicts(accounts), [])
-        # Nor is one that never carried a uuid, from a version before it did.
+        check("a slot name that means somebody else here is not reused",
+              ew.schedule_view(accounts), None)
+
+        # A file written before uuids travelled, or a machine that knows no
+        # identities, still matches on the name -- which is all there was.
         with open(ew.SCHEDULE_FILE, "w") as f:
             json.dump({"written_at": now, "accounts": [
-                {"name": "1", "tier": "usable", "usable_now": True,
+                {"name": "1", "label": "older-file", "usable_now": True,
                  "last_run": now - 60, "expires_at": now + 600}]}, f)
-        check("nor is one that cannot say",
-              ew.schedule_name_conflicts(accounts), [])
+        known, states, _avail, _w = ew.schedule_view(accounts)
+        check("an older file falls back on the slot name",
+              [a.name for a in known], ["1"])
+        check("keeping this machine's label", known[0].display, "1 (label1)")
     finally:
         restore()
 
@@ -7550,7 +7570,7 @@ def main():
                  test_an_interrupted_switch_never_leaves_a_login_in_two_places,
                  test_a_spent_account_is_never_recommended,
                  test_a_live_reading_beats_a_cached_one,
-                 test_a_copied_schedule_that_means_a_different_account,
+                 test_a_copied_schedule_is_matched_by_account_not_by_slot,
                  test_the_schedule_is_treated_as_input_not_configuration,
                  test_the_refusals_fire_where_the_readme_says_to_switch,
                  test_switching_refuses_where_it_cannot_work,

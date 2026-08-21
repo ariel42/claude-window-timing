@@ -295,7 +295,9 @@ That creates no timers, builds no conversations and spends nothing. Copy `schedu
 
 Copy `schedule.json` **before** running the wizard if you can. It is how a machine that pings nothing recognises the account you are already signed in as — and recognising it saves one browser sign-in, because that login parks itself on your first switch instead of needing one of its own. Setup says so if it cannot find the file.
 
-`which` answers from that file alone: no timers, no logins, no network call — a machine that does not ping never reads a limit from Claude, because it has no login of its own to ask with and the pinging machine has already looked. The file carries each window's *phase*, which does not move between windows, so even a days-old copy still names the right account — along with each account's availability, which is the part only the pinging machine can see, and which does age. `which` says how old the file is.
+`which` answers from that file alone: no timers, no logins, no network call — a machine that does not ping never reads a limit from Claude, because it has no login of its own to ask with and the pinging machine has already looked.
+
+**The two machines do not have to number the accounts the same way.** Which account is 1 and which is 2 falls out of the order you signed in at install time, and each machine keeps its own. Every entry in the file carries the account it belongs to, so a copy is read onto *this* machine's accounts by account rather than by slot: the names on screen are the ones this machine uses, and `which` and `switch` can never mean different accounts by the same number. The file carries each window's *phase*, which does not move between windows, so even a days-old copy still names the right account — along with each account's availability, which is the part only the pinging machine can see, and which does age. `which` says how old the file is.
 
 Answering "no pings" on a machine that has been pinging offers to stop its timers, because a second pinger doubles what those accounts consume and buys nothing. `doctor` reports the mismatch until the two agree.
 
