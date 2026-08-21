@@ -158,6 +158,7 @@ class Account(object):
         self.name       = name
         self.index      = index
         self.label      = label
+        self._known_as  = None      # filled in on demand by known_as()
         self.config_dir = os.path.abspath(
             os.path.expanduser(config_dir or ping_config_dir(name)))
 
@@ -249,7 +250,38 @@ class Account(object):
 
     @property
     def display(self):
-        return "{} ({})".format(self.name, self.label) if self.label else self.name
+        """
+        How this account is named on screen: "2 (work)", "2 (aba4000)", or "2".
+
+        The label comes from accounts.json when somebody wrote one there. Most
+        installs never do -- `./install.sh -y` writes none -- and then the
+        account is still perfectly able to say who it is: the sign-in in its
+        own directory carries the email, and so does the login parked for
+        switching. Falling back to that is what keeps two machines in one setup
+        from disagreeing about what the accounts are called merely because one
+        of them was labelled by hand.
+
+        The local part only. It is the half people recognise, it is what
+        somebody labelling by hand writes anyway, and it keeps a column narrow.
+        """
+        label = self.label or self.known_as()
+        return "{} ({})".format(self.name, label) if label else self.name
+
+    def known_as(self):
+        """
+        Who this account is signed in as, as a short name, or "".
+
+        Read once per object: `display` is called in loops that measure column
+        widths, and this reads two small files.
+        """
+        if self._known_as is None:
+            self._known_as = ""
+            for login in (self, switch_store(self)):
+                email = account_identity(login).get("email") or ""
+                if email:
+                    self._known_as = email.split("@")[0]
+                    break
+        return self._known_as
 
     def ensure_state_dir(self):
         secure_dir(STATE_ROOT)
@@ -3218,6 +3250,7 @@ def switch_only_findings(accounts):
     """
     findings = switch_findings(accounts)
     findings.extend(_stray_unit_findings(accounts))
+    findings.extend(schedule_conflict_findings(accounts))
     if installed_units():
         findings.append(Finding(
             "error",
@@ -3366,6 +3399,7 @@ def doctor(accounts):
 
     findings.extend(unit_cli_findings())
     findings.extend(linger_findings(pings))
+    findings.extend(schedule_conflict_findings(accounts))
     findings.extend(_launcher_findings())
     findings.extend(_user_account_findings(accounts))
     findings.extend(switch_findings(accounts))
@@ -3638,7 +3672,8 @@ def _read_text(path):
         return ""
 
 
-def which(accounts, states=None, avail=None, published_at=None, live=False):
+def which(accounts, states=None, avail=None, published_at=None, live=False,
+          conflicts=()):
     """
     Say which account to use, and why.
 
@@ -3647,7 +3682,9 @@ def which(accounts, states=None, avail=None, published_at=None, live=False):
     machine rather than from this one's own state files — see `schedule_view`.
 
     `live` says whether a live reading was taken before this ran, which decides
-    only one thing: whether to offer one.
+    only one thing: whether to offer one. `conflicts` is what
+    `schedule_name_conflicts` found, said here because this is where advice
+    from a file that names accounts differently actually gets acted on.
     """
     now = time.time()
     states = {a.name: read_state(a) for a in accounts} if states is None \
@@ -3725,6 +3762,12 @@ def which(accounts, states=None, avail=None, published_at=None, live=False):
               "the pings.".format(fmt_delta(now - published_at)))
         print("  Window phases hold whatever the file's age; which accounts are "
               "usable is as old as the file.")
+        for name, mine, theirs in conflicts:
+            print("  WARNING: account {} is {} in that file and {} here."
+                  .format(name, theirs, mine))
+            print("           The advice above is about the file's account; "
+                  "`{} switch {}` would move you to this machine's. Run `{} "
+                  "doctor`.".format(COMMAND, name, COMMAND))
     elif freshest and now - freshest > STALE_AFTER_SEC:
         print()
         print("  These readings are {} old. If that is not expected, check the "
@@ -4637,6 +4680,61 @@ def offer_sign_in(account, store):
         return False
     print()
     return bool(account_identity(store)["has_token"])
+
+
+def schedule_name_conflicts(accounts):
+    """
+    Names the copied schedule uses for a different account than this machine.
+
+    Returns [(name, who it is here, who it is there)], empty when they agree
+    or when there is nothing to compare.
+
+    Slot names are positional, and two machines set up independently order
+    their directories however the person happened to type: one person's
+    account 1 is the other's account 2. Everything then looks right and is
+    wrong -- `which` answers out of the file and names "account 1", and
+    `switch 1` here points at a different subscription entirely. This is the
+    reason the uuid travels in that file at all; nothing was comparing it.
+
+    Silent on the machine doing the pinging, whose schedule.json is its own.
+    """
+    document = read_schedule()
+    if not document:
+        return []
+    conflicts = []
+    for entry in document.get("accounts", []):
+        if not isinstance(entry, dict):
+            continue
+        theirs = entry.get("account_uuid")
+        name = str(entry.get("name") or "")
+        if not theirs or not name:
+            continue
+        for account in accounts:
+            if account.name != name:
+                continue
+            mine = (account_identity(account)["account_uuid"]
+                    or account_identity(switch_store(account))["account_uuid"])
+            if mine and mine != theirs:
+                conflicts.append((
+                    name,
+                    account.known_as() or mine[:8],
+                    str(entry.get("label") or "") or theirs[:8]))
+    return conflicts
+
+
+def schedule_conflict_findings(accounts):
+    """`schedule_name_conflicts` as findings, for `doctor`."""
+    return [Finding(
+        "error",
+        "Account {} is a different Claude account here than in the schedule "
+        "copied here — this machine: {}; that file: {}".format(
+            name, mine, theirs),
+        "Slot names are positional, so the advice out of that file names the "
+        "wrong account on this machine: `{} which` would recommend one account "
+        "and `{} switch {}` would move you to another. Give the same account "
+        "the same name in both machines' accounts.json, and copy the file "
+        "again.".format(COMMAND, COMMAND, name))
+        for name, mine, theirs in schedule_name_conflicts(accounts)]
 
 
 def published_uuid(account):
@@ -6397,7 +6495,10 @@ def cli(argv=None):
             live = True if live is None else live
             if not view and live:
                 refresh_limits(accounts)
-            return which(*view) if view else which(accounts, live=live)
+            if view:
+                return which(*view,
+                             conflicts=schedule_name_conflicts(accounts))
+            return which(accounts, live=live)
         if command == "switch":
             return switch_account(accounts, args.account, sign_in=args.sign_in)
         if command == "log":

@@ -5613,6 +5613,78 @@ def test_a_live_reading_beats_a_cached_one():
         restore()
 
 
+def test_a_copied_schedule_that_means_a_different_account():
+    """
+    Slot names are positional, and two machines set up independently order
+    their directories however the person happened to type. One machine's
+    account 1 is the other's account 2 — seen exactly that way on two real
+    machines, with the uuids swapped.
+
+    Everything then looks right and is wrong: `which` answers out of the copied
+    file and names "account 1", while `switch 1` here points at a different
+    subscription entirely. The uuid travels in that file for this reason and
+    nothing was comparing it.
+    """
+    section("A copied schedule that means a different account")
+    restore, home, accounts = _switch_sandbox(names=("1", "2"))
+    try:
+        now = time.time()
+        # The other machine's file, with the two accounts the other way round.
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"written_at": now, "window_hours": 5, "accounts": [
+                {"name": "1", "label": "theirs-one", "account_uuid": "uuid-2",
+                 "tier": "usable", "usable_now": True, "last_run": now - 60,
+                 "expires_at": now + 600},
+                {"name": "2", "label": "theirs-two", "account_uuid": "uuid-1",
+                 "tier": "usable", "usable_now": True, "last_run": now - 60,
+                 "expires_at": now + 9000}]}, f)
+
+        conflicts = ew.schedule_name_conflicts(accounts)
+        check("both names are reported as meaning something else",
+              [name for name, _, _ in conflicts], ["1", "2"])
+        check("named as this machine knows them",
+              [mine for _, mine, _ in conflicts], ["a1", "a2"])
+        check("and as the file knows them",
+              [theirs for _, _, theirs in conflicts],
+              ["theirs-one", "theirs-two"])
+
+        findings = ew.schedule_conflict_findings(accounts)
+        check("doctor calls it an error", [f.level for f in findings],
+              ["error", "error"])
+        check_true("saying which command would do the wrong thing",
+                   "switch 1" in findings[0].hint)
+        check_true("and naming both sides of the disagreement",
+                   "this machine: a1" in findings[0].message
+                   and "that file: theirs-one" in findings[0].message)
+
+        # And it is said where the wrong advice is actually delivered.
+        view = ew.schedule_view(accounts)
+        said, _, _ = _capture(lambda: ew.which(*view, conflicts=conflicts))
+        check_true("`which` warns about the file it is answering from",
+                   "WARNING: account 1 is theirs-one in that file and a1 here."
+                   in said)
+        check_true("and points at the command that explains it",
+                   "doctor" in said)
+
+        # A file that agrees says nothing at all.
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"written_at": now, "accounts": [
+                {"name": "1", "account_uuid": "uuid-1", "tier": "usable",
+                 "usable_now": True, "last_run": now - 60,
+                 "expires_at": now + 600}]}, f)
+        check("a file that agrees is not a finding",
+              ew.schedule_name_conflicts(accounts), [])
+        # Nor is one that never carried a uuid, from a version before it did.
+        with open(ew.SCHEDULE_FILE, "w") as f:
+            json.dump({"written_at": now, "accounts": [
+                {"name": "1", "tier": "usable", "usable_now": True,
+                 "last_run": now - 60, "expires_at": now + 600}]}, f)
+        check("nor is one that cannot say",
+              ew.schedule_name_conflicts(accounts), [])
+    finally:
+        restore()
+
+
 def test_the_schedule_is_treated_as_input_not_configuration():
     """
     `schedule.json` is copied between machines, so it arrives from elsewhere.
@@ -7478,6 +7550,7 @@ def main():
                  test_an_interrupted_switch_never_leaves_a_login_in_two_places,
                  test_a_spent_account_is_never_recommended,
                  test_a_live_reading_beats_a_cached_one,
+                 test_a_copied_schedule_that_means_a_different_account,
                  test_the_schedule_is_treated_as_input_not_configuration,
                  test_the_refusals_fire_where_the_readme_says_to_switch,
                  test_switching_refuses_where_it_cannot_work,
