@@ -3969,6 +3969,39 @@ def test_a_timer_that_will_never_fire_again_is_noticed():
         ew._systemctl = original
 
 
+def test_the_way_out_of_no_path_is_a_command_that_exists():
+    """
+    `doctor` on a fresh clone says `claude-window` is not on your PATH and
+    tells you how to fix it. It named `bin/claude-window` -- which is written
+    by install, is not in the repository, and therefore does not exist at the
+    one moment this advice is printed. Following it gave "No such file or
+    directory", from the command whose job is to hand people a way out.
+    """
+    section("The way out of no PATH is a command that exists")
+    saved = ew.BIN_DIR
+    try:
+        ew.BIN_DIR = tempfile.mkdtemp()      # a checkout that has never installed
+        named = ew.how_to_run().split()[-1]
+        check_true("with no launcher it names the script, which is always there",
+                   os.path.exists(named))
+        # Whichever of the two findings this machine produces -- no launcher
+        # on PATH, or one belonging to another checkout -- both used to point
+        # at bin/claude-window, and neither had any reason to believe it was
+        # there.
+        for finding in ew._launcher_findings():
+            check_true("the advice names something that can be run",
+                       ew.how_to_run() in finding.hint)
+
+        launcher = os.path.join(ew.BIN_DIR, ew.COMMAND)
+        with open(launcher, "w"):
+            pass
+        check("once the launcher exists, that is named instead",
+              ew.how_to_run(), launcher)
+    finally:
+        shutil.rmtree(ew.BIN_DIR, ignore_errors=True)
+        ew.BIN_DIR = saved
+
+
 def test_doctor_notices_a_deployment_going_wrong():
     section("doctor reports what is actually broken")
     ew.STATE_ROOT = tempfile.mkdtemp()
@@ -5120,6 +5153,52 @@ def test_the_shell_scripts_call_commands_that_exist():
     check("and it compiles as a program", broke, "")
     check("using nothing newer than the version it demands",
           [token for token in ('f"', "f'", ":=") if token in snippet], [])
+
+    # A mistyped flag used to be indistinguishable from an unreadable config:
+    # the script tore the units down by name, did *not* do the --purge that
+    # was asked for, and printed "Uninstalled successfully" after argparse had
+    # printed an error. Three false statements on one screen, from the command
+    # whose whole job is to leave the machine as it found it.
+    sandbox = tempfile.mkdtemp()
+    home = os.path.join(sandbox, "home")
+    os.makedirs(os.path.join(home, ".config", "systemd", "user"))
+    for name in ("uninstall.sh", "claude_window_timing.py"):
+        shutil.copy(os.path.join(here, name), sandbox)
+    with open(os.path.join(sandbox, "accounts.json"), "w") as f:
+        json.dump({"accounts": [{"name": "1", "config_dir": "~/.c1"}]}, f)
+    # A systemctl that records being called at all. Nothing should reach it.
+    stub = os.path.join(sandbox, "bin")
+    os.makedirs(stub)
+    for name in ("systemctl", "systemd-run", "loginctl"):
+        path = os.path.join(stub, name)
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\necho \"$@\" >> %s\n"
+                    % os.path.join(sandbox, "calls.txt"))
+        os.chmod(path, 0o755)
+    run = subprocess.run(
+        ["bash", os.path.join(sandbox, "uninstall.sh"), "--purge-all"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        env=dict(os.environ, HOME=home, PATH=stub + os.pathsep + os.environ["PATH"]))
+    check("a mistyped flag is refused, with argparse's own code", run.returncode, 2)
+    check_true("saying plainly that nothing happened",
+               "Nothing was removed" in run.stdout)
+    check_true("and not claiming success",
+               "Uninstalled successfully" not in run.stdout)
+    check_true("having touched no units at all",
+               not os.path.exists(os.path.join(sandbox, "calls.txt")))
+
+    run = subprocess.run(
+        ["bash", os.path.join(sandbox, "uninstall.sh"), "--help"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        env=dict(os.environ, HOME=home, PATH=stub + os.pathsep + os.environ["PATH"]))
+    check("asking what it does succeeds", run.returncode, 0)
+    check_true("and is not itself a way of doing it",
+               "Uninstalled successfully" not in run.stdout)
+    check_true("having touched no units either",
+               not os.path.exists(os.path.join(sandbox, "calls.txt")))
+    shutil.rmtree(sandbox, ignore_errors=True)
 
 
 def test_doctor_spots_residue_from_an_earlier_install():
@@ -8152,6 +8231,7 @@ def main():
                  test_three_accounts_install_and_space_correctly,
                  test_removing_an_account_stops_its_timer,
                  test_a_clean_install_refuses_a_refused_first_message,
+                 test_the_way_out_of_no_path_is_a_command_that_exists,
                  test_doctor_notices_a_deployment_going_wrong,
                  test_a_login_is_never_in_two_places_at_once,
                  test_an_interrupted_switch_never_leaves_a_login_in_two_places,

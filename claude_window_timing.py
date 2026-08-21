@@ -3919,13 +3919,29 @@ def _launcher_findings():
                 COMMAND),
             "It is {}; this one is {}. Whichever you run decides which "
             "checkout's accounts and state you are looking at.".format(
-                path, os.path.join(BIN_DIR, COMMAND)))]
+                path, how_to_run()))]
     return [Finding(
         "warning",
         "`{}` is not on your PATH, so every command here has to be typed "
         "as a path".format(COMMAND),
         "Run `{} install-command`, which offers to link it somewhere your "
-        "shell already looks.".format(os.path.join(BIN_DIR, COMMAND)))]
+        "shell already looks.".format(how_to_run()))]
+
+
+def how_to_run():
+    """
+    How to type this tool from where the reader is standing right now.
+
+    `bin/{}` is written by install and is not in the repository, so on a fresh
+    clone -- which is exactly when the advice below is printed -- naming it
+    gives somebody a path that answers "No such file or directory". The script
+    itself is always there, because they are running it.
+    """.format(COMMAND)
+    launcher = os.path.join(BIN_DIR, COMMAND)
+    if os.path.exists(launcher):
+        return launcher
+    return "{} {}".format(sys.executable or "python3",
+                          os.path.abspath(__file__))
 
 
 def _log_run_counts(account):
