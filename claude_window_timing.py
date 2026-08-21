@@ -2047,6 +2047,62 @@ def probe_is_safe(state, now):
     return bool(recorded) and recorded > now
 
 
+def take_reading(account, login=None, now=None):
+    """
+    Refresh one account's limits from Claude and record them.
+
+    Returns (limits, problem): `limits` is what is stored for the account
+    afterwards -- unchanged when nothing could be read, so a caller always has
+    something to show -- and `problem` a sentence saying why not, or "".
+
+    **Every command that displays a live figure comes through here.** `status`,
+    the bare `claude-window` and `which` reach it through `refresh_limits`;
+    `switch` calls it directly for the one account it just moved to. So the
+    rules about when a reading may be taken at all are written once: never
+    between windows, where a billed request would *start* one at a moment
+    nothing chose, and never twice inside the reuse window, so that putting any
+    of these commands in a prompt or a loop cannot run up a bill.
+
+    `login` is which credential to ask with, and defaults to the account's own
+    ping directory. `switch` passes the login it has just installed instead:
+    on a machine that only switches there is no ping directory, and the
+    credential now in ~/.claude belongs to this very account.
+
+    Recording the failure is part of the job, not the caller's: `doctor` keeps
+    reporting a failed reading after the moment has scrolled by, and a reading
+    that silently falls back to half-hour-old figures is the failure the whole
+    option exists to prevent. Whether to *say* so on the way past is the
+    caller's, because a switch that worked must not end in a paragraph about a
+    status request that did not.
+    """
+    now = time.time() if now is None else now
+    state = read_state(account)
+    stored = state.get("rate_limits") or {}
+    if not probe_is_safe(state, now):
+        return stored, ""
+    if now - (state.get("limits_read_at") or 0) < LIVE_REUSE_SEC:
+        return stored, ""      # already fresh; hand back what is on disk
+
+    limits, problem = read_live_limits(login or account)
+    account.ensure_state_dir()
+    if problem or not limits:
+        problem = problem or "nothing was reported"
+        state["live_problem"] = problem
+        state["live_problem_at"] = now
+        write_state(account, state)
+        return stored, problem
+    state.pop("live_problem", None)
+    state.pop("live_problem_at", None)
+    merged = dict(stored)
+    for key, window in limits.items():
+        merged[key] = dict(merged.get(key) or {}, **window)
+    state["rate_limits"] = merged
+    state["limits_source"] = "live"
+    state["limits_read_at"] = now
+    write_state(account, state)
+    return merged, ""
+
+
 def refresh_limits(accounts):
     """
     Take a live reading for every account it is safe to ask. Returns what it got.
@@ -2059,43 +2115,19 @@ def refresh_limits(accounts):
     machine is not the authority on these accounts either, since `which` and
     `switch` both answer from the schedule the pinging machine published.
     """
-    taken, now = {}, time.time()
+    taken = {}
     if not pings_here():
         return taken
     for account in accounts:
-        state = read_state(account)
-        if not probe_is_safe(state, now):
-            continue
-        # Already fresh: hand back what is on disk rather than asking again.
-        read_at = state.get("limits_read_at") or 0
-        if now - read_at < LIVE_REUSE_SEC:
-            taken[account.name] = state.get("rate_limits") or {}
-            continue
-        limits, problem = read_live_limits(account)
+        limits, problem = take_reading(account)
         if problem:
-            # Loud on the way past, and recorded so `doctor` keeps saying it
-            # after the moment has scrolled by. A live reading that silently
-            # falls back to half-hour-old figures is the failure this whole
-            # option exists to prevent.
+            # Loud on the way past. `take_reading` has already recorded it for
+            # `doctor`; this is the half that belongs to a person watching.
             sys.stderr.write("WARNING: no live reading for account {}: {}\n"
                              .format(account.display, problem))
             log_quietly(account, "WARNING: live reading failed: {}".format(problem))
-            state["live_problem"] = problem
-            state["live_problem_at"] = time.time()
-            account.ensure_state_dir()
-            write_state(account, state)
             continue
-        state.pop("live_problem", None)
-        state.pop("live_problem_at", None)
         taken[account.name] = limits
-        merged = dict(state.get("rate_limits") or {})
-        for key, window in limits.items():
-            merged[key] = dict(merged.get(key) or {}, **window)
-        state["rate_limits"] = merged
-        state["limits_source"] = "live"
-        state["limits_read_at"] = time.time()
-        account.ensure_state_dir()
-        write_state(account, state)
     return taken
 
 
@@ -4805,26 +4837,15 @@ def report_live_usage(account):
     worked must not end in a paragraph about a failed status request -- the
     figures are what `status` is for, and it says how old they are.
     """
-    state = read_state(account)
     now = time.time()
-    # The same rule every other reading obeys: a billed request starts a window
-    # if none is running, and choosing that moment belongs to the anchoring
-    # machinery rather than to a report. In ordinary use a window is always
-    # running -- that is the entire point of this tool -- so this almost never
-    # declines.
-    if not probe_is_safe(state, now):
+    # Through the same door as every other reading, so the rules about when one
+    # may be taken -- not between windows, not twice inside the reuse window --
+    # are obeyed here without being restated. Read with the login this switch
+    # has just installed rather than the account's ping directory, which is a
+    # different login and does not exist at all on a machine that only switches.
+    merged, problem = take_reading(account, login=user_login(), now=now)
+    if problem or not merged:
         return
-    limits, problem = read_live_limits(user_login())
-    if problem or not limits:
-        return
-    merged = dict(state.get("rate_limits") or {})
-    for key, window in limits.items():
-        merged[key] = dict(merged.get(key) or {}, **window)
-    state["rate_limits"] = merged
-    state["limits_source"] = "live"
-    state["limits_read_at"] = now
-    account.ensure_state_dir()
-    write_state(account, state)
 
     five = merged.get("five_hour") or {}
     used, resets = five.get("used_percentage"), five.get("resets_at")

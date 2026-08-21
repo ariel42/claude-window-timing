@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2208,6 +2209,59 @@ def test_what_it_says_in_every_state_it_can_be_in():
           "No account can be used — start with 1")
     check_true("the recommendation points at the command that explains it",
                "doctor" in ew.choose_account([one], {one.name: fresh}, now)[1])
+
+
+def test_every_live_reading_goes_through_one_door():
+    """
+    Four commands show a live figure -- the bare `claude-window`, `status`,
+    `which` and now `switch` -- and the rules about when a reading may be taken
+    are not obvious: never between windows, where a billed request would *start*
+    one at a moment nothing chose, and never twice inside the reuse window, or a
+    command in a shell prompt bills hundreds of requests an hour. A second
+    implementation of that policy is a second chance to get it wrong, and the
+    first version of the `switch` reading was exactly that -- it re-did the
+    merge-and-store and honoured neither rule.
+    """
+    section("Every live reading goes through one door")
+    here = os.path.dirname(os.path.abspath(__file__))
+    source = open(os.path.join(here, "claude_window_timing.py")).read()
+
+    callers = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for call in ast.walk(node):
+            if (isinstance(call, ast.Call)
+                    and getattr(call.func, "id", "") == "read_live_limits"):
+                callers.add(node.name)
+    check("exactly one function asks Claude for a reading",
+          sorted(callers), ["take_reading"])
+
+    # And everything that wants one asks *it*, rather than reaching past it.
+    users = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for call in ast.walk(node):
+            if (isinstance(call, ast.Call)
+                    and getattr(call.func, "id", "") == "take_reading"):
+                users.add(node.name)
+    check("and the commands that show one come through it",
+          sorted(users), ["refresh_limits", "report_live_usage"])
+
+    # The two rules live there and nowhere else, so neither caller can be
+    # written in a way that skips them.
+    door = source[source.index("def take_reading("):
+                  source.index("def refresh_limits(")]
+    check_true("the window rule is stated there", "probe_is_safe" in door)
+    check_true("and so is the reuse rule", "LIVE_REUSE_SEC" in door)
+    for name in ("refresh_limits", "report_live_usage"):
+        start = source.index("def {}(".format(name))
+        body = source[start:source.index("\ndef ", start + 1)]
+        check_true("{} does not restate the window rule".format(name),
+                   "probe_is_safe" not in body)
+        check_true("{} does not restate the reuse rule".format(name),
+                   "LIVE_REUSE_SEC" not in body)
 
 
 def test_a_reading_taken_a_moment_ago_is_not_taken_again():
@@ -7234,6 +7288,83 @@ def test_switching_says_what_it_will_and_will_not_fix():
         restore()
 
 
+def test_parking_never_writes_over_a_login_that_is_already_there():
+    """
+    A store is meant to be empty: a login is parked there on the way out and
+    taken away on the way back. If something else is in it, that something is a
+    login too, and parking writes over it with no copy anywhere -- the exact
+    silent, unrecoverable loss the lock and the backup exist to prevent.
+
+    Guarded twice on purpose: once before anything is written, where refusing
+    costs nothing, and once at the moment of writing, because `park_login` runs
+    last and by then ~/.claude has already changed. Both are checked here. They
+    were both unreachable from the fixtures -- every switch test parks the
+    *other* account, so the outgoing account's store is always empty -- which
+    meant one ordinary "this predicate is written twice" refactor would have
+    removed the protection with the suite still green.
+    """
+    section("Parking never writes over a login already there")
+
+    def occupied_store():
+        """Signed in as 1, and 1's own store already holding a *different*
+        login -- what signing in to a store by hand while on that account
+        leaves behind."""
+        restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                                  parked=("1", "2"))
+        return restore, accounts
+
+    restore, accounts = occupied_store()
+    try:
+        store = ew.switch_store(accounts[0])
+        before = ew.login_fingerprint(store)
+        mine = ew.login_fingerprint(ew.user_login())
+        check_true("the fixture really is the dangerous one",
+                   before and mine and before != mine)
+
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("the switch refuses", code, 1)
+        check_true("saying which store is occupied and why it matters",
+                   "already holds a different login" in err
+                   and "nothing else has a copy" in err)
+        check_true("and that nothing was changed", "Nothing was changed" in err)
+        check("the login in the way is untouched",
+              ew.login_fingerprint(store), before)
+        check("and so is the one that was in use",
+              ew.login_fingerprint(ew.user_login()), mine)
+        check("nobody was moved", ew.current_account(accounts).name, "1")
+    finally:
+        restore()
+
+    # The second guard, on its own: reached only once the first has been
+    # removed, which is what a refactor that de-duplicates them would do.
+    restore, accounts = occupied_store()
+    try:
+        store = ew.switch_store(accounts[0])
+        before = ew.login_fingerprint(store)
+        taken = ew.take_login()
+        raised = ""
+        try:
+            ew.park_login(accounts[0], taken)
+        except ew.ConfigError as e:
+            raised = str(e)
+        check_true("parking on top of a login refuses in its own right",
+                   "already holds a different login" in raised)
+        check("leaving what was there exactly as it was",
+              ew.login_fingerprint(store), before)
+
+        # And parking the *same* login back where it came from is not a
+        # conflict -- that is an ordinary repeat, and refusing it would break
+        # re-running a switch that half happened.
+        again = (open(ew.credentials_path(store)).read(),
+                 {"accountUuid": "uuid-1"})
+        ew.park_login(accounts[0], again)
+        check("re-parking the same login is allowed",
+              ew.login_fingerprint(store), before)
+    finally:
+        restore()
+
+
 def test_a_switch_says_what_the_account_it_moved_to_actually_has_left():
     """
     The reason to switch is that the account you are on is spent, so the first
@@ -8603,6 +8734,7 @@ def main():
                  test_a_login_that_stopped_working_is_reported,
                  test_the_account_it_recommends_says_how_much_is_left,
                  test_what_it_says_in_every_state_it_can_be_in,
+                 test_every_live_reading_goes_through_one_door,
                  test_a_reading_taken_a_moment_ago_is_not_taken_again,
                  test_the_age_of_the_figures_is_never_overstated,
                  test_one_usage_figure_reaches_every_surface_unchanged,
@@ -8654,6 +8786,7 @@ def main():
                  test_the_token_and_the_identity_move_together,
                  test_switching_refuses_what_cannot_possibly_work,
                  test_switching_says_what_it_will_and_will_not_fix,
+                 test_parking_never_writes_over_a_login_that_is_already_there,
                  test_a_switch_says_what_the_account_it_moved_to_actually_has_left,
                  test_a_switch_killed_between_its_two_writes_is_finished_not_believed,
                  test_switching_with_no_account_named_follows_which,
@@ -8678,7 +8811,22 @@ def main():
                  test_doctor_catches_a_machine_pinging_when_it_says_it_does_not,
                  test_setup_names_an_account_it_is_about_to_drop,
                  test_setup_says_the_pings_belong_on_one_machine):
-        test()
+        # A test that raises is a failure, not the end of the run. This was a
+        # bare `test()`, so one unexpected exception -- a machine without
+        # `systemctl`, a tool this suite assumes is installed -- aborted
+        # everything after it. On a minimal PATH that happened a third of the
+        # way in, and 38 test functions never ran, including every one about
+        # credentials. The run then looked like a crash in the tool rather than
+        # a missing prerequisite, and the checks that never executed were
+        # indistinguishable from checks that passed.
+        try:
+            test()
+        except Exception as exc:                              # noqa: BLE001
+            FAILURES.append("{} raised {}: {}".format(
+                test.__name__, type(exc).__name__, exc))
+            print("  ERROR  {} raised {}: {}".format(
+                test.__name__, type(exc).__name__, exc))
+            traceback.print_exc()
     # Nothing armed on the way out, whatever a test did or failed to do.
     for name in (TEST_PREFIX, TEST_PREFIX + "-a", TEST_PREFIX + "-b"):
         ew.cancel_anchor(ew.Account(name, "/tmp/nonexistent", 0))
