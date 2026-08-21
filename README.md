@@ -61,13 +61,13 @@ claude-window which
 
 ```
 Use account 1 (personal)
-  the only account usable right now; its window ends 2026-08-13 03:52:35 (in 4h00m00s)
+  the only account usable right now; its window ends 2026-08-13 03:52:35 IDT (in 4h00m00s)
   That is the window to spend; how you use the account is up to you.
   Point your own Claude Code at it:  claude-window switch 1
 
   1 (personal)  usable — window ends in 4h00m00s   <- use this
-  2 (work)      unusable until 2026-08-13 01:22:35 — its 5-hour limit is spent
-  3 (spare)     unusable until 2026-08-14 23:52:35 — its weekly limit is spent
+  2 (work)      unusable until 2026-08-13 01:22:35 IDT — its 5-hour limit is spent
+  3 (spare)     unusable until 2026-08-14 23:52:35 IDT — its weekly limit is spent
 
   Figures from a live reading, 0h00m02s ago.
 ```
@@ -180,7 +180,7 @@ Claude Code Window Timing — status
 ==================================
 
 Use account 2 (work)
-  its window ends first, 2026-08-11 13:00:00 (in 1h21m29s)
+  its window ends first, 2026-08-11 13:00:00 IDT (in 1h21m29s)
 
 Your Claude Code  : account 1 (personal)
                     `claude-window switch` moves it to account 2 (work)
@@ -188,10 +188,10 @@ Your Claude Code  : account 1 (personal)
 Account 1 (personal)
   Config dir    : /home/you/.claude-1
   Checkpoint    : 6f1c47a9-2d40-4e5b-9a7c-1b3e8d05f2aa
-  Last ping     : 2026-08-11 11:37:26 (0h01m05s ago)
-  5-hour window : 82% used, resets 2026-08-11 15:30:00 (in 3h51m29s)
-  Weekly limit  : 17% used, resets 2026-08-17 10:00:00 (in 142h21m29s)
-  Next start-of-window opportunity: 2026-08-11 15:30:00 (in 3h51m29s)
+  Last ping     : 2026-08-11 11:37:26 IDT (0h01m05s ago)
+  5-hour window : 82% used, resets 2026-08-11 15:30:00 IDT (in 3h51m29s)
+  Weekly limit  : 17% used, resets 2026-08-17 10:00:00 IDT (in 142h21m29s)
+  Next start-of-window opportunity: 2026-08-11 15:30:00 IDT (in 3h51m29s)
     set by the 5-hour window   [via statusline]
   Anchor        : none scheduled
   Next ping     : Tue 2026-08-11 12:07:13 IDT
@@ -201,8 +201,8 @@ Account 2 (work)
 
 Spacing
   Windows should sit 2h30m00s apart.
-    account 1 (personal) next window starts 2026-08-11 15:30:00
-    account 2 (work)     next window starts 2026-08-11 13:00:00
+    account 1 (personal) next window starts 2026-08-11 15:30:00 IDT
+    account 2 (work)     next window starts 2026-08-11 13:00:00 IDT
   Spacing is correct.
 ```
 
@@ -220,7 +220,7 @@ Every run is logged, so the log doubles as a record of your usage through the da
 
 ```
 [2026-08-11 11:37:26] Turn confirmed: cache_read=6864 cache_write=0 in=10 out=54
-[2026-08-11 11:37:26] Usage: 5-hour 82% (resets 2026-08-11 15:30:00, in 3h51m29s) · weekly 17% (resets 2026-08-17 10:00:00, in 142h21m29s)
+[2026-08-11 11:37:26] Usage: 5-hour 82% (resets 2026-08-11 15:30:00 IDT, in 3h51m29s) · weekly 17% (resets 2026-08-17 10:00:00 IDT, in 142h21m29s)
 ```
 
 ## Staying on schedule
@@ -264,8 +264,8 @@ The difference is not cosmetic. Three accounts with one out of action, counted a
 ```
 Spacing
   Windows should sit 2h30m00s apart — 2 of 3 accounts are holding a window.
-    account 1 (personal) next window starts 2026-08-13 01:52:35
-    account 2 (work)     next window starts 2026-08-13 04:22:35
+    account 1 (personal) next window starts 2026-08-13 01:52:35 IDT
+    account 2 (work)     next window starts 2026-08-13 04:22:35 IDT
     account 3 (spare)    not holding a window right now — its weekly limit is spent,
                          which outlasts its current window
   Spacing is correct.

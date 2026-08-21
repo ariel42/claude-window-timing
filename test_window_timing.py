@@ -607,6 +607,44 @@ def test_without_systemd():
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
+def test_a_time_says_which_clock_it_is_on():
+    """
+    A setup has more than one machine in it, and the whole point is that they
+    are watching the same windows. One in Jerusalem and one in UTC printing
+    "13:00:00" and "10:00:00" for the identical instant is correct, and reads
+    as a disagreement: the countdown beside each says the same thing, but only
+    if you know to compare those two lines rather than the two clocks.
+
+    So every moment this tool prints says which clock it is on.
+    """
+    section("A time says which clock it is on")
+    epoch = 1786800000
+    saved = os.environ.get("TZ")
+    try:
+        for zone, expected in (("Etc/UTC", "2026-08-15 13:20:00 UTC"),
+                               ("Asia/Jerusalem", "2026-08-15 16:20:00 IDT"),
+                               ("America/New_York", "2026-08-15 09:20:00 EDT")):
+            os.environ["TZ"] = zone
+            time.tzset()
+            check("in {} it reads {}".format(zone, expected),
+                  ew.fmt_time(epoch), expected)
+        # The same instant, whichever machine is looking: the countdown is
+        # what makes two machines comparable, and it does not move.
+        deltas = []
+        for zone in ("Etc/UTC", "Asia/Jerusalem"):
+            os.environ["TZ"] = zone
+            time.tzset()
+            deltas.append(ew.fmt_delta(epoch - 1786700000))
+        check("and the countdown to it is the same on both", deltas[0],
+              deltas[1])
+    finally:
+        if saved is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = saved
+        time.tzset()
+
+
 def test_formatting():
     section("Formatting")
     check("a positive delta", ew.fmt_delta(3661), "1h01m01s")
@@ -7625,6 +7663,7 @@ def main():
                  test_schedule_carries_account_identity,
                  test_the_status_line_writes_only_where_it_was_told,
                  test_resume_baseline_race, test_without_systemd, test_formatting,
+                 test_a_time_says_which_clock_it_is_on,
                  test_usage_line, test_init_refuses_to_checkpoint_a_refusal,
                  test_pty_drain_tolerates_a_departed_child,
                  test_run_interactive_survives_an_immediate_exit,

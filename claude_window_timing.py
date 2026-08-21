@@ -1704,7 +1704,19 @@ def write_state(account, state):
 
 
 def fmt_time(epoch):
-    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+    """
+    A moment, in this machine's own local time, and said to be.
+
+    With the zone, because a setup has more than one machine in it and the
+    whole point is that they are looking at the same windows. One in Jerusalem
+    and one in UTC printing "13:00:00" and "10:00:00" for the identical instant
+    is correct and reads as a disagreement — the countdown beside it says
+    2h19m48s on both, but only if you compare the right two lines.
+
+    `astimezone()` because a naive datetime formats %Z as nothing at all.
+    """
+    return datetime.fromtimestamp(epoch).astimezone().strftime(
+        "%Y-%m-%d %H:%M:%S %Z")
 
 
 def fmt_delta(seconds):
