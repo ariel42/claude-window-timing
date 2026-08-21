@@ -933,6 +933,13 @@ def note_foreign_pinger(document, now):
     the moment that machine starts pinging it overwrites the copy with its
     own. So the sighting is taken here, in the instant before the overwrite,
     and kept -- otherwise it lasts thirty minutes and nobody is looking.
+
+    What this cannot see: two installs that have never exchanged a file. There
+    is nothing shared between them to compare -- no server-side marker, no
+    common directory -- so the only evidence a second pinger ever leaves on
+    this machine is a schedule.json somebody copied here. That is the normal
+    way a second machine is set up, which is why the check is worth having;
+    it is not a guarantee, and the README says so rather than implying one.
     """
     theirs = (document or {}).get("pinged_by")
     if not theirs or theirs == machine_id():

@@ -19,7 +19,7 @@ Two things to decide before you run anything, because both are easier to weigh n
 
 **This sends automated requests to your subscription, around the clock.** One saved line per account every 30 minutes, day and night, whether or not you are at the machine — roughly 340 requests per account per week. Anthropic's [consumer terms](https://www.anthropic.com/legal/consumer-terms) address reaching the service by automated means, and Anthropic also ships Claude Code for scripted and headless use; the pings create no capacity, exceed no limit and ask for nothing extra. Where that leaves you is a judgement this tool cannot make for you. **Read the terms and decide.** If you would rather not, there is nothing here for you, and that is a reasonable conclusion.
 
-**The pings belong on exactly one machine.** A second machine pinging the same accounts doubles what they consume and buys nothing at all. Install with `./install.sh --no-pings` everywhere else — those machines can still switch accounts and read the figures. If it happens anyway, `claude-window doctor` now notices and says which machine.
+**The pings belong on exactly one machine.** A second machine pinging the same accounts doubles what they consume and buys nothing at all. Install with `./install.sh --no-pings` everywhere else — those machines can still switch accounts and read the figures. If it happens anyway, `claude-window doctor` notices and names the machine — provided the two have exchanged a `schedule.json`, which is the normal way a second machine is set up. Two installs that have never seen each other's files have nothing to compare, and nothing here can see the other one; that case is yours to keep track of.
 
 ---
 
