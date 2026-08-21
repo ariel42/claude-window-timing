@@ -5690,6 +5690,36 @@ def prepare_store(store):
                       _existing_mode(store.config_json))
 
 
+def should_offer_sign_in(sign_in, store, findings):
+    """
+    Whether to offer the browser sign-in this switch is missing.
+
+    Five conditions, all of which have to hold, and each of which is here for
+    a different reason:
+
+      * it was asked for -- `--no-sign-in` exists so a script can be sure this
+        never blocks on a browser;
+      * there is no login parked already, or there is nothing to offer;
+      * nothing *else* is wrong. Offering first meant a full browser round
+        trip could still end in "Nothing was changed" over a condition that
+        was knowable before it started. The missing login is excluded from
+        that check, because it is the very thing being offered;
+      * somebody is there to answer;
+      * and they did not pass --yes, which means "do not ask me things", not
+        "sign me in".
+
+    Its own function because as an inline condition nothing could reach it:
+    every clause survived being inverted with the suite still green.
+    """
+    if not sign_in or os.path.exists(credentials_path(store)):
+        return False
+    blocking = [f for f in findings if f.level == "error"
+                and "No login is parked" not in f.message]
+    if blocking:
+        return False
+    return _stdin_is_interactive() and not ASSUME_YES
+
+
 def offer_sign_in(account, store):
     """
     Offer to run the one browser sign-in this switch is missing. True if done.
@@ -6012,13 +6042,7 @@ def switch_account(accounts, name=None, sign_in=True):
     store = switch_store(account)
     findings = switch_blockers(account, avail.get(account.name))
 
-    # The sign-in is offered only once everything else has passed. Offering it
-    # first meant a full browser round-trip could end in "Nothing was changed"
-    # because of a condition that was already knowable.
-    if (sign_in and not os.path.exists(credentials_path(store))
-            and not [f for f in findings if f.level == "error"
-                     and "No login is parked" not in f.message]
-            and sys.stdin.isatty() and not ASSUME_YES):
+    if should_offer_sign_in(sign_in, store, findings):
         offer_sign_in(account, store)
         findings = switch_blockers(account, avail.get(account.name))
     errors = [f for f in findings if f.level == "error"]

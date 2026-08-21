@@ -9553,6 +9553,266 @@ def test_a_purge_says_what_it_costs_before_it_takes_it():
         ew.ASSUME_YES, ew._stdin_is_interactive, sys.stdin = saved
 
 
+
+def test_the_sign_in_a_switch_offers_is_the_one_place_a_login_is_made():
+    """
+    `offer_sign_in` is 41 lines on the credential path and had no test at all,
+    and the five-clause gate in front of it survived every mutation -- so any
+    one of those clauses could have been inverted and nothing would have
+    failed. It is the one place this tool creates a login rather than moving
+    one, and getting it wrong either wastes a browser round-trip or, worse,
+    sends somebody off to copy a credential by hand, which is the single
+    mistake that costs a login.
+    """
+    section("The sign-in a switch offers")
+    root = tempfile.mkdtemp()
+    saved = (ew.SWITCH_ROOT, ew.CLAUDE_PATH, ew.ASSUME_YES,
+             ew._stdin_is_interactive, sys.stdin)
+    try:
+        ew.SWITCH_ROOT = os.path.join(root, "switch")
+        account = ew.Account("1", os.path.join(root, "cfg1"), 0)
+        store = ew.switch_store(account)
+
+        # -- prepare_store: a fresh directory a person can meet /login in ----
+        ew.prepare_store(store)
+        check_true("the store directory exists", os.path.isdir(store.config_dir))
+        check("and is not readable by anyone else",
+              stat.S_IMODE(os.stat(store.config_dir).st_mode), 0o700)
+        check("nor is the root it sits in",
+              stat.S_IMODE(os.stat(ew.SWITCH_ROOT).st_mode), 0o700)
+        config = json.load(open(store.config_json))
+        check_true("onboarding is already answered",
+                   config.get("hasCompletedOnboarding") is True)
+        check_true("and the directory is trusted, so no prompt stands in the way",
+                   config["projects"][store.config_dir]["hasTrustDialogAccepted"]
+                   is True)
+
+        # Re-running must not discard an identity that is already there.
+        config["oauthAccount"] = {"accountUuid": "u1"}
+        with open(store.config_json, "w") as f:
+            json.dump(config, f)
+        ew.prepare_store(store)
+        check("re-preparing keeps the identity already in the file",
+              json.load(open(store.config_json))["oauthAccount"]["accountUuid"],
+              "u1")
+
+        # A file that cannot be parsed is not overwritten. It is the account's
+        # identity, and there is no second copy.
+        with open(store.config_json, "w") as f:
+            f.write("{ not json")
+        refused = None
+        try:
+            ew.prepare_store(store)
+        except ew.ConfigError as e:
+            refused = e
+        check_true("an unparseable config is refused, not replaced",
+                   refused is not None)
+        check_true("saying which file", store.config_json in str(refused))
+        os.remove(store.config_json)
+
+        # -- offer_sign_in: declining is free, and says so ------------------
+        ew._stdin_is_interactive = lambda: True
+        ew.ASSUME_YES = False
+        sys.stdin = _Answers("n\n")
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            done = ew.offer_sign_in(account, store)
+        finally:
+            sys.stdout = out
+        said = buf.getvalue()
+        check("declining does nothing", done, False)
+        check_true("and it explained why a copy is the wrong answer",
+                   "eight hours" in said and "own sign-in" in said)
+        check_true("and nothing was started",
+                   not os.path.exists(ew.credentials_path(store)))
+
+        # -- agreeing runs Claude Code in the store, and only there ---------
+        seen = {}
+
+        def fake_call(argv, env=None, cwd=None):
+            seen["argv"], seen["env"], seen["cwd"] = argv, env, cwd
+            with open(ew.credentials_path(store), "w") as f:
+                json.dump({"claudeAiOauth": {"accessToken": "t"}}, f)
+            with open(store.config_json, "w") as f:
+                json.dump({"oauthAccount": {"accountUuid": "u9"}}, f)
+            return 0
+
+        real_call = ew.subprocess.call
+        ew.subprocess.call = fake_call
+        sys.stdin = _Answers("y\n")
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            done = ew.offer_sign_in(account, store)
+        finally:
+            sys.stdout = out
+            ew.subprocess.call = real_call
+        check("agreeing reports a login was made", done, True)
+        check("Claude Code was pointed at the store, not at ~/.claude",
+              seen["env"]["CLAUDE_CONFIG_DIR"], store.config_dir)
+        check("and started there", seen["cwd"], store.config_dir)
+        for var in ew._ACCOUNT_OVERRIDE_VARS:
+            check_true("{} cannot outrank the login being made".format(var),
+                       var not in seen["env"])
+
+        # A run that made no login is not reported as one.
+        os.remove(ew.credentials_path(store))
+        ew.subprocess.call = lambda *a, **k: 0
+        sys.stdin = _Answers("y\n")
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            done = ew.offer_sign_in(account, store)
+        finally:
+            sys.stdout = out
+            ew.subprocess.call = real_call
+        check("a sign-in that did not happen is not claimed", done, False)
+
+        # And a Claude Code that will not start is a sentence.
+        def explode(*a, **k):
+            raise OSError(2, "No such file or directory")
+
+        ew.subprocess.call = explode
+        sys.stdin = _Answers("y\n")
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            done = ew.offer_sign_in(account, store)
+        finally:
+            sys.stdout = out
+            ew.subprocess.call = real_call
+        check("a CLI that will not start is not a traceback", done, False)
+        check_true("and says what happened",
+                   "Could not start Claude Code" in buf.getvalue())
+    finally:
+        (ew.SWITCH_ROOT, ew.CLAUDE_PATH, ew.ASSUME_YES,
+         ew._stdin_is_interactive, sys.stdin) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+
+def test_every_condition_on_offering_a_sign_in_is_load_bearing():
+    """
+    Five clauses decide whether a switch offers the browser sign-in, and as an
+    inline condition every one of them could be inverted with the whole suite
+    still green. Each is checked here on its own, by making it the only thing
+    that is wrong.
+    """
+    section("Every condition on offering a sign-in")
+    root = tempfile.mkdtemp()
+    saved = (ew.SWITCH_ROOT, ew.ASSUME_YES, ew._stdin_is_interactive)
+    try:
+        ew.SWITCH_ROOT = os.path.join(root, "switch")
+        account = ew.Account("1", os.path.join(root, "cfg1"), 0)
+        store = ew.switch_store(account)
+        os.makedirs(store.config_dir, 0o700)
+        missing = ew.Finding("error", "No login is parked for account 1", "…")
+
+        ew.ASSUME_YES = False
+        ew._stdin_is_interactive = lambda: True
+        check("with everything in place, it is offered",
+              ew.should_offer_sign_in(True, store, [missing]), True)
+        check("and with no findings at all",
+              ew.should_offer_sign_in(True, store, []), True)
+
+        check("--no-sign-in means never ask",
+              ew.should_offer_sign_in(False, store, [missing]), False)
+
+        with open(ew.credentials_path(store), "w") as f:
+            f.write("{}")
+        check("a login already parked leaves nothing to offer",
+              ew.should_offer_sign_in(True, store, [missing]), False)
+        os.remove(ew.credentials_path(store))
+
+        other = ew.Finding("error", "Account 1's window is spent", "…")
+        check("something else already wrong means the round trip is wasted",
+              ew.should_offer_sign_in(True, store, [missing, other]), False)
+        check("a warning is not something else wrong",
+              ew.should_offer_sign_in(
+                  True, store,
+                  [missing, ew.Finding("warning", "something minor", "…")]),
+              True)
+
+        ew._stdin_is_interactive = lambda: False
+        check("nobody there means nobody to ask",
+              ew.should_offer_sign_in(True, store, [missing]), False)
+
+        ew._stdin_is_interactive = lambda: True
+        ew.ASSUME_YES = True
+        check("--yes means do not ask me things, not sign me in",
+              ew.should_offer_sign_in(True, store, [missing]), False)
+    finally:
+        ew.SWITCH_ROOT, ew.ASSUME_YES, ew._stdin_is_interactive = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_the_verdict_the_schedule_publishes_is_the_one_it_holds():
+    """
+    A second machine cannot observe a lapsed subscription or a spent weekly
+    limit, so the verdict travels in the file with the numbers. `usable_now`
+    could be inverted with nothing failing -- which would have every other
+    machine in the setup recommending exactly the accounts that cannot serve
+    a request.
+    """
+    section("The verdict the schedule publishes")
+    root = tempfile.mkdtemp()
+    saved = (ew.STATE_ROOT, ew.SCHEDULE_FILE)
+    ew.STATE_ROOT = os.path.join(root, "state")
+    ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
+    now = time.time()
+    try:
+        accounts = [ew.Account("1", os.path.join(root, "c1"), 0),
+                    ew.Account("2", os.path.join(root, "c2"), 1)]
+        for account in accounts:
+            account.ensure_state_dir()
+            os.makedirs(account.config_dir, 0o700)
+            with open(account.config_json, "w") as f:
+                json.dump({"oauthAccount": {
+                    "accountUuid": "u" + account.name,
+                    "emailAddress": account.name + "@x"}}, f)
+            with open(ew.credentials_path(account), "w") as f:
+                json.dump({"claudeAiOauth": {
+                    "accessToken": "t", "subscriptionType": "max",
+                    "rateLimitTier": "default_claude_ai",
+                    "refreshTokenExpiresAt":
+                        int((time.time() + 90 * 86400) * 1000)}}, f)
+
+        # One usable, one plainly spent.
+        ew.write_state(accounts[0], {"rate_limits": {"five_hour": {
+            "used_percentage": 10, "resets_at": now + 3600}}})
+        ew.write_state(accounts[1], {"rate_limits": {"five_hour": {
+            "used_percentage": 100, "resets_at": now + 7200}}})
+
+        ew.publish_schedule(accounts)
+        published = {e["name"]: e
+                     for e in json.load(open(ew.SCHEDULE_FILE))["accounts"]}
+
+        for account in accounts:
+            state = ew.read_state(account)
+            here = ew.account_availability(account, state, now)
+            check("account {}'s verdict travels as this machine holds "
+                  "it".format(account.name),
+                  published[account.name]["usable_now"],
+                  here.tier == ew.USABLE)
+            check("and so does the tier it came from",
+                  published[account.name]["tier"], ew.TIER_NAMES[here.tier])
+
+        check_true("the spent one is published as unusable",
+                   published["2"]["usable_now"] is False)
+        check_true("and the other is not",
+                   published["1"]["usable_now"] is True)
+        check_true("the two do not agree, so an inversion cannot hide",
+                   published["1"]["usable_now"] != published["2"]["usable_now"])
+
+        # The percentage travels unchanged: a second machine repeats it.
+        check("the figure published is the figure held",
+              published["2"]["used_percentage"], 100)
+    finally:
+        ew.STATE_ROOT, ew.SCHEDULE_FILE = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     # Every path the tool reads or writes is redirected into one disposable
     # directory before a single test runs.
@@ -9568,6 +9828,12 @@ def main():
     # Defaulting everything to a sandbox means forgetting is safe. A test that
     # wants the real thing has to say so.
     suite_root = tempfile.mkdtemp(prefix="window-timing-tests-")
+    # Every mkdtemp() a test makes lands inside the suite's own directory from
+    # here on, so the run cleans up after itself in one go. Individual tests
+    # tidy up where they can, but around sixty directories a run were being
+    # left in /tmp -- a few megabytes each time, for ever, on a machine
+    # somebody runs this on twenty times an afternoon.
+    tempfile.tempdir = suite_root
     home = os.path.join(suite_root, "home")
     # Including HOME itself. Anything derived from it -- a ping directory, a
     # switch store, the bin directories a launcher can be linked into -- then
@@ -9667,6 +9933,9 @@ def main():
                  test_an_anchor_that_could_not_be_booked_is_not_silent,
                  test_setup_says_up_front_what_it_cannot_do_here,
                  test_a_purge_says_what_it_costs_before_it_takes_it,
+                 test_the_sign_in_a_switch_offers_is_the_one_place_a_login_is_made,
+                 test_every_condition_on_offering_a_sign_in_is_load_bearing,
+                 test_the_verdict_the_schedule_publishes_is_the_one_it_holds,
                  test_nothing_touches_the_users_own_directory,
                  test_a_clean_install_from_nothing,
                  test_install_uninstall_purge_and_install_again,
@@ -9762,6 +10031,10 @@ def main():
         unit = line.split()[0] if line.split() else ""
         if unit.startswith("claude-window-timing@" + TEST_PREFIX):
             ew._systemctl("reset-failed", unit)
+
+    # One directory to remove, because everything went inside it.
+    tempfile.tempdir = None
+    shutil.rmtree(suite_root, ignore_errors=True)
 
     print("\n{}".format("-" * 60))
     if FAILURES:
