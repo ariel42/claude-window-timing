@@ -4538,6 +4538,37 @@ def test_doctor_notices_a_deployment_going_wrong():
     check_true("a config directory with no credentials is an error",
                any("not signed in" in m for m in findings))
 
+    # Expired and expiring are different sentences, and the warning had no
+    # lower bound: it said "expires <a date three days ago>. Sign in again
+    # before then" -- present tense about the past, and an instruction nobody
+    # can follow -- directly beneath the error reporting the same login.
+    for offset, want, unwanted in ((-3 * 86400, "expired", "before then"),
+                                   (2 * 86400, "expires", "")):
+        with open(account.config_json, "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": "u"}}, f)
+        with open(os.path.join(account.config_dir, ".credentials.json"),
+                  "w") as f:
+            json.dump({"claudeAiOauth": {
+                "accessToken": "t", "refreshToken": "r",
+                "subscriptionType": "pro",
+                "refreshTokenExpiresAt": int(
+                    (time.time() + offset) * 1000)}}, f)
+        said = [(f.level, f.message, f.hint or "")
+                for f in ew.validate_accounts([account])
+                if "expire" in f.message]
+        check("a login {} days out is reported once".format(offset // 86400),
+              len(said), 1)
+        level, message, hint = said[0]
+        check_true("in the tense that matches ({})".format(want),
+                   want in message)
+        check("an expired one is an error, a live one a warning",
+              level, "error" if offset < 0 else "warning")
+        if unwanted:
+            check_true("with no advice that cannot be followed",
+                       unwanted not in hint)
+    os.remove(account.config_json)
+    os.remove(os.path.join(account.config_dir, ".credentials.json"))
+
 
 # ---------------------------------------------------------------------------
 # A whole install, from nothing
@@ -4798,6 +4829,27 @@ def test_a_clean_install_from_nothing():
                os.path.exists(os.path.join(units, "claude-window-timing@.service")))
     body = open(os.path.join(units, "claude-window-timing@.service")).read()
     check_true("and runs an explicit ping subcommand", "ping %i" in body)
+
+    # The timer template's *content*, not merely the service's. Only the
+    # service body was ever opened, so `install_units` could have written an
+    # empty `claude-window-timing@.timer` and every check here would still have
+    # passed -- with no ping ever firing again, on any account, silently.
+    timer_template = os.path.join(units, "claude-window-timing@.timer")
+    check_true("the timer template is written too",
+               os.path.exists(timer_template))
+    timer = open(timer_template).read()
+    check_true("it repeats at the interval the tool is built around",
+               "OnUnitActiveSec={}min".format(ew.INTERVAL_MIN) in timer)
+    check_true("it starts firing shortly after it is enabled",
+               "OnActiveSec=" in timer)
+    check_true("it is tightened past systemd's default minute of slack",
+               "AccuracySec=1s" in timer)
+    check_true("it catches up after the machine was off",
+               "Persistent=true" in timer)
+    check_true("and it is something `systemctl enable` can install",
+               "[Install]" in timer and "WantedBy=timers.target" in timer)
+    check_true("the manager is told to re-read the files just written",
+               ["systemctl", "daemon-reload"] in [c[:2] for c in calls])
     check_true("the second account is staggered so they do not collide",
                os.path.exists(os.path.join(
                    units, "claude-window-timing@2.timer.d", "stagger.conf")))
@@ -7288,6 +7340,43 @@ def test_switching_says_what_it_will_and_will_not_fix():
         restore()
 
 
+def test_what_a_switch_says_reads_in_order_when_it_is_redirected():
+    """
+    `switch` writes errors to stderr and warnings to stdout. stdout is
+    block-buffered whenever it is not a terminal, and stderr never is -- so
+    redirected to a file or a pipe the two came out interleaved wrongly:
+    "Nothing was changed." landed in the middle of the list, with a warning
+    after it, reading as something that happened next. Anyone piping to `tee`,
+    running in CI, or capturing a session for a bug report saw that.
+    """
+    section("What a switch says reads in order when redirected")
+    sandbox = tempfile.mkdtemp()
+    home = os.path.join(sandbox, "home")
+    os.makedirs(os.path.join(home, ".claude"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    shutil.copy(os.path.join(here, "claude_window_timing.py"), sandbox)
+    with open(os.path.join(sandbox, "accounts.json"), "w") as f:
+        json.dump({"accounts": [{"name": "1", "config_dir": "~/.c1"},
+                                {"name": "2", "config_dir": "~/.c2"}]}, f)
+    try:
+        # Both streams into one pipe, which is what a redirect does and what a
+        # terminal does not: the ordering only breaks when stdout is buffered.
+        run = subprocess.run(
+            [sys.executable, os.path.join(sandbox, "claude_window_timing.py"),
+             "switch", "2"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, env=dict(os.environ, HOME=home))
+        lines = [l for l in run.stdout.splitlines() if l.strip()]
+        check("it refuses, having nothing parked", run.returncode, 1)
+        check_true("something was actually printed", len(lines) >= 2)
+        check("the closing line really is the last one",
+              lines[-1].strip(), "Nothing was changed.")
+        check_true("and the reason comes before it",
+                   any("No login is parked" in l for l in lines[:-1]))
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
 def test_parking_never_writes_over_a_login_that_is_already_there():
     """
     A store is meant to be empty: a login is parked there on the way out and
@@ -8786,6 +8875,7 @@ def main():
                  test_the_token_and_the_identity_move_together,
                  test_switching_refuses_what_cannot_possibly_work,
                  test_switching_says_what_it_will_and_will_not_fix,
+                 test_what_a_switch_says_reads_in_order_when_it_is_redirected,
                  test_parking_never_writes_over_a_login_that_is_already_there,
                  test_a_switch_says_what_the_account_it_moved_to_actually_has_left,
                  test_a_switch_killed_between_its_two_writes_is_finished_not_believed,
@@ -8830,6 +8920,18 @@ def main():
     # Nothing armed on the way out, whatever a test did or failed to do.
     for name in (TEST_PREFIX, TEST_PREFIX + "-a", TEST_PREFIX + "-b"):
         ew.cancel_anchor(ew.Account(name, "/tmp/nonexistent", 0))
+    # And nothing left behind in the manager's memory. `temp_account` names
+    # itself after the process id, so the three fixed names above never
+    # matched those -- a run that ended badly left a *failed* unit on the real
+    # user manager, which `doctor` then reported for ever, and which made a
+    # later run of this very suite fail on an unrelated assertion. systemd
+    # remembers a failed unit long after its file is gone.
+    listed = ew._systemctl("list-units", "--all", "--plain", "--no-legend",
+                           "claude-window-timing@{}*".format(TEST_PREFIX))
+    for line in (listed.stdout or "").splitlines():
+        unit = line.split()[0] if line.split() else ""
+        if unit.startswith("claude-window-timing@" + TEST_PREFIX):
+            ew._systemctl("reset-failed", unit)
 
     print("\n{}".format("-" * 60))
     if FAILURES:

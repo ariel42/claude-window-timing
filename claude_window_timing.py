@@ -1593,7 +1593,19 @@ def validate_accounts(accounts):
                 "This tool only does anything useful for a paid subscription."))
 
         expires = identity["refresh_expires_at"]
-        if expires and expires - time.time() < REFRESH_WARNING_DAYS * 86400:
+        # Expired and expiring are different sentences. With no lower bound
+        # this said "expires <a date three days ago>. Sign in again before
+        # then" -- present tense about the past, and an instruction nobody can
+        # follow -- directly under the error correctly reporting the same login
+        # as unusable. `switch_findings` has always drawn the line; this did not.
+        if expires and expires <= time.time():
+            findings.append(Finding(
+                "error",
+                "Account {}'s login expired {}".format(
+                    account.name, fmt_time(expires)),
+                "Nothing can be read or pinged with it until you sign in "
+                "again: {}".format(sign_in_command(account))))
+        elif expires and expires - time.time() < REFRESH_WARNING_DAYS * 86400:
             findings.append(Finding(
                 "warning",
                 "Account {}'s login expires {}".format(
@@ -5532,10 +5544,19 @@ def switch_account(accounts, name=None, sign_in=True):
     errors = [f for f in findings if f.level == "error"]
     for finding in findings:
         stream = sys.stderr if finding.level == "error" else sys.stdout
+        # stdout is block-buffered whenever it is not a terminal, and stderr
+        # never is. Redirected to a file or a pipe -- `tee`, CI, a session
+        # captured for a bug report -- the two streams came out interleaved
+        # wrongly, so "Nothing was changed." landed in the middle of the list
+        # and a warning appeared after it, reading as something that happened
+        # next. Flushing before each hand-over keeps the order it was written in.
+        sys.stdout.flush()
         stream.write("{}: {}\n".format(finding.level.upper(), finding.message))
         if finding.hint:
             stream.write("  -> {}\n".format(finding.hint))
+        stream.flush()
     if errors:
+        sys.stdout.flush()
         sys.stderr.write("\nNothing was changed.\n")
         return 1
     if findings:

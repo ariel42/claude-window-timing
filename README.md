@@ -25,7 +25,7 @@ Plenty of people work around it by hand: fire a throwaway "hi" at Claude early i
 
 It sends that message for you, every 30 minutes, all day and all night.
 
-Each one is tiny — a single "bye" to a saved one-line conversation — and **they cost as close to nothing as makes no difference**, because Claude serves them from its prompt cache and [cache reads are not deducted from your rate limit](https://platform.claude.com/docs/en/build-with-claude/prompt-caching). A week of logs: every ping served from cache, apart from a run of misses traced to the one thing that can spoil it — see [where the pings run](#where-the-pings-run).
+Each one is tiny — a single "bye" to a saved one-line conversation — and **they cost as close to nothing as makes no difference**, because Claude serves them from its prompt cache and [cache reads are not deducted from your rate limit](https://platform.claude.com/docs/en/build-with-claude/prompt-caching). Every ping in the logs this machine keeps — 48 hours of them, which is all `LOG_RETENTION_HOURS` holds — was served from cache, apart from a run of misses traced to the one thing that can spoil it — see [where the pings run](#where-the-pings-run).
 
 Same morning, with it running:
 
@@ -369,7 +369,7 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 
 Each account pings from an empty directory of its own, `~/.claude-<n>/pingcwd`, and not from this checkout.
 
-Claude Code puts the working directory's branch, working-tree status and recent commits into the **cached** part of every prompt. A ping running inside a git repository therefore loses its cache every time that repository changes — and the repository this ships from is one somebody commits to. In a week of logs that was the sole cause of every cache miss: a clean sweep of hits, broken only by the hours when commits were landing in the working directory.
+Claude Code puts the working directory's branch, working-tree status and recent commits into the **cached** part of every prompt. A ping running inside a git repository therefore loses its cache every time that repository changes — and the repository this ships from is one somebody commits to. In the logs kept here that was the sole cause of every cache miss: a clean sweep of hits, broken only by the hours when commits were landing in the working directory.
 
 An empty directory has nothing left to change, which is the whole point. The checkpoint conversation is registered against the directory it was created in and cannot be resumed from anywhere else, so if you upgrade from a version that pinged elsewhere, `./install.sh` rebuilds it — one message per account. `claude-window doctor` says so if it ever needs doing.
 
