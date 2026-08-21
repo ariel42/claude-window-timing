@@ -9,7 +9,7 @@ This puts that timing back under your control. It starts your window before you 
 - **A fresh window every 5/N hours instead of every 5.** Two subscriptions are held 2h30m apart, three 1h40m. Not more quota — quota that arrives when you need it, instead of all at once and then not for hours.
 - **A straight answer to which account to spend.** The window that expires first, skipping any account that cannot serve a request at all — a spent weekly limit, a lapsed plan, an expired sign-in.
 
-It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 5,600 lines of Python standard library and a systemd timer — no dependencies and no daemon. The only traffic it makes is the pings themselves, plus the one very small request per account that `which` and `status` use to read your limits ([how fresh those figures are](#which-account-to-use-now)).
+It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 6,700 lines of Python standard library and a systemd timer — no dependencies and no daemon. The only traffic it makes is the pings themselves, plus the one very small request per account that `which` and `status` use to read your limits ([how fresh those figures are](#which-account-to-use-now)).
 
 ---
 
@@ -192,7 +192,7 @@ Account 1 (personal)
   5-hour window : 82% used, resets 2026-08-11 15:30:00 IDT (in 3h51m29s)
   Weekly limit  : 17% used, resets 2026-08-17 10:00:00 IDT (in 142h21m29s)
   Next start-of-window opportunity: 2026-08-11 15:30:00 IDT (in 3h51m29s)
-    set by the 5-hour window   [via statusline]
+    set by the 5-hour window, as reported by the last ping
   Anchor        : none scheduled
   Next ping     : Tue 2026-08-11 12:07:13 IDT
 
@@ -332,7 +332,7 @@ Uninstalling stops the timers and removes every unit, and by default leaves this
 |---|---|
 | `claude_window_timing.py` | The whole tool. |
 | `install.sh` / `uninstall.sh` | Prerequisite checks, then the wizard; and the teardown. |
-| `test_window_timing.py` | Over 950 checks. `python3 test_window_timing.py`. |
+| `test_window_timing.py` | Over 1,100 checks. `python3 test_window_timing.py`. |
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 

@@ -2081,6 +2081,26 @@ def fmt_pct(used):
     return "?%" if used is None else "{}%".format(used)
 
 
+# Where a set of figures came from, in words a reader can act on.
+#
+# The stored tokens name internals: "statusline" is Claude Code's statusLine --
+# the command it runs to draw its own bottom bar, which we attach to the ping's
+# process alone so that the rate limits riding in its payload land in a file we
+# can read. None of that is anybody's business but this script's, and printing
+# the token only invited the question. What the reader does need is how much to
+# trust the figure, and that is answered by naming the reading it came from.
+_SOURCE_NAMES = {
+    "live":         "a live reading",
+    "statusline":   "the last ping",
+    "refusal-text": "the last ping's refusal message",
+}
+
+
+def fmt_source(source):
+    """The reading `limits_source` names, in words, or None if it names none."""
+    return _SOURCE_NAMES.get(source)
+
+
 def format_usage(account, limits=None):
     """
     One line summarising both limits: how much is used, and when each resets.
@@ -3281,9 +3301,18 @@ def status(accounts):
                 stale = "" if boundary > now else " — passed, awaiting next ping"
                 print("  Next start-of-window opportunity: {} (in {}){}".format(
                     fmt_time(boundary), fmt_delta(boundary - now), stale))
-                print("    set by the {}   [via {}]".format(
-                    state.get("boundary_label", "?"),
-                    state.get("limits_source", "?")))
+                # Both halves are omitted rather than printed as "?" when
+                # missing: a state file written before either field existed
+                # would otherwise explain the line above with a punctuation
+                # mark.
+                detail = []
+                if state.get("boundary_label"):
+                    detail.append("set by the {}".format(state["boundary_label"]))
+                source = fmt_source(state.get("limits_source"))
+                if source:
+                    detail.append("as reported by {}".format(source))
+                if detail:
+                    print("    {}".format(", ".join(detail)))
             else:
                 print("  Next start-of-window opportunity: not known yet — "
                       "run one ping first")
@@ -3894,9 +3923,9 @@ def which(accounts, states=None, avail=None, published_at=None, live=False):
     stamps = [stamp for stamp in stamps if stamp[0]]
     if stamps and not published_at:
         read_at = min(stamps)[0]
-        source = ("a live reading"
+        source = (_SOURCE_NAMES["live"]
                   if all(states[name].get("limits_source") == "live"
-                         for _, name in stamps) else "the last ping")
+                         for _, name in stamps) else _SOURCE_NAMES["statusline"])
         # Offering a reading is only useful to someone who did not just take
         # one: `--no-live` is the way to arrive here with figures worth
         # refreshing, and pointing anybody else at the command they have this

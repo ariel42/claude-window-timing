@@ -2234,11 +2234,58 @@ def test_the_status_display_shows_the_unusual_parts():
                    "passed, awaiting next ping" in said)
         check_true("and says which limit set it, and where that came from",
                    "set by the weekly limit" in said
-                   and "[via refusal-text]" in said)
+                   and "as reported by the last ping's refusal message" in said)
+        check_true("in words, not in the internal name for the source",
+                   "refusal-text" not in said and "statusline" not in said)
         check_true("a hold in force is stated with its reason",
                    "Holding       : until" in said and "spacing" in said)
     finally:
         ew._systemctl, ew._run, ew.SCHEDULE_FILE = saved
+
+
+def test_every_reading_a_figure_can_come_from_can_be_said_in_words():
+    """
+    `limits_source` records which reading a figure came from, and the display
+    turns that into the phrase telling the reader how much to trust it. The
+    stored tokens are internal — "statusline" names Claude Code's own status-bar
+    hook, which nobody running this tool has to know exists — so a source with
+    no phrase beside it means the display either prints the token at the reader
+    or, now that it refuses to, says nothing at all about where the figure came
+    from. Both are silent failures, and both are one forgotten line away.
+    """
+    section("Every reading a figure can come from can be said in words")
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    source = open(os.path.join(here, "claude_window_timing.py")).read()
+
+    def key_of(subscript):
+        # `x["k"]` is Subscript(slice=Constant) from 3.9 on, and wrapped in an
+        # ast.Index before that. Reading only one shape finds nothing on the
+        # other and passes, which is the failure this whole test is about.
+        node = subscript.slice
+        if node.__class__.__name__ == "Index":
+            node = node.value
+        return _literal_value(node)
+
+    stored = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if (isinstance(target, ast.Subscript)
+                    and key_of(target) == "limits_source"):
+                value = _literal_value(node.value)
+                if isinstance(value, str):
+                    stored.add(value)
+
+    check_true("the tokens are found in the source at all", len(stored) >= 3)
+    for token in sorted(stored):
+        check_true("a figure from {} can be described".format(token),
+                   bool(ew.fmt_source(token)))
+    check("and every phrase describes a reading that is really recorded",
+          sorted(ew._SOURCE_NAMES), sorted(stored))
+    check("a source nothing recorded is not invented a name",
+          ew.fmt_source("no-such-source"), None)
 
 
 def test_spacing_optimiser():
@@ -7816,6 +7863,7 @@ def main():
                  test_what_it_says_in_every_state_it_can_be_in,
                  test_the_age_of_the_figures_is_never_overstated,
                  test_the_status_display_shows_the_unusual_parts,
+                 test_every_reading_a_figure_can_come_from_can_be_said_in_words,
                  test_spacing_optimiser,
                  test_phase_is_lost_only_when_pings_cannot_get_through,
                  test_correction_policy,
