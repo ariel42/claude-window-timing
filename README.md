@@ -143,7 +143,7 @@ There are three familiar ways to attack this, and this tool is none of them.
 
 What this one does instead:
 
-- **It aims at the window boundary, not at the clock.** Claude Code reports exactly when your current window ends. The tool reads that, books a ping for 30 seconds after it, and so starts the next window the instant the last one closes. One correction repairs a schedule that a missed ping knocked out of step — this is the part that makes it hold up over weeks instead of days. ([Staying on schedule](#staying-on-schedule).)
+- **It aims at the window boundary.** Anthropic snaps every reset to a 30-minute grid, so the pings run on that same grid — `:00:30` and `:30:30` — and every one of them lands half a minute after a boundary rather than somewhere inside a window. A missed ping cannot drag the rest out of step, because nothing is measured from the last run. This is the part that makes it hold up over weeks instead of days. ([Staying on schedule](#staying-on-schedule).)
 - **The pings are engineered to be free.** Every ping replays one identical saved conversation from a directory whose contents never change, so Claude serves it from cache, and 30 minutes sits comfortably inside the ~1-hour cache lifetime while dividing 5 hours evenly. All three facts are load-bearing; none is a coincidence ([why 30 minutes](#why-30-minutes), [where the pings run](#where-the-pings-run)).
 - **It runs several subscriptions as one supply.** Windows spaced 5/N hours apart, kept spaced automatically, and a straight answer to "which account should I use right now" that skips any account that cannot serve a request. ([More than one subscription](#more-than-one-subscription).)
 - **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. Nothing that runs on a timer ever writes to `~/.claude` or `~/.claude.json`. The one thing that does is `claude-window switch`, only when you run it, to two files, after copying both somewhere safe — and a test names the single function allowed to write there and fails the day a second one appears.
@@ -252,9 +252,11 @@ This is what makes it reliable over weeks rather than days.
 
 A window lasts 5 hours and the pings are 30 minutes apart, so a ping lands exactly on the moment each window ends and immediately starts the next. As long as that keeps happening, everything stays lined up on its own.
 
-**Sometimes a ping does not happen.** The laptop slept, the network dropped, or you used the window up yourself and Claude refused the ping until your limit reset. When the ping at the *end* of a window is missed, the next window starts late — and stays late, because every window after it is measured from that late start.
+**Sometimes a ping does not happen.** The laptop slept, the network dropped, or you used the window up yourself and Claude refused the ping until your limit reset. A window that should have started then starts at the next ping instead.
 
-**The fix.** Claude Code reports exactly when your current window ends. Shortly before it does, the tool books one extra ping for **30 seconds after** that moment — plus a minute per account beyond the first, so several accounts correcting at once do not ping in the same instant. Because the regular 30-minute rhythm restarts from whenever the last ping happened, everything after it comes back into step. One correction and the schedule is repaired.
+**Why that does not compound.** The pings are on the clock, not on a stopwatch: `:00:30` and `:30:30`, five seconds apart per account so several do not spawn at once. Anthropic floors every reset to the same 30-minute grid, so every boundary is a moment the timer was going to fire at anyway. A missed ping costs one window a late start of at most half an hour and moves nothing after it — there is no drifting cadence to repair, because there is no cadence, only a clock.
+
+For the boundaries that somehow land off that grid, the tool still books one extra ping 30 seconds after the moment Claude reported — the mechanism that used to do all of this, now kept as the safety net for the grid rather than as the thing the schedule depends on.
 
 **Why 30 seconds late rather than exactly on time?** Early and late are not equally bad. A ping a moment *early* finds the old window still running, achieves nothing, and waits another 30 minutes. A ping a moment *late* starts the new window a few seconds late. So it deliberately aims late.
 
@@ -384,7 +386,8 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 - It relies on where Claude Code stores sessions and on the window reset time it reports. Both are internal details that a future release could change; the tests would notice, and `doctor` reports what it can verify.
 - Linux only, and enforced rather than merely stated — and now said *before* you spend anything rather than after. Running the pings needs systemd; `--no-pings` does not, but switching reads the credentials file Claude Code keeps on Linux, which macOS replaces with the Keychain — so `switch` refuses there rather than consuming a parked login to no effect. Setup on macOS or Windows warns up front that `switch` will not work, `doctor` reports it instead of saying "Everything checks out", and what does still work there — `status`, `which` and `doctor` reading a copied `schedule.json` — carries on working. Switching on macOS and Windows is wanted and not yet built.
 - **Having `systemctl` is not the same as having a systemd user session.** WSL without `systemd=true`, `docker exec`, `su -` and `ssh host ./install.sh` on some distributions all ship the binary and reach no user bus. Setup checks for the manager itself now and refuses rather than reporting timers it did not start.
-- **The pings do not catch up after downtime, and do not advance across a suspend.** The timer is monotonic on purpose; a machine asleep for four hours resumes and pings up to one interval of *awake* time later. Right for a server, and the thing to know if you run this on a laptop.
+- **The pings do not catch up after downtime.** The timer fires on the clock — `*:00,30:30` — so a machine that was asleep pings at the next half hour and is immediately back in step, rather than resuming a drifted cadence. Nothing is replayed for the time it was off, which is right: a missed ping is a missed ping, and the one after it lands on the boundary anyway.
+- **Anthropic snaps every 5-hour reset down to a 30-minute grid.** A ping at 15:30:44 opens a window reported as resetting at 20:30:00, not 20:30:44. That is why the pings fire on `:00` and `:30` and not on some other cadence: a ping that opens a window part-way through a grid cell has that window dated from the start of the cell, and loses the difference. It is an observation about someone else's service rather than a documented guarantee, so the tool checks it on every ping and `doctor` says so if it ever stops holding.
 
 ## Where the pings run
 
@@ -402,9 +405,11 @@ Two things decide the interval.
 
 **Landing on the boundary.** A window lasts 5 hours and a new one only starts on the first ping *after* the old one ends. 30 minutes divides 5 hours evenly, so a ping falls exactly on each boundary. An interval that does not divide evenly — 59 minutes, say — would leave nearly an hour with no window running at all.
 
-30 minutes also means a single missed ping is not a disaster: the next attempt is half an hour away, still inside the cache lifetime.
+**Landing on Anthropic's grid.** This is the part that makes 30 the only sensible answer rather than one of several. Every reset is floored to a 30-minute boundary — a ping at 15:30:44 opens a window that reports resetting at 20:30:00 — so a window opened part-way through a grid cell is dated from the start of that cell and loses the difference. The pings therefore fire on the clock at `:00:30` and `:30:30`, which is always just past a boundary and never inside a cell. An interval that does not divide 30 walks across the grid: 25 minutes, say, would take six different positions in the cell and throw away an average of 12 minutes of any window it opened, while costing 20% more pings.
 
-The interval is defined once, as `INTERVAL_MIN`.
+Because the ticks are wall-clock rather than measured from the last run, a missed ping cannot move the ones after it. The next attempt is half an hour away, still inside the cache lifetime, and still exactly on a boundary.
+
+The interval is defined once, as `INTERVAL_MIN`, and the grid beside it as `GRID_SEC`.
 
 ## License
 

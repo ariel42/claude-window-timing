@@ -496,6 +496,18 @@ def _log_of(account, fn):
 # Scheduling, replacing and cancelling the anchor
 # ---------------------------------------------------------------------------
 
+def _off_grid(moment):
+    """
+    Nudge a moment off the 30-minute reset grid.
+
+    Anchors are only booked for boundaries the grid does not explain, so a test
+    that wants one has to ask for a boundary that is genuinely off it — and
+    `now + something` lands on the grid about once in every 1800 runs, which is
+    exactly the kind of test that fails one morning for no visible reason.
+    """
+    return moment + 1 if not int(moment) % ew.GRID_SEC else moment
+
+
 def test_anchor_scheduling():
     section("Scheduling the anchor (creates real transient systemd units)")
     if not _have_systemd():
@@ -505,8 +517,13 @@ def test_anchor_scheduling():
     account = temp_account()
     ew.cancel_anchor(account)
 
+    # Off the grid on purpose. A boundary *on* the 30-minute grid is already
+    # covered by the ordinary wall-clock tick and books nothing at all — which
+    # is the case just below. Anchors exist for the boundaries the grid does
+    # not explain, so that is what this exercises.
+    boundary = _off_grid(now + 1500)
     state = {}
-    ew.maybe_schedule_anchor(account, now + 1500, ew.FIVE_HOUR_HORIZON,
+    ew.maybe_schedule_anchor(account, boundary, ew.FIVE_HOUR_HORIZON,
                              "5-hour window", state, False)
     first = ew.anchor_pending(account)
     check_true("a target within one interval is scheduled", bool(first))
@@ -517,9 +534,26 @@ def test_anchor_scheduling():
         return
     check_true("the anchor is placed %ds after the boundary, never before"
                % account.guard_sec,
-               abs(state["anchor_target"] - (now + 1500 + account.guard_sec)) < 2)
+               abs(state["anchor_target"] - (boundary + account.guard_sec)) < 2)
 
-    ew.maybe_schedule_anchor(account, now + 1200, ew.FIVE_HOUR_HORIZON,
+    # The regular tick fires at exactly boundary + guard_sec when the boundary
+    # is on the grid, so an anchor there would run the same ping twice in one
+    # second and one of them would lose the lock for nothing.
+    on_grid = (int(now) // ew.GRID_SEC + 1) * ew.GRID_SEC
+    booked = {}
+    ew.maybe_schedule_anchor(account, on_grid, ew.FIVE_HOUR_HORIZON,
+                             "5-hour window", booked, False)
+    check("a boundary on the grid books no anchor at all", booked, {})
+    check_true("and the earlier one is left alone", bool(ew.anchor_pending(account)))
+    if on_grid + account.guard_sec - time.time() <= ew.INTERVAL_MIN * 60:
+        # Only then is the grid the reason it declined, rather than the boundary
+        # simply being further off than one interval.
+        tail = (open(account.log_file).read()
+                if os.path.exists(account.log_file) else "")
+        check_true("and says the ordinary ping already lands on it",
+                   "No anchor" in tail)
+
+    ew.maybe_schedule_anchor(account, _off_grid(now + 1200), ew.FIVE_HOUR_HORIZON,
                              "5-hour window", {}, False)
     check_true("re-scheduling replaces the pending anchor",
                ew.anchor_pending(account) != first)
@@ -4998,19 +5032,19 @@ def test_a_clean_install_from_nothing():
     check_true("the timer template is written too",
                os.path.exists(timer_template))
     timer = open(timer_template).read()
-    check_true("it repeats at the interval the tool is built around",
-               "OnUnitActiveSec={}min".format(ew.INTERVAL_MIN) in timer)
-    check_true("it starts firing shortly after it is enabled",
-               "OnActiveSec=" in timer)
+    # Wall-clock and pinned to Anthropic's 30-minute reset grid, which is what
+    # makes an ordinary tick land on every window boundary without an anchor.
+    check_true("it fires on the grid Claude resets on",
+               "OnCalendar=*-*-* *:00,30:30" in timer)
+    check_true("it is no longer monotonic, so it cannot drift off that grid",
+               "OnUnitActiveSec" not in timer and "OnActiveSec" not in timer)
     check_true("it is tightened past systemd's default minute of slack",
                "AccuracySec=1s" in timer)
-    # Persistent= was set here for years and did nothing: systemd applies it
-    # only to OnCalendar= timers, and this one is monotonic. Asserting its
-    # absence, so that nobody puts it back believing it catches anything up.
-    check_true("it does not claim to catch up, which it never could",
+    # A caught-up ping fires part-way through a grid cell, and a window opened
+    # there is dated from the cell's start — so it would throw away the
+    # difference. Asserting the absence so nobody adds it as an improvement.
+    check_true("it does not catch up after downtime, deliberately",
                "Persistent=" not in timer)
-    check_true("and it is monotonic, which is why",
-               "OnCalendar=" not in timer)
     check_true("and it is something `systemctl enable` can install",
                "[Install]" in timer and "WantedBy=timers.target" in timer)
     check_true("the manager is told to re-read the files just written",
@@ -5020,8 +5054,12 @@ def test_a_clean_install_from_nothing():
                    units, "claude-window-timing@2.timer.d", "stagger.conf")))
     stagger = open(os.path.join(
         units, "claude-window-timing@2.timer.d", "stagger.conf")).read()
-    check_true("and its drop-in restates the repeat interval",
-               "OnUnitActiveSec" in stagger)
+    # OnCalendar is a list: assigning without clearing would leave the account
+    # firing at both seconds, which is the collision the stagger exists to stop.
+    check_true("and its drop-in clears the template's tick before setting its own",
+               "OnCalendar=\nOnCalendar=" in stagger)
+    check_true("moving only the seconds, so it stays in the same grid cell",
+               "OnCalendar=*-*-* *:00,30:35" in stagger)
 
     enabled = [c for c in calls if c[:2] == ["systemctl", "enable"]]
     check("a timer is enabled per account", len(enabled), 2)
@@ -5173,16 +5211,23 @@ def test_three_accounts_install_and_space_correctly():
     for name in ("2", "3"):
         body = open(os.path.join(units, "claude-window-timing@{}.timer.d".format(name),
                                  "stagger.conf")).read()
-        offsets.append([l for l in body.splitlines() if l.startswith("OnActiveSec=") and l != "OnActiveSec="][0])
-    check("each later account starts a minute after the last", offsets,
-          ["OnActiveSec=120s", "OnActiveSec=180s"])
+        offsets.append([l for l in body.splitlines()
+                        if l.startswith("OnCalendar=") and l != "OnCalendar="][0])
+    check("each later account takes its own second of the same grid cell",
+          offsets, ["OnCalendar=*-*-* *:00,30:35",
+                    "OnCalendar=*-*-* *:00,30:40"])
 
-    # Guards, which offset the *anchored* pings, must separate too.
+    # Guards, which offset the *anchored* pings, must separate too — and must
+    # agree with the seconds above, or an anchored ping and an ordinary one
+    # would open windows on different phases.
     accounts = [ew.Account(str(i + 1), "/tmp/c%d" % i, i) for i in range(3)]
     check("the anchored pings are separated as well",
           [a.guard_sec for a in accounts],
           [ew.RESET_GUARD_SEC, ew.RESET_GUARD_SEC + ew.PING_STAGGER_SEC,
            ew.RESET_GUARD_SEC + 2 * ew.PING_STAGGER_SEC])
+    check("and the timer says the same seconds the guard does",
+          [ew.timer_calendar(a).rsplit(":", 1)[1] for a in accounts],
+          ["{:02d}".format(a.guard_sec) for a in accounts])
 
     # Three accounts want 1h40m apart, not 2h30m, and the optimiser has to reach
     # that from wherever the three windows actually landed.
@@ -9224,6 +9269,147 @@ def test_a_timer_for_an_account_nobody_configured_is_reported():
 
 
 
+def test_the_reset_grid_is_checked_rather_than_assumed():
+    """
+    Every spacing decision this tool makes rests on Anthropic flooring each
+    5-hour reset to a 30-minute grid — and that is an observation about someone
+    else's service, not a documented guarantee. If it ever stops holding, the
+    reachable-spacing table in ALIGNMENT-PLAN.md is wrong and nothing else
+    anywhere would notice: the tool would go on computing targets from a lattice
+    that no longer exists, and the only symptom would be corrections that never
+    settle. So the grid is counted, sampled, and reported when it breaks.
+    """
+    section("The 30-minute reset grid, checked")
+    account = temp_account()
+
+    check("a slot is the grid cell a moment falls in", ew.slot_of(0), 0)
+    check("and wraps once per window", ew.slot_of(ew.WINDOW_HOURS * HOUR), 0)
+    check("ten of them fit in a window", ew.WINDOW_SLOTS, 10)
+    check("a window's start and its reset share a slot",
+          ew.slot_of(1700000000), ew.slot_of(1700000000 + ew.WINDOW_HOURS * HOUR))
+
+    on_grid = 1700000000 - 1700000000 % ew.GRID_SEC
+    state = {}
+    ew.note_reset_grid(account, state, on_grid)
+    check("an on-grid reset is counted", state["grid"]["checked"], 1)
+    check("and not reported", state["grid"].get("off_grid"), None)
+    check("the raw value is kept, so the sample can be re-derived",
+          state["grid"]["recent"], [float(on_grid)])
+
+    # The same reset is reported by all ten pings of a window. Counting each
+    # would claim ten times the evidence there actually is.
+    ew.note_reset_grid(account, state, on_grid)
+    ew.note_reset_grid(account, state, on_grid)
+    check("the same reset seen again is not fresh evidence",
+          state["grid"]["checked"], 1)
+
+    ew.note_reset_grid(account, state, on_grid + ew.GRID_SEC)
+    check("a different one is", state["grid"]["checked"], 2)
+    check("newest first, so the sample reads as a history",
+          state["grid"]["recent"],
+          [float(on_grid + ew.GRID_SEC), float(on_grid)])
+
+    ew.note_reset_grid(account, state, on_grid + 2 * ew.GRID_SEC + 137)
+    check("an off-grid reset is counted separately", state["grid"]["off_grid"], 1)
+    check("and says how far off it was",
+          state["grid"]["last_off_grid"]["off_by"], 137)
+
+    for junk in (None, "soon", float("nan"), 0, True):
+        before = dict(state["grid"])
+        ew.note_reset_grid(account, state, junk)
+        check("nothing is learned from {!r}".format(junk),
+              state["grid"]["checked"], before["checked"])
+
+    check_true("the sample is bounded, so state.json stays readable",
+               ew.GRID_SAMPLE_KEPT <= 100)
+    for i in range(ew.GRID_SAMPLE_KEPT + 20):
+        ew.note_reset_grid(account, state, on_grid + (i + 10) * ew.GRID_SEC)
+    check("and it stops growing", len(state["grid"]["recent"]),
+          ew.GRID_SAMPLE_KEPT)
+
+    ew.write_state(account, state)
+    findings = ew.reset_grid_findings([account])
+    check("a broken assumption is one finding", len(findings), 1)
+    check("and a warning, not an error", findings[0].level, "warning")
+    check_true("naming the account", "Account {}".format(account.name)
+               in findings[0].message)
+    check_true("and pointing at the document that depends on it",
+               "ALIGNMENT-PLAN.md" in findings[0].hint)
+
+    clean = temp_account()
+    ew.write_state(clean, {"grid": {"checked": 40, "recent": []}})
+    check("a grid that holds is reported by silence",
+          ew.reset_grid_findings([clean]), [])
+
+
+def test_an_upgraded_install_still_running_the_old_timer_is_noticed():
+    """
+    Editing the unit template in the source changes nothing on disk: the units
+    are written at install time. So an upgrade that is never followed by `setup`
+    leaves the older monotonic timer running — which still pings, so every other
+    screen looks perfect, and drifts off the grid, losing part of every window
+    it opens. Invisible from anywhere else.
+    """
+    section("An install left on the pre-grid timer")
+    saved = ew.UNIT_DIR
+    ew.UNIT_DIR = tempfile.mkdtemp()
+    try:
+        check("no units installed here is not this check's business",
+              ew.stale_timer_findings(), [])
+
+        path = os.path.join(ew.UNIT_DIR, "claude-window-timing@.timer")
+        with open(path, "w") as f:
+            f.write("[Timer]\nOnActiveSec=1min\nOnUnitActiveSec=30min\n")
+        findings = ew.stale_timer_findings()
+        check("a monotonic timer left over is a warning", len(findings), 1)
+        check_true("saying what it costs", "lose" in findings[0].hint)
+        check_true("and how to fix it", "install.sh" in findings[0].hint)
+
+        with open(path, "w") as f:
+            f.write(ew._TIMER_UNIT.format(
+                interval=ew.INTERVAL_MIN, minutes=ew.calendar_minutes(),
+                second=ew.RESET_GUARD_SEC))
+        check("the current timer is not reported", ew.stale_timer_findings(), [])
+    finally:
+        shutil.rmtree(ew.UNIT_DIR, ignore_errors=True)
+        ew.UNIT_DIR = saved
+
+
+def test_the_ping_cadence_is_a_calendar_on_the_grid():
+    """
+    The cadence has to be expressible as a wall-clock calendar, and every
+    account's tick has to stay inside one grid cell. An interval that does not
+    divide an hour has no repeating minutes-past-the-hour form at all, and
+    installing a timer that fires unevenly would be a silent, permanent loss of
+    window — so it fails loudly at the source instead.
+    """
+    section("The cadence as a calendar expression")
+    check("the interval this tool ships with divides an hour",
+          60 % ew.INTERVAL_MIN, 0)
+    check("half-hourly is two minutes fields", ew.calendar_minutes(30), "00,30")
+    check("and the expression generalises", ew.calendar_minutes(15),
+          "00,15,30,45")
+    check("down to every minute", len(ew.calendar_minutes(1).split(",")), 60)
+    for bad in (45, 7, 13, 0, -30):
+        try:
+            ew.calendar_minutes(bad)
+            check_true("an interval of {} is refused".format(bad), False)
+        except ValueError as exc:
+            check_true("an interval of {} is refused, loudly".format(bad),
+                       "divide 60" in str(exc))
+
+    accounts = [ew.Account(str(i + 1), "/tmp/c%d" % i, i) for i in range(8)]
+    seconds = [int(ew.timer_calendar(a).rsplit(":", 1)[1]) for a in accounts]
+    check_true("every account fires within the same grid cell",
+               all(0 <= s < 60 for s in seconds))
+    check_true("never before the boundary it is meant to follow",
+               all(s >= ew.RESET_GUARD_SEC for s in seconds))
+    check("the first six each get their own second",
+          len(set(seconds[:6])), 6)
+    check("and the calendar agrees with the guard used for anchors",
+          seconds, [a.guard_sec for a in accounts])
+
+
 def test_a_clock_that_is_wrong_is_measured_against_claudes():
     """
     A machine two minutes fast books every anchor two minutes before the
@@ -10072,6 +10258,9 @@ def main():
                  test_a_timer_for_an_account_nobody_configured_is_reported,
                  test_a_reset_in_the_hour_that_happens_twice,
                  test_a_clock_that_is_wrong_is_measured_against_claudes,
+                 test_the_reset_grid_is_checked_rather_than_assumed,
+                 test_an_upgraded_install_still_running_the_old_timer_is_noticed,
+                 test_the_ping_cadence_is_a_calendar_on_the_grid,
                  test_an_install_says_what_it_cannot_write_before_it_asks,
                  test_rebuilding_a_checkpoint_waits_for_a_ping_in_flight,
                  test_uninstall_finds_the_path_line_whatever_the_shell_says,

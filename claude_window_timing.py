@@ -92,10 +92,19 @@ LOG_RETENTION_HOURS = 48
 #
 # INTERVAL_MIN is the single source of truth for the ping cadence:
 # install_units() reads it from here when it writes the systemd timer, and
-# install.sh reads nothing — it checks prerequisites and execs `setup`. 30
-# divides the 5-hour window evenly, so consecutive windows sit back-to-back, and
-# it stays well under the ~1-hour prompt-cache TTL so every ping is a
-# (rate-limit-exempt) cache read.
+# install.sh reads nothing — it checks prerequisites and execs `setup`.
+#
+# 30 is not merely convenient, it is the grid Anthropic itself uses. Every
+# 5-hour reset is floored to a 30-minute boundary (GRID_SEC below), so a ping
+# series pinned to :00 and :30 lands just after *every* window boundary, for
+# ever, and never opens a window part-way through a grid cell — which would
+# throw away the rest of that cell, since the window is dated from the tick
+# before it. An interval that does not divide 30 walks across the grid and
+# loses an average of GRID_SEC/2 on any ping that opens a window.
+#
+# It also stays well under the ~1-hour prompt-cache TTL, so every ping is a
+# (rate-limit-exempt) cache read. Must divide 60: the timer is a wall-clock
+# calendar expression built from it.
 INTERVAL_MIN = 30
 
 # A window reset reported as 17:00:00 is pinged at 17:00:30. Firing *early* is the
@@ -103,17 +112,49 @@ INTERVAL_MIN = 30
 # and leave us waiting another full interval — so we deliberately aim late. The
 # ping itself needs ~8s of CLI startup before it reaches the API, so the request
 # actually arrives around +38s. That lateness is harmless; earliness is not.
+#
+# It is also the seconds field of the wall-clock timer, which is what makes it
+# land after every boundary rather than only after an anchored one: boundaries
+# are on the 30-minute grid (GRID_SEC), so :00:30 and :30:30 are always just
+# past one. It must stay well inside a minute for that reason.
 RESET_GUARD_SEC = 30
 
-# Accounts are spaced 5/N hours apart, and for N=2 that is an exact multiple of
-# the 30-minute interval — so without this every account would ping in the same
-# second, forever. Each account adds index * PING_STAGGER_SEC to its guard, which
-# shifts its whole grid by a constant and is therefore absorbed into its measured
-# phase. Staggering the *cadence* instead does not work: the anchor re-anchors
-# each series to its own window boundary and pulls any cadence offset back out.
-PING_STAGGER_SEC = 60
+# Without this every account would ping in the same second, forever, and spawn
+# as many Claude processes at once. Each account adds index * PING_STAGGER_SEC
+# to its guard, and that guard is the *seconds* field of the wall-clock tick, so
+# every account still fires inside the same 30-minute grid cell — five seconds
+# of separation costs nothing and moves no phase. It used to be a minute, from
+# when the timer was monotonic and the offset shifted an account's whole series;
+# a calendar timer has no series to shift, so the smallest workable value is the
+# right one. Accounts past the sixth share the last second of the cell (see
+# Account.guard_sec) — a nuisance at that count, not a correctness problem.
+PING_STAGGER_SEC = 5
 
 WINDOW_HOURS = 5
+
+# Anthropic snaps every 5-hour reset down to a 30-minute grid: a ping at
+# 15:30:44 opens a window reported as resetting at 20:30:00, not 20:30:44.
+# Observed on every window-opening ping in this machine's logs, across both
+# accounts (see ALIGNMENT-REVIEW.md §2 and ALIGNMENT-PLAN.md §1).
+#
+# Two consequences, and the spacing design rests on both:
+#
+#   * a window's phase can only ever be one of WINDOW_SLOTS values, so exact
+#     5/N spacing is reachable only when 18000/N is a multiple of GRID_SEC;
+#   * opening a window off-grid throws away the rest of the grid cell.
+#
+# This is an observation about someone else's service, not a documented
+# guarantee — so it is *checked* rather than assumed. note_reset_grid() compares
+# every distinct reset this machine is told about against the grid, and `doctor`
+# reports a miss. The day that finding appears, the reachable-spacing table in
+# ALIGNMENT-PLAN.md needs revisiting.
+GRID_SEC = 30 * 60
+WINDOW_SLOTS = WINDOW_HOURS * 3600 // GRID_SEC          # 10
+
+# How many distinct reset times to keep per account as the raw sample behind
+# that check. One per window, so 60 is about twelve days — long enough to show
+# a fortnight's evidence, short enough that state.json stays a file you can read.
+GRID_SAMPLE_KEPT = 60
 
 # How long a ping waits on its Claude subprocess. Named rather than inline so a
 # test can shorten them: with a stand-in CLI the fixed startup pause is otherwise
@@ -238,7 +279,16 @@ class Account(object):
 
     @property
     def guard_sec(self):
-        return RESET_GUARD_SEC + self.index * PING_STAGGER_SEC
+        """
+        Seconds past a window boundary at which this account pings.
+
+        Also the seconds field of its wall-clock timer, so the two can never
+        disagree. Capped inside the minute: the calendar expression has nowhere
+        to put a 60, and an account that shared a second with another would only
+        be spawning two CLI processes at once — the nuisance this offset exists
+        to avoid, not a timing fault. That happens from the seventh account on.
+        """
+        return min(59, RESET_GUARD_SEC + self.index * PING_STAGGER_SEC)
 
     # -- Claude Code's own config file ----------------------------------------
 
@@ -2189,6 +2239,115 @@ def clock_skew_findings(now=None):
         .format(fmt_delta(abs(skew))))]
 
 
+def slot_of(epoch):
+    """
+    Which of the WINDOW_SLOTS grid cells a moment falls in.
+
+    Window starts are floored to the grid and windows are a whole number of
+    cells long, so `slot_of(start) == slot_of(reset)` and either can be used to
+    say where in the 5-hour cycle an account sits.
+    """
+    return int(epoch // GRID_SEC) % WINDOW_SLOTS
+
+
+def note_reset_grid(account, state, resets):
+    """
+    Check a reported 5-hour reset against the 30-minute grid, and keep the tally.
+
+    The grid is the one load-bearing fact this tool did not read in a document
+    (GRID_SEC): every spacing decision assumes Anthropic floors resets to it. So
+    every distinct reset is compared against it and the result recorded, which
+    turns "we believe this" into "we have checked this N times".
+
+    Counted once per *distinct* value on purpose. The same reset is reported by
+    all ten pings of a window, and counting each one would claim ten times the
+    evidence there is. `recent` keeps the raw values so the sample can be read
+    back and re-derived rather than taken on trust.
+    """
+    if not isinstance(resets, (int, float)) or isinstance(resets, bool):
+        return
+    if resets != resets or not resets:          # NaN, or nothing reported
+        return
+    grid = dict(state.get("grid") or {})
+    if grid.get("last_seen") == resets:
+        return
+    now = time.time()
+    grid["last_seen"] = resets
+    grid["since"] = grid.get("since") or now
+    grid["checked"] = int(grid.get("checked") or 0) + 1
+    grid["recent"] = ([round(float(resets), 3)]
+                      + list(grid.get("recent") or []))[:GRID_SAMPLE_KEPT]
+
+    off = int(resets) % GRID_SEC
+    if off:
+        grid["off_grid"] = int(grid.get("off_grid") or 0) + 1
+        grid["last_off_grid"] = {"resets_at": resets, "seen_at": now,
+                                 "off_by": off}
+        log(account,
+            "Reset {} is {} off the {}-minute grid the spacing assumes — {} of "
+            "{} distinct resets seen here. See ALIGNMENT-PLAN.md.".format(
+                fmt_time(resets), fmt_delta(off), GRID_SEC // 60,
+                grid["off_grid"], grid["checked"]))
+    state["grid"] = grid
+
+
+def stale_timer_findings():
+    """
+    Say when the installed ping timer predates the move to the grid.
+
+    Editing the template in this file changes nothing on disk — the units are
+    written at install time — so an upgrade that is never followed by `setup`
+    leaves the older monotonic timer running. It still pings, so nothing looks
+    wrong from any other screen, and it drifts off the grid and loses part of
+    every window it opens.
+    """
+    path = os.path.join(UNIT_DIR, "claude-window-timing@.timer")
+    try:
+        with open(path) as f:
+            body = f.read()
+    except (IOError, OSError):
+        return []                       # not installed here; not this check
+    if "OnCalendar=" in body:
+        return []
+    return [Finding(
+        "warning",
+        "The installed ping timer is the older monotonic one",
+        "It drifts off the {}-minute grid Claude resets on, so a ping that "
+        "opens a window can date it from up to that much earlier and lose the "
+        "difference. Re-run ./install.sh to rewrite the units.".format(
+            GRID_SEC // 60))]
+
+
+def reset_grid_findings(accounts):
+    """
+    Say so when Claude stops snapping resets to the grid the spacing assumes.
+
+    Silent while the assumption holds, which is the normal case and needs no
+    line on screen. When it stops holding, nothing else anywhere would notice:
+    the tool would go on computing reachable spacings from a lattice that no
+    longer exists, and the only symptom would be corrections that never settle.
+    """
+    findings = []
+    for account in accounts:
+        grid = read_state(account).get("grid") or {}
+        off = int(grid.get("off_grid") or 0)
+        if not off:
+            continue
+        last = grid.get("last_off_grid") or {}
+        findings.append(Finding(
+            "warning",
+            "Account {}: {} of {} reset times Claude reported were not on the "
+            "{}-minute grid".format(
+                account.name, off, grid.get("checked") or off, GRID_SEC // 60),
+            "The window spacing assumes every reset is floored to that grid — "
+            "ALIGNMENT-PLAN.md rests on it entirely. The most recent exception "
+            "was {}, off by {}. If this keeps happening, the reachable-spacing "
+            "table in that document is wrong and the plan needs revisiting."
+            .format(fmt_time(last.get("resets_at") or 0),
+                    fmt_delta(last.get("off_by") or 0))))
+    return findings
+
+
 def read_live_limits(account):
     """
     Ask Claude what this account's limits are *now*, as (limits, problem).
@@ -2973,6 +3132,23 @@ def maybe_schedule_anchor(account, boundary, horizon, label, state, was_limited)
             fmt_time(boundary), label))
         return
 
+    # A boundary on the grid needs no anchor at all. The ping timer is a
+    # wall-clock series pinned to that same grid at the same guard second, so
+    # the ordinary tick fires at exactly this moment — not near it, at it.
+    # Booking an anchor here would start the same ping twice in one instant and
+    # the loser of the lock would log a skip for a run nobody needed.
+    #
+    # Off-grid boundaries still get one, which is the point: the anchor stops
+    # being the mechanism that makes the schedule work and becomes the safety
+    # net for the assumption that the grid exists (GRID_SEC).
+    if not int(boundary) % GRID_SEC:
+        log(account,
+            "Next window can start at {} (in {}, set by the {}) — on the "
+            "{}-minute grid, so the ordinary ping lands on it. No anchor "
+            "needed.".format(fmt_time(boundary), fmt_delta(boundary - now),
+                             label, GRID_SEC // 60))
+        return
+
     streak = state.get("anchor_streak", 0)
     if was_limited and streak >= MAX_ANCHOR_STREAK:
         log(account,
@@ -3577,6 +3753,13 @@ def _ping(account, accounts=None):
             state["limits_read_at"] = time.time()
         limits = state.get("rate_limits") or {}
 
+    # Check the 30-minute grid rather than assume it. Every spacing decision
+    # this tool makes is built on it, and it is someone else's implementation
+    # detail — so each distinct reset is compared against it and counted.
+    note_reset_grid(account, state,
+                    ((state.get("rate_limits") or {}).get("five_hour")
+                     or {}).get("resets_at"))
+
     boundary, horizon, label = next_window_start(
         limits, result["text"], result["limited"])
     if boundary:
@@ -4001,6 +4184,8 @@ def doctor(accounts):
     findings.extend(foreign_pinger_findings(now))
     findings.extend(orphaned_timer_findings(accounts))
     findings.extend(clock_skew_findings(now))
+    findings.extend(stale_timer_findings())
+    findings.extend(reset_grid_findings(accounts))
     findings.extend(anchor_findings(accounts, now))
     # Whether anything here can see systemd at all. Every timer question below
     # answers "no" when the bus is out of reach, which is a different thing
@@ -4185,11 +4370,13 @@ def _timer_will_fire_again(account):
     """
     Whether systemd still has a next elapse for this account's timer.
 
-    Both properties have to be consulted. A monotonic timer — which is what the
-    ping cadence is — reports NextElapseUSecMonotonic and leaves the realtime one
-    empty; a calendar timer does the opposite. Reading only one of them calls a
-    perfectly healthy timer broken, and a diagnostic that cries wolf is worse
-    than no diagnostic at all.
+    Both properties have to be consulted. A calendar timer — which is what the
+    ping cadence is, and what the anchor is too — reports NextElapseUSecRealtime
+    and leaves the monotonic one empty; a monotonic timer does the opposite.
+    Reading only one of them calls a perfectly healthy timer broken, and a
+    diagnostic that cries wolf is worse than no diagnostic at all. Both are still
+    read: the cadence was monotonic until the move to the grid, and an install
+    upgraded in place keeps its old units until setup rewrites them.
 
     Unknown counts as fine: without systemd there is nothing to report.
 
@@ -7104,27 +7291,56 @@ _TIMER_UNIT = """[Unit]
 Description=Claude Code Window Timing — ping account %i every {interval} minutes
 
 [Timer]
-# OnActiveSec fires shortly after the timer starts; OnUnitActiveSec then repeats
-# every interval after the service was last activated. "Last activated" is what
-# makes the boundary anchor work: when the one-shot anchor starts this same
-# service, the repeating series re-anchors off that run, so a single correction
-# puts every later ping back on the window boundary.
-OnActiveSec=1min
-OnUnitActiveSec={interval}min
-# systemd's default accuracy is 1 minute, which would let each ping land up to a
-# minute late and quietly stretch the cadence. Tighten it so the interval holds.
+# Wall-clock, pinned to Anthropic's own grid, and that is the whole point.
+# Every 5-hour reset is floored to a 30-minute boundary, so every window
+# boundary lands on :00:00 or :30:00 — and a timer pinned to the same grid
+# therefore fires just after *every* boundary, for ever, with nothing to
+# correct. Two things follow that a monotonic timer could not give:
+#
+#   * no drift to repair. A monotonic series measures from its last run, so a
+#     missed ping or a suspend moves the whole series off the grid and it stays
+#     there until a one-shot anchor drags it back.
+#   * no window opened part-way through a grid cell. A ping at :17 opens a
+#     window dated from :00 and throws away seventeen minutes of it.
+OnCalendar=*-*-* *:{minutes}:{second:02d}
+# systemd's default accuracy is 1 minute, which would let a ping land in the
+# *next* grid cell and lose half an hour of window. Tighten it.
 AccuracySec=1s
-# This timer is monotonic, and deliberately carries no catch-up setting: the
-# one systemd offers applies to wall-clock timers only, so it was set here for
-# years and did nothing at all. Nothing is caught up after downtime, and a
-# monotonic timer does not advance across a suspend either -- a machine asleep
-# for four hours resumes and pings up to one interval of *awake* time later.
-# Right for a server; the thing to fix for a laptop. What it is not is
-# something a setting here was quietly handling.
+# Deliberately no catch-up directive. After downtime the right first ping is the
+# next grid tick, not an immediate one part-way through a cell — a window opened
+# there is dated from the cell's start and loses the difference. The next tick is
+# at most {interval} minutes away and lands on a boundary anyway, so a missed
+# ping stays missed and the one after it is exactly on time. A test asserts the
+# directive's absence, so that nobody adds it back as an improvement.
 
 [Install]
 WantedBy=timers.target
 """
+
+
+def calendar_minutes(interval=None):
+    """
+    The minutes field of the ping timer's calendar expression.
+
+    Derived from INTERVAL_MIN rather than written out, so the cadence stays
+    defined in exactly one place. The interval has to divide an hour for a
+    calendar expression to exist at all — 45 minutes has no repeating
+    minutes-past-the-hour form — and that is a source-edit mistake worth
+    failing loudly on rather than installing a timer that fires unevenly.
+    """
+    # `is None`, not falsy: an interval of 0 must reach the check below and be
+    # refused, not silently become the default.
+    interval = INTERVAL_MIN if interval is None else interval
+    if interval < 1 or 60 % interval:
+        raise ValueError(
+            "INTERVAL_MIN={} does not divide 60, so it cannot be written as a "
+            "systemd calendar expression. Use a divisor of 60.".format(interval))
+    return ",".join("{:02d}".format(m) for m in range(0, 60, interval))
+
+
+def timer_calendar(account):
+    """This account's wall-clock tick: on the grid, at its own second."""
+    return "*-*-* *:{}:{:02d}".format(calendar_minutes(), account.guard_sec)
 
 
 def unit_path():
@@ -7207,32 +7423,27 @@ def install_units(accounts):
                                      python=sys.executable or "/usr/bin/python3",
                                      path=unit_path()))
     with open(os.path.join(UNIT_DIR, "claude-window-timing@.timer"), "w") as f:
-        f.write(_TIMER_UNIT.format(interval=INTERVAL_MIN))
+        f.write(_TIMER_UNIT.format(interval=INTERVAL_MIN,
+                                   minutes=calendar_minutes(),
+                                   second=RESET_GUARD_SEC))
 
-    # Offset each account's first firing. OnUnitActiveSec measures from the last
-    # activation, so shifting the first one shifts that account's whole grid for
-    # good — without this, timers started together stay in lockstep forever and
-    # every account spawns a Claude process in the same second. The guard in
-    # Account.guard_sec only offsets *anchored* pings, which do not happen until
-    # a window boundary comes round.
+    # Give each account its own second within the grid cell, so they do not all
+    # spawn a Claude process in the same instant. Seconds, not minutes: every
+    # account must still fire inside the same cell, or it would open its windows
+    # on a different phase than the one the spacing arithmetic believes.
     for account in accounts:
         drop_in = os.path.join(UNIT_DIR, account.timer_unit + ".d")
         if account.index:
             if not os.path.isdir(drop_in):
                 os.makedirs(drop_in)
             with open(os.path.join(drop_in, "stagger.conf"), "w") as f:
-                # Two systemd subtleties, both of which bite silently:
-                #
-                #   * OnActiveSec is a list, not a scalar. Assigning it in a
-                #     drop-in *adds* to what the template set, so the account
-                #     would fire at both times and collide anyway.
-                #   * Assigning the empty string to any monotonic timer option
-                #     resets *all* of them — so clearing OnActiveSec also
-                #     discards the template's OnUnitActiveSec, and the timer
-                #     fires once and then never again. It has to be restated.
-                f.write("[Timer]\nOnActiveSec=\nOnActiveSec={}s\n"
-                        "OnUnitActiveSec={}min\n".format(
-                            60 + account.index * PING_STAGGER_SEC, INTERVAL_MIN))
+                # OnCalendar is a list, not a scalar: assigning it in a drop-in
+                # *adds* to what the template set, so the account would fire at
+                # both seconds and collide anyway. The empty assignment clears
+                # the template's value first. Unlike the monotonic options this
+                # replaced, clearing it discards nothing else.
+                f.write("[Timer]\nOnCalendar=\nOnCalendar={}\n".format(
+                    timer_calendar(account)))
         elif os.path.isdir(drop_in):
             shutil.rmtree(drop_in)          # account order may have changed
 
@@ -7240,10 +7451,10 @@ def install_units(accounts):
     for account in accounts:
         _systemctl("enable", account.timer_unit)
         _systemctl("restart", account.timer_unit)
-        print("Timer running for account {} — every {} minutes{}".format(
-            account.display, INTERVAL_MIN,
-            "" if not account.index else ", offset {}s so the accounts do not "
-            "ping at the same moment".format(account.index * PING_STAGGER_SEC)))
+        print("Timer running for account {} — every {} minutes, at {}{}".format(
+            account.display, INTERVAL_MIN, timer_calendar(account),
+            "" if not account.index else " (its own second, so the accounts "
+            "do not ping at the same moment)"))
 
     if "Linger=yes" not in (_run(["loginctl", "show-user", USER]).stdout or ""):
         print()
