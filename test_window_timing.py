@@ -3384,6 +3384,39 @@ def test_doctor_says_what_a_failing_ping_was_told():
                    "Claude refuses its pings" not in said)
         login["ok"] = (True, "pro")
 
+        # Somebody does what it said: signs in again, while the failed ping's
+        # half-hour has not yet run out. Quoting the old failure at them as an
+        # error is telling them their fix did not work before anything has
+        # tried it.
+        os.makedirs(account.config_dir, 0o700)
+        creds = ew.credentials_path(account)
+        with open(creds, "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r",
+                                         "subscriptionType": "pro"}}, f)
+        os.utime(creds, (now + 5, now + 5))
+        org_off["started"] = now - 20
+        ew.write_state(account, {"last_run": now, "available_at": now - 60,
+                                 "consecutive_failures": 1,
+                                 "last_error": org_off})
+        said = doctor_says()
+        check_true("a login written after the failed ping began is not an error",
+                   "Claude refuses its pings" not in said)
+        check_true("it is said as what it is, and what happens next",
+                   "written again since" in said and "next ping" in said)
+        state = ew.read_state(account)
+        check("nor does `which` call the account unusable on that evidence",
+              ew.account_availability(account, state, now + 10).tier
+              == ew.NEEDS_ACTION, False)
+        # Signed in *before* the ping started: the ping saw that login, and
+        # it was refused. That is still the account's problem.
+        os.utime(creds, (now - 60, now - 60))
+        check_true("a login older than the refusal is still the account's fault",
+                   "Claude refuses its pings" in doctor_says())
+        check("and still makes it unusable",
+              ew.account_availability(account, ew.read_state(account),
+                                      now + 10).tier, ew.NEEDS_ACTION)
+        os.remove(creds)
+
         overloaded = {"error": "server_error", "status": 529,
                       "text": "API Error: 529 Overloaded.", "needs_you": False,
                       "at": now}

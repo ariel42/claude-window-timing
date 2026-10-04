@@ -780,7 +780,8 @@ def account_availability(account, state, now):
     # dropped connection, none of these clears on its own. Cleared the moment a
     # ping gets through.
     error = state.get("last_error") or {}
-    if error.get("needs_you") and state.get("consecutive_failures", 0):
+    if error.get("needs_you") and state.get("consecutive_failures", 0) \
+            and not ping_error_superseded(account, state):
         return Availability(NEEDS_ACTION, None,
                             "Claude refused its last ping — {}".format(
                                 describe_ping_error(error)), True)
@@ -3432,6 +3433,30 @@ def classify_turn(record):
                          "needs_you": bool(needs_you)}
 
 
+def ping_error_superseded(account, state):
+    """
+    When the account's login was written after its last failed ping started,
+    or None.
+
+    The ordinary sequence after fixing a login: the ping that failed is the
+    newest evidence there is until the next one, half an hour away, and every
+    command goes on quoting it -- to somebody who has just done exactly what it
+    told them. A login written since the failing ping began is the one thing
+    that can have changed the answer, so it is said instead of the failure.
+    Measured from when the ping *started*: a sign-in finished while a ping was
+    already running is invisible to that ping.
+    """
+    error = state.get("last_error") or {}
+    started = error.get("started") or error.get("at")
+    if not started:
+        return None
+    try:
+        written = os.path.getmtime(credentials_path(account))
+    except (OSError, TypeError):
+        return None
+    return written if written > started else None
+
+
 def describe_ping_error(error):
     """One line for an error recorded by classify_turn."""
     if not error:
@@ -3961,7 +3986,7 @@ def _ping(account, accounts=None, force=False):
         # pings failed" is only half a diagnosis.
         state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
         if error:
-            state["last_error"] = dict(error, at=time.time())
+            state["last_error"] = dict(error, at=time.time(), started=now)
 
     maybe_schedule_anchor(account, boundary, horizon, label, state,
                           result["limited"])
@@ -4377,7 +4402,16 @@ def doctor(accounts):
         # when it is broken, said nothing and exited 0.
         failures = state.get("consecutive_failures", 0)
         error = state.get("last_error") or {}
-        if failures and error.get("needs_you") and ok:
+        since = ping_error_superseded(account, state) if failures else None
+        if failures and error.get("needs_you") and ok and since:
+            findings.append(Finding(
+                "warning",
+                "Account {}: its last ping was refused — {} — but its login "
+                "was written again since, at {}".format(
+                    account.name, describe_ping_error(error), fmt_time(since)),
+                "If you have just signed in, the next ping will say whether "
+                "that fixed it. Nothing to do until then."))
+        elif failures and error.get("needs_you") and ok:
             # The login is fine on disk and Claude still refuses it. Nothing
             # above can see that; only the ping's own error says so, and
             # waiting for three of them would add an hour and a half of
