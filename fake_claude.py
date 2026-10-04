@@ -27,8 +27,18 @@ it arrived. Every key is optional.
      "silent": true,                  never answer, to exercise the timeout
      "hang_prompt": true,             block on a first-run prompt, as a fresh
                                       account did before --no-chrome
+     "api_error": {"error": <label>,  answer with the turn Claude Code makes up
+                   "status": <int>,   itself when a request fails -- an expired
+                   "text": <str>},    login, a disabled organisation, a 529
      "auth": {...}}                   what `auth status --json` should report;
                                       false makes it print nothing parseable
+
+Refusals and errors are written the way the real CLI writes them, not as
+ordinary replies: `model` "<synthetic>", `isApiErrorMessage`, the error label
+and status alongside, and every usage figure zero. Copied from real session
+files. An earlier version wrote refusals as normal turns with tokens, which is
+exactly why nothing here noticed the tool counting a made-up "Login expired"
+turn as a ping that got through.
 """
 
 import json
@@ -113,6 +123,20 @@ def append(path, entry):
         f.write(json.dumps(entry) + "\n")
 
 
+def synthetic_turn(text, label, status):
+    """The assistant turn Claude Code writes itself when a request fails."""
+    turn = {"type": "assistant", "uuid": str(uuid.uuid4()),
+            "isApiErrorMessage": True, "error": label,
+            "message": {"role": "assistant", "model": "<synthetic>",
+                        "content": [{"type": "text", "text": text}],
+                        "usage": {"input_tokens": 0, "output_tokens": 0,
+                                  "cache_read_input_tokens": 0,
+                                  "cache_creation_input_tokens": 0}}}
+    if status is not None:
+        turn["apiErrorStatus"] = status
+    return turn
+
+
 def auth_status():
     """
     Answer `auth status --json` the way the real CLI does.
@@ -188,13 +212,23 @@ def main():
                         "weekly" if limited == "weekly" else "session", when))
             append(path, {"type": "user", "uuid": str(uuid.uuid4()),
                           "message": {"role": "user", "content": prompt}})
-            append(path, {"type": "assistant", "uuid": str(uuid.uuid4()),
-                          "message": {"role": "assistant",
-                                      "content": [{"type": "text", "text": text}],
-                                      "usage": {"input_tokens": 10,
-                                                "output_tokens": 20}}})
+            append(path, synthetic_turn(text, "rate_limit", 429))
             sys.stdout.write(text + "\r\n")
             sys.stdout.flush()
+            emit_statusline(status_command, baseline_ms + 1500)
+            continue
+
+        failure = control().get("api_error")
+        if failure:
+            text = failure.get("text", "Login expired · Please run /login")
+            append(path, {"type": "user", "uuid": str(uuid.uuid4()),
+                          "message": {"role": "user", "content": prompt}})
+            append(path, synthetic_turn(text, failure.get("error"),
+                                        failure.get("status")))
+            sys.stdout.write(text + "\r\n")
+            sys.stdout.flush()
+            # The real CLI's statusLine still fires after an error turn: the
+            # tool must not need its absence to tell the two apart.
             emit_statusline(status_command, baseline_ms + 1500)
             continue
 

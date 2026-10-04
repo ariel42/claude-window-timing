@@ -770,6 +770,18 @@ def account_availability(account, state, now):
     if stuck:
         return Availability(NEEDS_ACTION, None, stuck, True)
 
+    # The case the files cannot show: a login that is perfectly valid on disk
+    # while Claude refuses it -- an organisation that has switched subscription
+    # access off, a billing failure, a revoked grant. Only a ping finds that
+    # out, and it says so in the error it brings back. One is enough: unlike a
+    # dropped connection, none of these clears on its own. Cleared the moment a
+    # ping gets through.
+    error = state.get("last_error") or {}
+    if error.get("needs_you") and state.get("consecutive_failures", 0):
+        return Availability(NEEDS_ACTION, None,
+                            "Claude refused its last ping — {}".format(
+                                describe_ping_error(error)), True)
+
     blockers = []
 
     # A refusal is Claude's own answer about this account, and it carries the
@@ -787,7 +799,9 @@ def account_availability(account, state, now):
         return Availability(WAITING, until, note, exact)
 
     if state.get("consecutive_failures", 0) >= UNHEALTHY_AFTER:
-        return Availability(UNKNOWN, None, "its pings keep failing", True)
+        why = describe_ping_error(state.get("last_error"))
+        return Availability(UNKNOWN, None, "its pings keep failing" + (
+            " — " + why if why else ""), True)
 
     return Availability(USABLE, None, "", True)
 
@@ -3337,6 +3351,93 @@ def _send(fd, data):
         return False
 
 
+# Claude Code records every failed request as an ordinary assistant turn of its
+# own making: `model` is "<synthetic>", `isApiErrorMessage` is set, every usage
+# figure is zero, and the text is the error. It does this for a rate-limit
+# refusal, and equally for an expired login, an organisation that has switched
+# subscription access off, a billing failure and an overloaded server. Judging
+# a ping by "a new assistant turn exists" therefore counts every one of those as
+# a ping that got through -- which is how both ping directories here spent a
+# month signed out while the tool recorded a fresh proof of life every half
+# hour, and doctor's staleness checks, keyed on that proof, said nothing.
+#
+# A rate-limit refusal is still an answer: the account is reachable, a limit is
+# spent, and the refusal says when it lifts. Anything else synthetic is a ping
+# that did not happen.
+SYNTHETIC_MODEL = "<synthetic>"
+
+# Failures that waiting will not fix. Each of these was observed in a real
+# session file; the statuses catch the same family when the label is new.
+NEEDS_YOU_ERRORS = frozenset(("authentication_failed", "oauth_org_not_allowed",
+                              "billing_error", "permission_error"))
+NEEDS_YOU_STATUSES = frozenset((401, 402, 403))
+
+
+def _turn_tokens(record):
+    """Every token this turn was billed for, or 0. Real replies are never 0."""
+    usage = (record.get("message") or {}).get("usage") or {}
+    total = 0
+    for key in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                "cache_creation_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total += value
+    return total
+
+
+def classify_turn(record):
+    """
+    What one recorded assistant turn says about the ping: (text, limited, error).
+
+    `limited` is a rate-limit refusal -- the account answered. `error` is None
+    for a turn Claude actually served or a refusal, and otherwise a dict
+    describing the failure: its label, its HTTP status, the text, and whether
+    it needs the user rather than time.
+
+    Three independent signals mark a turn as not served, and any one is enough:
+    the synthetic model name, the API-error flag, and a total of zero tokens.
+    They fail differently -- a renamed model, a dropped flag, a usage block that
+    stops being written -- so trusting all three is what keeps one upstream
+    change from making a dead account look alive again. The cost of that
+    choice is in the other direction, and it is the right one: a real reply
+    misread as a failure is loud, the opposite was silent for a month.
+    """
+    message = record.get("message") or {}
+    text = ""
+    for block in message.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text", "")
+
+    label = record.get("error")
+    status = record.get("apiErrorStatus")
+    # Keyed off the structured fields rather than the wording, which is
+    # English-only and free to change -- the wording stays as a fallback.
+    limited = (status == 429 or label == "rate_limit"
+               or "hit your" in text.lower())
+
+    unserved = (message.get("model") == SYNTHETIC_MODEL
+                or bool(record.get("isApiErrorMessage"))
+                or _turn_tokens(record) == 0)
+    if limited or not unserved:
+        return text, limited, None
+
+    needs_you = label in NEEDS_YOU_ERRORS or status in NEEDS_YOU_STATUSES
+    return text, False, {"error": label, "status": status,
+                         "text": " ".join(text.split())[:300],
+                         "needs_you": bool(needs_you)}
+
+
+def describe_ping_error(error):
+    """One line for an error recorded by classify_turn."""
+    if not error:
+        return ""
+    head = error.get("error") or "API error"
+    if error.get("status"):
+        head = "{} ({})".format(head, error["status"])
+    text = error.get("text") or ""
+    return "{}: {}".format(head, text) if text else head
+
+
 def run_interactive(account, extra_args, prompt_text, session_id,
                     startup_wait=None, completion_timeout=None,
                     statusline_wait=None):
@@ -3503,26 +3604,24 @@ def run_interactive(account, extra_args, prompt_text, session_id,
     # assistant turn was recorded and log its token usage (cache read vs write).
     entries = _assistant_entries(account, session_id)
     completed = len(entries) > baseline
-    text, limited = "", False
+    text, limited, error = "", False, None
     if completed:
         record = entries[-1]
         usage = record.get("message", {}).get("usage", {})
-        for block in record.get("message", {}).get("content", []):
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text", "")
-        # A refused ping is recorded as an ordinary assistant turn whose text is the
-        # refusal. Key off the structured fields Claude Code stores alongside it
-        # rather than the wording, which is English-only and free to change.
-        limited = (record.get("apiErrorStatus") == 429
-                   or record.get("error") == "rate_limit"
-                   or "hit your" in text.lower())
-        log(account,
-            "Turn confirmed{}: cache_read={} cache_write={} in={} out={}".format(
-            " [RATE-LIMITED]" if limited else "",
-            usage.get("cache_read_input_tokens", 0),
-            usage.get("cache_creation_input_tokens", 0),
-            usage.get("input_tokens", 0),
-            usage.get("output_tokens", 0)))
+        text, limited, error = classify_turn(record)
+        if error:
+            # Not "Turn confirmed": the turn exists, but Claude Code wrote it
+            # itself, and nothing reached the account.
+            log(account, "Ping did not get through — {}".format(
+                describe_ping_error(error)))
+        else:
+            log(account,
+                "Turn confirmed{}: cache_read={} cache_write={} in={} out={}".format(
+                " [RATE-LIMITED]" if limited else "",
+                usage.get("cache_read_input_tokens", 0),
+                usage.get("cache_creation_input_tokens", 0),
+                usage.get("input_tokens", 0),
+                usage.get("output_tokens", 0)))
         if limited:
             log(account, "Refusal: {}".format(text.strip()))
     else:
@@ -3534,7 +3633,8 @@ def run_interactive(account, extra_args, prompt_text, session_id,
         log(account, usage)
 
     log(account, f"Exited with code: {proc.returncode}")
-    return {"completed": completed, "limited": limited, "text": text}
+    return {"completed": completed, "limited": limited, "text": text,
+            "error": error}
 
 
 # ---------------------------------------------------------------------------
@@ -3612,6 +3712,20 @@ def _init(account):
         _discard_session(account, checkpoint_id)
         sys.exit(1)
 
+    # The same reasoning, for every other way Claude Code answers without
+    # Claude: an expired login or a disabled organisation would otherwise be
+    # frozen in as "the conversation", replayed by every ping for ever, and
+    # reported by install.sh as a checkpoint built.
+    if result.get("error"):
+        log(account, "ERROR: the first message did not reach Claude, so there "
+                     "is no reply to build the checkpoint from — {}".format(
+                         describe_ping_error(result["error"])))
+        if result["error"].get("needs_you"):
+            log(account, "Sign in again with: {}, then run ./install.sh "
+                         "again.".format(sign_in_command(account)))
+        _discard_session(account, checkpoint_id)
+        sys.exit(1)
+
     if not result["completed"]:
         log(account, "ERROR: Failed to create checkpoint session.")
         _discard_session(account, checkpoint_id)
@@ -3661,9 +3775,9 @@ def ping(account, accounts=None):
     if lock is None:
         log(account, "A ping for account {} is already running — skipping this "
                      "one rather than pinging twice.".format(account.display))
-        return
+        return True
     try:
-        _ping(account, accounts)
+        return _ping(account, accounts)
     finally:
         os.close(lock)          # releases the flock with it
 
@@ -3687,7 +3801,7 @@ def _ping(account, accounts=None):
                          hold.get("reason", "alignment")))
         schedule_anchor(account, hold["until"] + account.guard_sec)
         write_state(account, state)
-        return
+        return True                   # deliberately not pinging is not a failure
 
     log(account, "Starting ping run for account {}...".format(
         account.display))
@@ -3776,9 +3890,11 @@ def _ping(account, accounts=None):
     # will be. Nothing here asks *which* limit refused: a weekly limit spent, a
     # lapsed subscription and a revoked login are the same state, and all three
     # recover the same way — by an ordinary ping succeeding again.
-    if result["completed"] and not result["limited"]:
+    error = result.get("error")
+    if result["completed"] and not result["limited"] and not error:
         state["available_at"] = time.time()          # proven by demonstration
         state["consecutive_failures"] = 0
+        state.pop("last_error", None)
         state["anchor_streak"] = 0    # back to normal; forget past corrections
         # A live reading that failed is recorded so `doctor` keeps saying it
         # after the moment has scrolled by -- but only a live reading cleared
@@ -3789,6 +3905,7 @@ def _ping(account, accounts=None):
         state.pop("live_problem", None)
         state.pop("live_problem_at", None)
     elif result["limited"]:
+        state.pop("last_error", None)                # it answered
         if boundary:
             state["available_at"] = boundary
         else:
@@ -3826,8 +3943,14 @@ def _ping(account, accounts=None):
         state["consecutive_failures"] = 0            # it answered; it just said no
     else:
         # No answer at all says nothing about the account — that is a local
-        # problem until it keeps happening.
+        # problem until it keeps happening. An answer Claude Code made up
+        # itself is the same: nothing reached the account, so nothing here is
+        # proof of life, and `available_at` is left exactly where the last real
+        # answer put it. What the error *said* is kept, because "the last three
+        # pings failed" is only half a diagnosis.
         state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+        if error:
+            state["last_error"] = dict(error, at=time.time())
 
     # Spacing is decided from what every account is *observed* to be doing, not
     # from a schedule agreed earlier — so nothing here can fall out of date, and
@@ -3846,6 +3969,11 @@ def _ping(account, accounts=None):
     write_state(account, state)
 
     log(account, "Ping run finished.\n")
+    # The exit status is the one signal that reaches outside this tool: a run
+    # that fails exits non-zero, so systemd marks the unit failed and it shows
+    # in `systemctl --user --failed` and to any OnFailure= notifier. A refusal
+    # is not a failure -- the account answered.
+    return bool(result["limited"] or (result["completed"] and not error))
 
 
 def realign(accounts, confirm=False):
@@ -4288,13 +4416,30 @@ def doctor(accounts):
         # `status` both say so; `doctor`, the command whose whole job is to say
         # when it is broken, said nothing and exited 0.
         failures = state.get("consecutive_failures", 0)
-        if failures >= UNHEALTHY_AFTER:
+        error = state.get("last_error") or {}
+        if failures and error.get("needs_you") and ok:
+            # The login is fine on disk and Claude still refuses it. Nothing
+            # above can see that; only the ping's own error says so, and
+            # waiting for three of them would add an hour and a half of
+            # silence to a failure that never clears by itself.
+            findings.append(Finding(
+                "error",
+                "Account {}: Claude refuses its pings — {}".format(
+                    account.name, describe_ping_error(error)),
+                "Its login is valid on disk, so this is the account rather "
+                "than this machine: a lapsed subscription, an organisation "
+                "that has turned Claude Code off, or a revoked sign-in. Fix it "
+                "on claude.ai or sign in again: {}".format(
+                    sign_in_command(account))))
+        elif failures >= UNHEALTHY_AFTER:
+            why = describe_ping_error(error)
             findings.append(Finding(
                 "error",
                 "Account {}: the last {} pings all failed, so no window is "
                 "being started for it".format(account.name, failures),
-                "The run itself is what is failing, not the timer. The reason "
-                "is on the last lines of {}".format(account.log_file)))
+                "The run itself is what is failing, not the timer. {}".format(
+                    "The last one said: " + why if why else
+                    "The reason is on the last lines of " + account.log_file)))
         if hold:
             pass
         elif last_run and now - last_run > 3 * INTERVAL_MIN * 60:
@@ -8159,9 +8304,9 @@ def cli(argv=None):
                 return not_a_pinging_machine("and sending one by hand is "
                                              "exactly what that decision was "
                                              "about")
-            ping(_selected(accounts, args.account), accounts)
+            ok = ping(_selected(accounts, args.account), accounts)
             publish_schedule(accounts)
-            return 0
+            return 0 if ok is not False else 1
     except ConfigError as e:
         sys.stderr.write("Configuration error: {}\n".format(e))
         return 2

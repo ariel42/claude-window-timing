@@ -987,7 +987,8 @@ def test_run_interactive_survives_an_immediate_exit():
         ew.CLAUDE_PATH = saved
 
     check("returns a result rather than raising",
-          sorted(result), ["completed", "limited", "text"])
+          sorted(result), ["completed", "error", "limited", "text"])
+    check("and no turn is not an error turn", result["error"], None)
     check("reports the turn as not completed", result["completed"], False)
 
 
@@ -1543,6 +1544,29 @@ def test_two_accounts_stay_out_of_each_others_files():
         check("an unknown account is refused instead of guessed",
               ew.cli(["ping", "nope"]), 2)
         check("and refusing means no ping was sent", len(pinged), 3)
+
+        # The exit status is the one signal that leaves this tool: systemd
+        # marks a unit failed on it, and that is what `systemctl --user
+        # --failed` and any OnFailure= notifier see. A month of signed-out
+        # pings exited 0 every half hour.
+        def answering(**result):
+            def run(account, extra_args, prompt, session_id, **kwargs):
+                pinged.append((account.name, session_id, None))
+                return dict({"completed": True, "limited": False,
+                             "text": "", "error": None}, **result)
+            return run
+        ew.run_interactive = answering(error={
+            "error": "authentication_failed", "status": None,
+            "text": "Login expired · Please run /login", "needs_you": True})
+        check("a ping that never reached Claude exits non-zero",
+              ew.cli(["ping"]), 1)
+        ew.run_interactive = answering(limited=True,
+                                       text="You've hit your session limit")
+        check("a refusal exits zero: the account answered", ew.cli(["ping"]), 0)
+        ew.run_interactive = answering(completed=False)
+        check("so does nothing, as a failure", ew.cli(["ping"]), 1)
+        ew.run_interactive = answering()
+        check("and a ping that got through exits zero", ew.cli(["ping"]), 0)
     finally:
         ew.run_interactive = original_run
         ew.ACCOUNTS_FILE = saved_accounts_file
@@ -3422,6 +3446,313 @@ def test_the_json_report_is_a_contract():
     # the same thing `which` says in words at the bottom of its answer.
     check("and the figures are dated, so a script can judge them too",
           entries["1"]["limits_read_at"], now - 60)
+
+
+# Each one copied from a real session file, one per kind of failure Claude Code
+# was seen to record. The shape is the point: all of them are "<synthetic>",
+# carry the API-error flag, and bill nothing.
+def _synthetic(text, label, status=None):
+    turn = {"type": "assistant", "isApiErrorMessage": True, "error": label,
+            "message": {"role": "assistant", "model": "<synthetic>",
+                        "content": [{"type": "text", "text": text}],
+                        "usage": {"input_tokens": 0, "output_tokens": 0,
+                                  "cache_creation_input_tokens": 0,
+                                  "cache_read_input_tokens": 0}}}
+    if status is not None:
+        turn["apiErrorStatus"] = status
+    return turn
+
+
+def _served(text="ok, bye"):
+    return {"type": "assistant",
+            "message": {"role": "assistant", "model": "claude-opus-5",
+                        "content": [{"type": "text", "text": text}],
+                        "usage": {"input_tokens": 3, "output_tokens": 22,
+                                  "cache_read_input_tokens": 6743,
+                                  "cache_creation_input_tokens": 0}}}
+
+
+def test_a_turn_claude_code_made_up_is_not_a_ping():
+    """
+    Claude Code writes an ordinary-looking assistant turn for every request that
+    fails -- an expired login, an organisation that has turned it off, a billing
+    failure, an overloaded server -- and the tool counted each one as a ping
+    that got through. Both ping directories here spent a month signed out while
+    every half hour recorded a fresh proof of life, and `doctor`'s staleness
+    checks, keyed on exactly that, said nothing.
+
+    A rate-limit refusal is written the same way and must stay what it was: an
+    answer, carrying the moment the account is back.
+    """
+    section("A turn Claude Code made up is not a ping that got through")
+
+    text, limited, error = ew.classify_turn(_served())
+    check("a real reply is served", (limited, error), (False, None))
+
+    text, limited, error = ew.classify_turn(_synthetic(
+        "You've hit your session limit · resets 9:30pm", "rate_limit", 429))
+    check("a rate-limit refusal is still an answer, not a failure",
+          (limited, error), (True, None))
+
+    for label, status, words, needs_you in (
+            ("authentication_failed", None,
+             "Login expired · Please run /login", True),
+            ("authentication_failed", 401, "Failed to authenticate. API Error: 401", True),
+            ("oauth_org_not_allowed", 403,
+             "Your organization has disabled Claude subscription access for "
+             "Claude Code", True),
+            ("unknown", 402, "API Error: 402 This request requires more credits",
+             True),
+            ("server_error", 529, "API Error: 529 Overloaded.", False),
+            ("invalid_request", 400, "Prompt is too long", False)):
+        text, limited, error = ew.classify_turn(_synthetic(words, label, status))
+        check_true("{} ({}) is a failed ping".format(label, status),
+                   error is not None and not limited)
+        check("and {} it needs you".format("says" if needs_you else "does not say"),
+              bool(error and error["needs_you"]), needs_you)
+    check_true("the error keeps the words Claude Code used",
+               "Overloaded" in ew.describe_ping_error(
+                   ew.classify_turn(_synthetic("API Error: 529 Overloaded.",
+                                               "server_error", 529))[2]))
+
+    # Three independent signals, any one enough: an upstream change that drops
+    # one of them must not bring the month-long silence back.
+    only_model = _synthetic("x", None)
+    del only_model["isApiErrorMessage"]
+    only_model["message"]["usage"]["input_tokens"] = 5
+    check_true("the synthetic model alone marks it",
+               ew.classify_turn(only_model)[2] is not None)
+    only_flag = _served()
+    only_flag["isApiErrorMessage"] = True
+    check_true("the API-error flag alone marks it",
+               ew.classify_turn(only_flag)[2] is not None)
+    only_zero = _served()
+    only_zero["message"]["usage"] = {"input_tokens": 0, "output_tokens": 0}
+    check_true("and so does a turn that billed nothing",
+               ew.classify_turn(only_zero)[2] is not None)
+    no_usage = _served()
+    del no_usage["message"]["usage"]
+    check_true("including one with no usage recorded at all",
+               ew.classify_turn(no_usage)[2] is not None)
+
+
+def test_a_ping_that_did_not_get_through_records_why():
+    """
+    What a failed ping writes down decides everything after it: whether the
+    account is still believed alive, whether `which` recommends it, whether
+    `doctor` speaks, whether systemd hears about it. Walked with the
+    conversation stubbed out, from a healthy account into a refused one and
+    back.
+    """
+    section("A ping that did not get through, and what it records")
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
+    saved = (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
+             ew.restore_checkpoint, ew._systemctl, ew._run)
+
+    class Ok(object):
+        returncode = 0
+        stdout = ""
+    ew.schedule_anchor = lambda account, target: True
+    ew.restore_checkpoint = lambda account, session: None
+    ew._systemctl = lambda *a: Ok()
+    ew._run = lambda cmd: Ok()
+    try:
+        account = temp_account(TEST_PREFIX)
+        ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
+        # A login that is perfectly good on disk: the case nothing else sees.
+        os.makedirs(account.config_dir, 0o700)
+        with open(account.config_json, "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": "u"}}, f)
+        with open(os.path.join(account.config_dir, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "t",
+                                         "subscriptionType": "pro"}}, f)
+        with open(account.session_id_file, "w") as f:
+            f.write("sess\n")
+        stamp_checkpoint(account)
+        open(account.checkpoint_backup, "w").close()
+        now = time.time()
+        limits = {"five_hour": {"resets_at": now + 600, "used_percentage": 7}}
+
+        def ping_with(record):
+            text, limited, error = ew.classify_turn(record)
+            ew.run_interactive = lambda *a, **k: {
+                "completed": True, "limited": limited, "text": text,
+                "error": error}
+            ew.read_statusline_limits = lambda a, records=None: limits
+            return ew.ping(account), ew.read_state(account)
+
+        ok, state = ping_with(_served())
+        check("a served ping reports success", ok, True)
+        proven = state["available_at"]
+
+        refused = _synthetic("Your organization has disabled Claude "
+                             "subscription access for Claude Code",
+                             "oauth_org_not_allowed", 403)
+        time.sleep(0.01)
+        ok, state = ping_with(refused)
+        check("a ping Claude Code answered itself reports failure", ok, False)
+        check("and counts as one", state["consecutive_failures"], 1)
+        check("it is not proof of life: available_at is left where it was",
+              state["available_at"], proven)
+        check("what it said is kept", state["last_error"]["error"],
+              "oauth_org_not_allowed")
+        check_true("with when", abs(state["last_error"]["at"] - time.time()) < 5)
+
+        avail = ew.account_availability(account, state, time.time())
+        check("an error that needs you makes the account unusable at once",
+              avail.tier, ew.NEEDS_ACTION)
+        check_true("and says why, in Claude's words",
+                   "disabled Claude subscription access" in avail.note)
+        holding, why = ew.participation(account, state, time.time())
+        check("so it stops holding a place in the spacing", holding, False)
+
+        # A transient failure is not the user's to fix, and is only worth
+        # raising if it keeps happening.
+        overloaded = _synthetic("API Error: 529 Overloaded.", "server_error", 529)
+        ok, state = ping_with(_served())
+        ok, state = ping_with(overloaded)
+        check("an overloaded server is a failure too", ok, False)
+        check("but not one that needs you",
+              ew.account_availability(account, state, time.time()).tier,
+              ew.USABLE)
+        for _ in range(ew.UNHEALTHY_AFTER - 1):
+            ok, state = ping_with(overloaded)
+        avail = ew.account_availability(account, state, time.time())
+        check("until it keeps happening", avail.tier, ew.UNKNOWN)
+        check_true("when the note says what the last one said",
+                   "Overloaded" in avail.note)
+
+        ok, state = ping_with(_served())
+        check("one ping getting through clears it", ok, True)
+        check("the counter", state["consecutive_failures"], 0)
+        check("and the error", state.get("last_error"), None)
+
+        refusal = _synthetic("You've hit your session limit · resets 9:30pm",
+                             "rate_limit", 429)
+        ok, state = ping_with(refusal)
+        check("a refusal is not a failed run, so systemd is not told it was",
+              ok, True)
+        check("and is not counted as one", state["consecutive_failures"], 0)
+    finally:
+        (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
+         ew.restore_checkpoint, ew._systemctl, ew._run) = saved
+
+
+def test_a_clean_install_refuses_a_first_message_claude_never_saw():
+    """
+    The checkpoint is frozen once and replayed by every ping for ever. Built
+    from a signed-out account, it would freeze Claude Code's own "Login expired"
+    turn in as the conversation -- and setup would report a checkpoint built.
+    Driven through the stand-in CLI, so the record shape is the real one.
+    """
+    section("A clean install that cannot reach Claude stops rather than pretends")
+    code, home, repo, calls = _clean_install(
+        "1\ny\n\ny\n", accounts=1,
+        claude_control={"api_error": {"error": "authentication_failed",
+                                      "text": "Login expired · Please run /login"}})
+    check("setup does not report success", code != 0, True)
+    check_true("no checkpoint is left behind",
+               not os.path.exists(os.path.join(repo, "state", "1",
+                                               "session_id.txt")))
+    check("and no timer was enabled",
+          [c for c in calls if c[:2] == ["systemctl", "enable"]], [])
+    log = os.path.join(repo, "state", "1", "ping.log")
+    said = open(log).read() if os.path.exists(log) else ""
+    check_true("the log says it never reached Claude, and why",
+               "did not reach Claude" in said and "Login expired" in said)
+
+
+def test_doctor_says_what_a_failing_ping_was_told():
+    """
+    `doctor` keyed its staleness findings on the proof of life a ping records,
+    and a ping that Claude Code answered itself recorded one every time -- so a
+    month of signed-out pings produced no finding at all. With that fixed, it
+    still has to say *why*: "the last three pings failed" sends somebody to a
+    log, when the reason is one sentence long and already known.
+
+    And the case no file can show -- a login perfectly valid on disk that
+    Claude refuses -- has to be said on the first failure, not after three,
+    because it never clears by itself.
+    """
+    section("Doctor names what a failing ping was told")
+    account = temp_account(TEST_PREFIX)
+    saved = (ew._systemctl, ew.account_auth_ok, ew.validate_accounts)
+
+    class Reply(object):
+        def __init__(self, out, code=0):
+            self.stdout, self.returncode = out, code
+
+    def systemctl(*args):
+        joined = " ".join(args)
+        if "is-enabled" in joined:
+            return Reply("enabled")
+        if "is-system-running" in joined:
+            return Reply("running")
+        if "NextElapse" in joined:
+            return Reply("NextElapseUSecRealtime=Sun 2099-01-01 00:00:00 UTC")
+        return Reply("")
+
+    def doctor_says():
+        buf = io.StringIO()
+        out, sys.stdout = sys.stdout, buf
+        try:
+            ew.doctor([account])
+        finally:
+            sys.stdout = out
+        return buf.getvalue()
+
+    ew._systemctl = systemctl
+    ew.validate_accounts = lambda accounts: []
+    login = {"ok": (True, "pro")}
+    ew.account_auth_ok = lambda a: login["ok"]
+    try:
+        now = time.time()
+        org_off = {"error": "oauth_org_not_allowed", "status": 403,
+                   "text": "Your organization has disabled Claude subscription "
+                           "access for Claude Code", "needs_you": True, "at": now}
+        ew.write_state(account, {"last_run": now, "available_at": now - 60,
+                                 "consecutive_failures": 1,
+                                 "last_error": org_off})
+        said = doctor_says()
+        check_true("one refusal Claude will not lift by itself is an error at once",
+                   "Claude refuses its pings" in said)
+        check_true("in Claude's own words",
+                   "disabled Claude subscription access" in said)
+        check_true("saying it is the account and not this machine",
+                   "valid on disk" in said)
+
+        login["ok"] = (False, "not signed in")
+        said = doctor_says()
+        check_true("a login already reported broken is not reported twice",
+                   "Claude refuses its pings" not in said)
+        login["ok"] = (True, "pro")
+
+        overloaded = {"error": "server_error", "status": 529,
+                      "text": "API Error: 529 Overloaded.", "needs_you": False,
+                      "at": now}
+        ew.write_state(account, {"last_run": now, "available_at": now - 60,
+                                 "consecutive_failures": 1,
+                                 "last_error": overloaded})
+        check_true("one transient failure is not worth a finding",
+                   "pings all failed" not in doctor_says()
+                   and "Claude refuses" not in doctor_says())
+
+        ew.write_state(account, {"last_run": now, "available_at": now - 60,
+                                 "consecutive_failures": ew.UNHEALTHY_AFTER,
+                                 "last_error": overloaded})
+        said = doctor_says()
+        check_true("but it is once it keeps happening",
+                   "pings all failed" in said)
+        check_true("and says what the last one was told, not just where to look",
+                   "Overloaded" in said)
+
+        ew.write_state(account, {"last_run": now, "available_at": now - 60,
+                                 "consecutive_failures": ew.UNHEALTHY_AFTER})
+        check_true("with nothing recorded it still points at the log",
+                   account.log_file in doctor_says())
+    finally:
+        ew._systemctl, ew.account_auth_ok, ew.validate_accounts = saved
 
 
 def test_what_a_ping_records_from_how_it_went():
@@ -10237,6 +10568,10 @@ def main():
                  test_realign_is_the_only_way_a_long_hold_happens,
                  test_the_json_report_is_a_contract,
                  test_what_a_ping_records_from_how_it_went,
+                 test_a_turn_claude_code_made_up_is_not_a_ping,
+                 test_a_ping_that_did_not_get_through_records_why,
+                 test_a_clean_install_refuses_a_first_message_claude_never_saw,
+                 test_doctor_says_what_a_failing_ping_was_told,
                  test_two_pings_at_once_do_not_tread_on_each_other,
                  test_a_hold_suppresses_the_ping_and_nothing_else,
                  test_an_unusable_account_is_still_pinged,
