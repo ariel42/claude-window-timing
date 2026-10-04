@@ -6,7 +6,7 @@ This puts that timing back under your control. It starts your window before you 
 
 - **A window already running when you sit down.** Pings keep one open around the clock, so you never start the clock yourself — you arrive partway into a window that is already running, and the next one comes sooner. Where in the window you land is luck; averaged over many days it is about 2.5 hours of waiting for a fresh one instead of a flat 5. The pings cost almost nothing against the 5-hour limit — Claude serves them from its prompt cache — and a little against the separate weekly one ([the numbers](#notes-and-caveats)).
 - **Hit the limit, keep working.** `claude-window switch` points your own Claude Code at an account that still has quota. No logging out, no browser, no losing your place — and it refuses when it would not actually work.
-- **A fresh window every 5/N hours instead of every 5.** Two subscriptions are held 2h30m apart, three 1h40m. Not more quota — quota that arrives when you need it, instead of all at once and then not for hours.
+- **A fresh window every 2½ hours with two subscriptions, instead of every 5.** Three sit 1h30m, 1h30m and 2h apart — as even as Anthropic's 30-minute grid allows. Kept that way on their own, through outages and your own use, with nothing to approve. Not more quota — quota that arrives when you need it, instead of all at once and then not for hours.
 - **A straight answer to which account to spend.** The window that expires first, skipping any account that cannot serve a request at all — a spent weekly limit, a lapsed plan, an expired sign-in.
 
 It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 8,000 lines of Python standard library and a systemd timer — no dependencies and no daemon. The only traffic it makes is the pings themselves, plus the one very small request per account that `which` and `status` use to read your limits ([how fresh those figures are](#which-account-to-use-now)).
@@ -54,13 +54,23 @@ That average is real even if you start work at the same hour every day, and it i
 
 If one subscription is not enough, the usual answer is a second. Two accounts give you twice the quota — but left alone their windows drift into whatever arrangement chance produces, and that arrangement matters more than it looks.
 
-This spaces them evenly: two accounts land **2h30m apart**, three land 1h40m apart. In general, N accounts sit 5/N hours apart.
+This spaces them as evenly as they can go. Anthropic dates every window from a 30-minute grid, so a window can only start in one of ten slots of a 5-hour cycle, and "evenly" means the best arrangement of those slots — the one that makes the average wait for a fresh window shortest:
+
+| Accounts | Windows sit | Average wait for a fresh one |
+|---|---|---|
+| 1 | — | 2h30m |
+| 2 | 2h30m apart | 1h15m |
+| 3 | 1h30m, 1h30m, 2h apart | 51m |
+| 4 | 1h, 1h, 1h30m, 1h30m apart | 39m |
+| 5 | 1h apart | 30m |
+
+Three and four accounts cannot sit exactly 5/N apart — 1h40m and 1h15m are not whole slots — and the arrangement above costs one minute of average wait at three accounts, and ninety seconds at four, against an ideal no schedule can reach.
 
 ### Why even spacing is worth having
 
 No arrangement creates capacity. Whatever your windows are doing, you get the same number of refills per day. What changes is the **shape** of the supply — and because unused quota expires the moment a window ends, shape is worth real money.
 
-- **A fresh window always arrives within 5/N hours** instead of up to 5. With two accounts the worst case halves and the average wait drops from 2.5 hours to about 1.25.
+- **A fresh window always arrives within about 5/N hours** instead of up to 5. With two accounts the worst case halves and the average wait drops from 2.5 hours to 1.25.
 - **Less quota expires unused.** When windows reset together, all your capacity shares one deadline and whatever you could not burn is gone. Staggered, the deadlines are spread out.
 
 That holds for everyone, not just heavy users: your own throughput caps how much extra quota is worth to you, so a steadier supply is never worse than a lumpy one of the same size.
@@ -145,7 +155,7 @@ What this one does instead:
 
 - **It aims at the window boundary.** Anthropic snaps every reset to a 30-minute grid, so the pings run on that same grid — `:00:30` and `:30:30` — and every one of them lands half a minute after a boundary rather than somewhere inside a window. A missed ping cannot drag the rest out of step, because nothing is measured from the last run. This is the part that makes it hold up over weeks instead of days. ([Staying on schedule](#staying-on-schedule).)
 - **The pings are engineered to be free.** Every ping replays one identical saved conversation from a directory whose contents never change, so Claude serves it from cache, and 30 minutes sits comfortably inside the ~1-hour cache lifetime while dividing 5 hours evenly. All three facts are load-bearing; none is a coincidence ([why 30 minutes](#why-30-minutes), [where the pings run](#where-the-pings-run)).
-- **It runs several subscriptions as one supply.** Windows spaced 5/N hours apart, kept spaced automatically, and a straight answer to "which account should I use right now" that skips any account that cannot serve a request. ([More than one subscription](#more-than-one-subscription).)
+- **It runs several subscriptions as one supply.** Windows spaced as evenly as Anthropic's grid allows, kept that way automatically, and a straight answer to "which account should I use right now" that skips any account that cannot serve a request. ([More than one subscription](#more-than-one-subscription).)
 - **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. Nothing that runs on a timer ever writes to `~/.claude` or `~/.claude.json`. The one thing that does is `claude-window switch`, only when you run it, to two files, after copying both somewhere safe — and a test names the single function allowed to write there and fails the day a second one appears.
 - **It refuses to bill you by surprise.** Pings run in interactive mode rather than `--print`, and `ANTHROPIC_API_KEY` is stripped from the environment so a ping can never land on a pay-as-you-go account.
 - **It says when it is broken.** Most failures here are silent — a timer that will never fire again, a login that expired, two accounts that are secretly the same account. `claude-window doctor` names them.
@@ -262,41 +272,36 @@ For the boundaries that somehow land off that grid, the tool still books one ext
 
 ### Keeping several accounts spaced
 
-The same mechanism does the spacing, under one constraint:
+A window starts on the first ping *after* the previous one ends, so the one thing the tool can do to an account's schedule is **not open its next window yet**. That is the whole mechanism. When an account's window ends, the next tick asks a single question — *is this the slot the plan wants this account's window in?* — and pings, or waits for the slot that is.
 
-> A window starts on the first ping *after* the previous one ends, so a schedule can only ever be pushed **later**, never earlier.
+Waiting is not a lockout, and that is what makes it safe to do unasked. A held account is fully usable: use it and its window opens there and then, with all of its quota, and the plan is worked out again from wherever things now stand. `which` tells you when the account it recommends is being held, and `switch` to a held account opens its window on the spot. Nothing is booked, nothing has to be confirmed, and there is no correction too large to make, because no correction takes anything away from you.
 
-Every correction therefore costs a stretch with no window running, and the tool finds the cheapest way to get everything evenly spaced. That leads somewhere slightly counterintuitive: when one account drifts 20 minutes late, it is cheaper to hold the *others* back 20 minutes than to drag the late one nearly all the way around the clock.
+It converges, and stays put. Every hold is a whole number of slots, so each one moves the arrangement strictly closer to the best one, and once there nothing is ever held again — so nothing you do with your accounts can move it. Only an outage, or an account joining or leaving the rotation, can. From any starting arrangement of two, three or four accounts it settles within one window plus the longest hold, eight hours at the very worst; every case was checked.
 
-Corrections worth minutes simply happen. Corrections worth hours — two accounts restarting together after a long outage is the realistic case — are costed and left for you to approve:
+A fresh install is the realistic worst case: setting up each account sends it one message, so their windows all start within minutes of each other. For the first few hours some accounts will be held at the end of a window to spread them out. Use them anyway if you need them.
 
-```bash
-claude-window realign            # what it would cost
-claude-window realign --confirm  # do it
-```
-
-A tool other people install should not make an account unavailable for two hours on its own initiative.
+One case overrides the plan: an account is never held when every other one is spent until after its slot. Saving a minute of average wait is not worth leaving you with nothing.
 
 ### Who counts as N
 
-The target is 5/N, and N is not how many subscriptions you own. It is how many will **start a window at their next boundary** — recomputed from observation on every ping. One test decides it: *can this account serve a request no later than the moment its current window ends?*
+N is not how many subscriptions you own. It is how many will **start a window at their next boundary** — recomputed from observation on every ping. One test decides it: *can this account serve a request no later than the moment its current window ends?*
 
 - **Out of 5-hour quota — still counts.** It becomes usable again at exactly its boundary, the ping 30 seconds later gets through, and its next window starts on time. Nothing was lost, so nothing needs re-spacing.
 - **Weekly limit spent, subscription lapsed, sign-in expired, or silent for a whole window — does not count.** Its boundary passes with nothing getting through, so no window begins, and a slot held for a window that never starts is a hole in the rotation.
 
-The difference is not cosmetic. Three accounts with one out of action, counted as three, are spaced 1h40m apart — which bunches the two that still supply windows into a third of the day and leaves the rest of it empty. Counted properly they sit 2h30m apart and cover it:
+The difference is not cosmetic. Three accounts with one out of action, counted as three, are spaced for three — which bunches the two that still supply windows into part of the day and leaves the rest of it empty. Counted properly they sit 2h30m apart and cover it:
 
 ```
 Spacing
-  Windows should sit 2h30m00s apart — 2 of 3 accounts are holding a window.
-    account 1 (personal) next window starts 2026-08-13 01:52:35 IDT
-    account 2 (work)     next window starts 2026-08-13 04:22:35 IDT
+  Windows should sit 2h30m00s apart (2 of 3 accounts are holding a window).
+    account 1 (personal) next window starts 2026-08-13 01:30:00 IDT
+    account 2 (work)     next window starts 2026-08-13 04:00:00 IDT
     account 3 (spare)    not holding a window right now — its weekly limit is spent,
                          which outlasts its current window
   Spacing is correct.
 ```
 
-**An account that is out of the rotation is still pinged**, on the same 30-minute schedule, and that is deliberate: an ordinary ping getting through is the only thing that ever notices an account coming back — a weekly limit resetting, a renewed subscription, a fresh login, a plan upgrade. It rejoins on the spot, and nothing is ever required of you. Because a change in the set moves the target for everyone, the set then has to hold steady for a full window before the tool acts on it — otherwise a limit spent on Friday afternoon would buy a re-space and Saturday morning would buy it back.
+**An account that is out of the rotation is still pinged**, on the same 30-minute schedule, and that is deliberate: an ordinary ping getting through is the only thing that ever notices an account coming back — a weekly limit resetting, a renewed subscription, a fresh login, a plan upgrade. It rejoins on the spot, and nothing is ever required of you. A change in the set moves the target for everyone, and the accounts are re-spaced at their next boundaries — at most one hold of a couple of hours on one account, which, like every hold, you can override by using it.
 
 ### Both limits have a say
 
@@ -338,7 +343,6 @@ Answering "no pings" on a machine that has been pinging offers to stop its timer
 | `claude-window switch [2] [--no-sign-in]` | Point your own Claude Code at an account. The only command that writes to `~/.claude`. |
 | `claude-window doctor` | Check the setup and say what is wrong. |
 | `claude-window uninstall [--purge]` | Remove the timers. `--purge` also deletes this checkout's generated files, and asks first: the checkpoints in `state/` cost a real message each to rebuild. |
-| `claude-window realign [--confirm]` | Show, then optionally apply, a spacing correction. |
 | `claude-window log [2] [-f] [-n N]` | A ping log, or every account's interleaved. |
 | `claude-window accounts` | List the configured accounts, who each is, and where its login lives. |
 | `claude-window check` | Validate the accounts without changing anything. |
@@ -382,7 +386,7 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 - Pings ask Claude for no thinking and never update the CLI. Thinking is billed as output and a ping's reply is discarded; an update rewrites the tool definitions that sit at the front of every cached prompt, which would make your own open sessions expensive to resume. Neither affects how you run Claude Code yourself.
 - Accounts must be genuinely different Claude accounts. Signing in twice as the same one looks like it works and buys nothing; setup checks for it.
 - **Do not point a ping directory at a *different* account with `/login`.** That directory's identity is how the tool knows which account it is pinging. Signing the *same* account in again is fine and is what `doctor` tells you to do when a login expires; changing which account lives there means editing `accounts.json` and re-running `./install.sh`.
-- A booked *anchor* does not survive a reboot — it is a transient systemd unit. Harmless: the next ordinary ping reads the reset times again and books another. A hold booked by `realign --confirm` is written to `state/` and does survive.
+- A booked *anchor* does not survive a reboot — it is a transient systemd unit. Harmless: anchors are only booked for a boundary off the 30-minute grid, and the ordinary pings land on every boundary that is on it.
 - It relies on where Claude Code stores sessions and on the window reset time it reports. Both are internal details that a future release could change; the tests would notice, and `doctor` reports what it can verify.
 - Linux only, and enforced rather than merely stated — and now said *before* you spend anything rather than after. Running the pings needs systemd; `--no-pings` does not, but switching reads the credentials file Claude Code keeps on Linux, which macOS replaces with the Keychain — so `switch` refuses there rather than consuming a parked login to no effect. Setup on macOS or Windows warns up front that `switch` will not work, `doctor` reports it instead of saying "Everything checks out", and what does still work there — `status`, `which` and `doctor` reading a copied `schedule.json` — carries on working. Switching on macOS and Windows is wanted and not yet built.
 - **Having `systemctl` is not the same as having a systemd user session.** WSL without `systemd=true`, `docker exec`, `su -` and `ssh host ./install.sh` on some distributions all ship the binary and reach no user bus. Setup checks for the manager itself now and refuses rather than reporting timers it did not start.

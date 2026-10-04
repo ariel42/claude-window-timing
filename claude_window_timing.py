@@ -23,9 +23,12 @@ run `python3 claude_window_timing.py <command>` directly.
 import argparse
 import email.utils
 import collections
+import contextlib
 import difflib
 import fcntl
 import hashlib
+import io
+import itertools
 import json
 import os
 import pty
@@ -833,6 +836,11 @@ def rank_account(account, state, now, availability=None):
     """
     avail = availability or account_availability(account, state, now)
     if avail.tier == USABLE:
+        # A held account has no window running, so nothing of its is about to
+        # expire: last among the usable, but usable -- and the one recommended
+        # when it is the only one.
+        if held_until(state, now):
+            return (USABLE, float("inf"), account.index)
         return (USABLE, next_expiry(state, now), account.index)  # most perishable
     if avail.tier == WAITING:
         return (WAITING, avail.until, account.index)             # soonest back
@@ -866,6 +874,13 @@ def choose_account(accounts, states=None, now=None, avail=None):
         return best, "{}; back {}{} (in {})".format(
             chosen.note, "" if chosen.exact else "no later than ",
             fmt_time(chosen.until), fmt_delta(chosen.until - now))
+
+    until = held_until(state, now)
+    if until:
+        return best, ("no window running — using it starts a fresh 5-hour "
+                      "window now. It is being held until {} (in {}) to space "
+                      "the windows; that is yours to spend.".format(
+                          fmt_time(until), fmt_delta(until - now)))
 
     expiry = next_expiry(state, now)
     if expiry == float("inf"):
@@ -917,6 +932,11 @@ def headline(chosen, avail, count):
 def describe_availability(state, avail, now):
     """One line per account, for the list `which` prints under its answer."""
     if avail.tier == USABLE:
+        until = held_until(state, now)
+        if until:
+            return ("usable — no window running; held until {} to space the "
+                    "windows, and using it starts one now".format(
+                        fmt_time(until)))
         expiry = next_expiry(state, now)
         if expiry == float("inf"):
             return "no window information yet"
@@ -1054,7 +1074,7 @@ def publish_schedule(accounts):
     needs nothing live: a window's *phase* is a constant, so a laptop with a copy
     of this file can work out which account is most perishable with arithmetic
     alone — no network call, no daemon, and nothing to go stale but the phase,
-    which changes only when the schedule is realigned.
+    which changes only when the spacing moves it.
     """
     now = time.time()
     window = WINDOW_HOURS * 3600
@@ -1062,6 +1082,14 @@ def publish_schedule(accounts):
     for account in accounts:
         state = read_state(account)
         expiry = next_expiry(state, now)
+        # A held account's last window is over and its next has not begun, so
+        # rolling the old one forward would publish a phase it is being moved
+        # off. What travels is the window it is being moved to, and when that
+        # starts -- so a copy read before then says it has no window running,
+        # and one read after rolls forward on the right phase.
+        held = held_until(state, now)
+        if held:
+            expiry = held + WINDOW_HOURS * 3600
         five = ((state.get("rate_limits") or {}).get("five_hour") or {})
         # The verdict travels with the numbers. Only this machine can see a
         # lapsed subscription or a spent weekly limit, so a laptop working from
@@ -1094,6 +1122,7 @@ def publish_schedule(accounts):
             "unusable_because": usable.note or None,
             "used_percentage": five.get("used_percentage"),
             "last_run": state.get("last_run"),
+            "held_until": held,
         })
 
     # Taken before the overwrite, because the overwrite is what destroys it.
@@ -1232,6 +1261,7 @@ def schedule_view(accounts):
             "rate_limits": {"five_hour": {
                 "resets_at": entry.get("expires_at"),
                 "used_percentage": entry.get("used_percentage")}},
+            "held_until": entry.get("held_until"),
         }
         # Fall back on `usable_now` if the file predates the named tier, so an
         # older copy degrades to a coarser answer rather than to no answer.
@@ -1270,12 +1300,12 @@ def schedule_view(accounts):
 # Keeping the windows evenly spaced
 # ---------------------------------------------------------------------------
 #
-# N accounts are worth most when their windows are spread evenly — 5/N hours
-# apart. No arrangement creates capacity: the expected number of refills in any
-# stretch of time is the same however the windows sit. What even spacing changes
-# is the *shape* of the supply, and since unused quota expires at every reset,
-# shape is worth real money. It also halves the worst-case wait for a fresh
-# window, from 5 hours to 5/N.
+# N accounts are worth most when their windows are spread evenly. No arrangement
+# creates capacity: the expected number of refills in any stretch of time is the
+# same however the windows sit. What even spacing changes is the *shape* of the
+# supply, and since unused quota expires at every reset, shape is worth real
+# money. It also shortens the wait for a fresh window from up to 5 hours to up to
+# about 5/N.
 #
 # N is not the number of accounts configured. It is the number that will start a
 # window at their next boundary, recomputed from observation on every ping —
@@ -1283,36 +1313,144 @@ def schedule_view(accounts):
 # still costs a slot if it is counted, and the slot is a stretch of the day with
 # no window arriving in it.
 #
-# One constraint governs everything here:
+# Three facts shape everything below.
 #
-#     A window starts on the first ping *after* the previous one ends, so a
+#   * A window starts on the first ping *after* the previous one ends, so a
 #     phase can only ever be delayed, never advanced.
 #
-# Every correction therefore costs a deliberate gap with no window running, and
-# the job is to find the cheapest set of delays that lands the accounts evenly
-# spaced. Note that only *relative* offsets matter — the whole arrangement may
-# rotate freely — which is what makes common drift free to ignore.
+#   * Anthropic floors every window start to the 30-minute grid (GRID_SEC), so a
+#     phase is one of WINDOW_SLOTS values. Exact 5/N spacing is reachable only
+#     when 5/N hours is a whole number of slots — two accounts and five. So the
+#     target is not 5/N but the best arrangement the grid allows, judged by the
+#     thing spacing exists for: the expected wait for a fresh window, which is
+#     proportional to the sum of the squared gaps. At three accounts that is
+#     90/90/120 minutes, one minute of average wait worse than an ideal nobody
+#     can reach. The old target was the unreachable one, and chasing it cost
+#     half an hour of dead window every cycle, for ever.
+#
+#   * Not pinging is not a lockout. Holding an account back only means the tool
+#     does not open its window; anyone can still use the account, which opens it
+#     there and then, with its full quota. So there is no correction too large
+#     to make unasked, no ceiling, no confirmation and nothing booked: every
+#     tick asks one question — is this the slot the plan wants this account's
+#     window in? — and pings or does not. A plan interrupted by somebody using
+#     the account is simply worked out again from where things now are.
+#
+# That converges, and stays converged: every hold is a whole number of slots,
+# so each one taken moves the arrangement strictly closer to an optimum, and at
+# an optimum nothing is held, so nothing anyone does can move it again. Only an
+# outage or a participant coming or going can. Both were checked exhaustively
+# over every starting arrangement of two, three and four accounts.
 
-# Ignore errors smaller than this. Each window's phase creeps forward by roughly
-# the CLI's startup time, and that creep is near-identical across accounts, so
-# it cancels out of the relative offsets. Chasing it would mean paying real dead
-# time to correct noise.
-ALIGN_DEADBAND_SEC = 5 * 60
 
-# Correct silently up to here. Beyond it, say what it would cost and wait to be
-# told: a multi-hour hold that nobody asked for is not something a tool other
-# people install should do on its own.
-AUTO_CORRECT_MAX_SEC = 45 * 60
+def raw_reset(state):
+    """
+    This account's 5-hour reset exactly as last reported, or None.
 
-ALIGNMENT_FILE = os.path.join(STATE_ROOT, "alignment.json")
-
-
-def window_phase(state, now):
-    """Where this account's boundary falls within the 5-hour cycle, or None."""
-    expiry = next_expiry(state, now)
-    if expiry == float("inf"):
+    Not rolled forward, unlike next_expiry(): a reset in the past is the one
+    state the spacing has to see, because it means the window has ended and
+    nothing has opened the next one yet.
+    """
+    resets = ((state.get("rate_limits") or {}).get("five_hour")
+              or {}).get("resets_at")
+    if not isinstance(resets, (int, float)) or isinstance(resets, bool) \
+            or resets != resets or not resets:
         return None
-    return expiry % (WINDOW_HOURS * 3600)
+    return resets
+
+
+def window_running(state, now):
+    """Whether this account's last reported window is still open."""
+    resets = raw_reset(state)
+    return resets is not None and 0 < resets - now <= READING_SANE_SEC
+
+
+def held_until(state, now):
+    """
+    When the tool means to open this account's next window, if it is holding
+    it back to space the windows — or None.
+
+    Recorded by the ping that held it and refreshed by every one after, so it is
+    at most one interval old. It describes the tool's own intention only: a
+    person can use the account at any moment, and then this is simply wrong
+    until the next ping notices.
+    """
+    until = state.get("held_until")
+    if isinstance(until, (int, float)) and not isinstance(until, bool) \
+            and until > now:
+        return until
+    return None
+
+
+def slot_start(moment):
+    """The start of the grid slot a moment falls in."""
+    return moment - moment % GRID_SEC
+
+
+def gap_cost(slots):
+    """
+    The sum of the squared gaps between these slots, around the cycle.
+
+    Proportional to the expected wait for a fresh window from a random moment,
+    which is the quantity spacing exists to make small. It also orders the
+    worst gap the same way, so "evenly spaced" means one thing.
+    """
+    ordered = sorted(slots)
+    if len(ordered) < 2:
+        return WINDOW_SLOTS ** 2
+    gaps = [(ordered[(i + 1) % len(ordered)] - ordered[i]) % WINDOW_SLOTS
+            for i in range(len(ordered))]
+    return sum(g * g for g in gaps)
+
+
+_OPTIMAL_TARGETS = {}
+
+
+def optimal_targets(count):
+    """
+    Every set of `count` slots spaced as evenly as the grid allows.
+
+    Exhaustive, because the space is tiny — at most C(10,5) = 252 sets — and
+    exhaustive cannot be subtly wrong in the way a clever construction can.
+    """
+    if count not in _OPTIMAL_TARGETS:
+        candidates = list(itertools.combinations(range(WINDOW_SLOTS), count))
+        best = min(gap_cost(c) for c in candidates)
+        _OPTIMAL_TARGETS[count] = [c for c in candidates if gap_cost(c) == best]
+    return _OPTIMAL_TARGETS[count]
+
+
+def plan_slots(phases):
+    """
+    How many whole slots to hold each account back so the windows end up as
+    evenly spaced as the grid allows, for the least total holding.
+
+    `phases` maps name -> the slot that account's next window would start in
+    if nothing held it. Returns name -> slots to hold it. Every optimal target
+    set is tried, in every rotation that keeps the accounts in their cyclic
+    order (forward-only delays never gain by crossing), and the cheapest wins.
+    Ties are broken on the delays themselves, so the same input gives the same
+    plan on every call — which matters, because each account's ping works the
+    plan out afresh and must reach the same answer as the others.
+
+    At least one account is always left at zero: shifting a whole target set
+    back by a slot would make every delay one smaller, so a plan with no zero is
+    never the cheapest. On every tick, something pings.
+    """
+    count = len(phases)
+    if count < 2 or count > WINDOW_SLOTS:
+        return dict((name, 0) for name in phases)
+    names = sorted(phases, key=lambda n: (phases[n], n))
+    current = [phases[n] % WINDOW_SLOTS for n in names]
+    best = None
+    for targets in optimal_targets(count):
+        for rotation in range(count):
+            delays = dict((name, (targets[(i + rotation) % count] - current[i])
+                           % WINDOW_SLOTS) for i, name in enumerate(names))
+            key = (sum(delays.values()), tuple(sorted(delays.items())))
+            if best is None or key < best[0]:
+                best = (key, delays)
+    return best[1]
 
 
 def participation(account, state, now):
@@ -1379,7 +1517,13 @@ def participation(account, state, now):
             return False, "no ping has ever got through — see `{} doctor`".format(
                 COMMAND)
         return False, "no ping has got through yet"
-    if proven <= now - WINDOW_HOURS * 3600:
+    # Measured from the moment the tool stopped pinging on purpose, when it
+    # has. Holding an account back to space it is the tool's own choice, not
+    # silence from the account, and a long hold must not read as an account
+    # that has died -- that would change N, and re-space every other account
+    # around a hole that is not there.
+    reference = state.get("withheld_since") or now
+    if proven <= reference - WINDOW_HOURS * 3600:
         return False, "nothing has got through since {}".format(
             fmt_time(proven))
 
@@ -1390,159 +1534,98 @@ def is_participating(account, state, now):
     return participation(account, state, now)[0]
 
 
-def plan_alignment(phases, window=None):
+def spacing_plan(accounts, states, now):
     """
-    The cheapest set of forward-only delays that spaces these phases evenly.
+    The plan for every account taking part: (delays, phases, participants).
 
-    `phases` maps name -> phase in seconds within the window. Returns
-    (delays, total) where delays maps name -> seconds to hold that account back.
-
-    Because targets are evenly spaced, sliding a single global offset covers
-    every way of assigning accounts to slots, and the optimum always leaves at
-    least one account untouched — so it is enough to try the offset that zeroes
-    each account in turn. That is N candidates, each costing N to evaluate.
-
-    Worth noticing what falls out: correcting one account that has drifted late
-    is usually done by delaying *the others* a little, not by dragging the late
-    one all the way around.
+    An account with its window open is fixed — its next window will start when
+    this one ends, at the phase it is already on. One whose window has ended is
+    free to start in the current slot or any later one. Everything else follows
+    from plan_slots().
     """
-    window = window or WINDOW_HOURS * 3600
-    names = sorted(phases, key=lambda n: (phases[n], n))
-    count = len(names)
-    if count < 2:
-        return {name: 0.0 for name in names}, 0.0
-
-    spacing = float(window) / count
-    best_delays, best_total = None, None
-    for zeroed in range(count):
-        offset = (phases[names[zeroed]] - zeroed * spacing) % window
-        delays, total = {}, 0.0
-        for position, name in enumerate(names):
-            delay = ((offset + position * spacing) - phases[name]) % window
-            delays[name] = delay
-            total += delay
-        if best_total is None or total < best_total - 1e-9:
-            best_delays, best_total = delays, total
-    return best_delays, best_total
-
-
-def read_alignment():
-    try:
-        with open(ALIGNMENT_FILE) as f:
-            return json.load(f)
-    except (IOError, OSError, ValueError):
-        return {}
-
-
-def write_alignment(data):
-    """
-    Record the shared alignment view. Failing to is survivable, and must be.
-
-    This runs *after* the ping, from the same stretch of code that still has to
-    write the account's state and book the boundary anchor. Spacing is advisory;
-    those two are not. So a full disk here costs a slightly stale spacing view
-    rather than a permanently late schedule.
-    """
-    try:
-        if not os.path.isdir(STATE_ROOT):
-            os.makedirs(STATE_ROOT, 0o700)
-        tmp = _temp_name(ALIGNMENT_FILE)
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
-        os.replace(tmp, ALIGNMENT_FILE)
-    except (IOError, OSError) as e:
-        sys.stderr.write("Could not record the spacing view: {}\n".format(e))
-
-
-def alignment_plan(accounts, states, now, record=True):
-    """
-    What the spacing should be, and what it would cost to get there.
-
-    Returns (delays, total, participants, settled). With `record` false it
-    reports without writing anything, which is what the commands that only
-    *look* — status, doctor — must do: noting a change in the participating set
-    starts the settling clock, and a diagnostic should never quietly move the
-    schedule it is reporting on.
-
-    `settled` is False while the set of participating accounts is still new:
-    an account dropping out changes the ideal spacing for everyone, and acting
-    on that immediately would mean paying for a re-space twice if it comes back
-    shortly. So the set has to hold steady for a full window before it moves the
-    target. An account nobody has ever seen is exempt — it cannot be the one
-    coming back — which is what keeps a fresh install from waiting on itself.
-    """
-    window = WINDOW_HOURS * 3600
-    participants = sorted(a.name for a in accounts
-                          if is_participating(a, states[a.name], now))
-
-    alignment = read_alignment()
-    previous = alignment.get("participants")
-    # An install that predates this key has still seen whatever it currently
-    # records as participating, and treating those as new would grant exactly
-    # the wrong account a free re-space the first time one drops out and
-    # returns.
-    ever = set(alignment.get("ever") or alignment.get("participants") or ())
-    if previous != participants and record:
-        # A *first* sighting is not a change. There is no earlier arrangement to
-        # thrash against and nothing has been paid for one yet, so waiting would
-        # only mean a freshly installed setup sitting visibly misaligned for a
-        # whole window with nothing to show for the patience.
-        #
-        # Nor is an account joining that has never been seen before. What this
-        # waits out is an account dropping out and coming back — a limit spent
-        # on Friday buying a re-space that Saturday buys back — and an account
-        # with no history cannot be doing that. Without this a two-account
-        # install would restart its own clock: the accounts are pinged a minute
-        # apart, so the set is observed as {1} and then {1,2}, and the second
-        # sighting would read as thrash on a setup minutes old.
-        joined = set(participants) - set(previous or ())
-        first_look = previous is None or (
-            joined and not set(previous) - set(participants)
-            and not joined & ever)
-        alignment["participants"] = participants
-        alignment["ever"] = sorted(ever | set(participants))
-        alignment["participants_since"] = now - window if first_look else now
-        write_alignment(alignment)
-    settled = now - alignment.get("participants_since", now) >= window
-
+    participants = [a for a in accounts
+                    if is_participating(a, states[a.name], now)]
     phases = {}
-    for account in accounts:
-        if account.name in participants:
-            phase = window_phase(states[account.name], now)
-            if phase is not None:
-                phases[account.name] = phase
-
-    delays, total = plan_alignment(phases, window)
-    return delays, total, participants, settled
+    for account in participants:
+        state = states[account.name]
+        phases[account.name] = slot_of(raw_reset(state)) \
+            if window_running(state, now) else slot_of(now)
+    return plan_slots(phases), phases, participants
 
 
-def describe_alignment(accounts, states, now, suggest_realign=True,
-                       note_waiting=True, record=False):
+def _someone_else_can_serve(account, accounts, states, now, until):
     """
-    A human summary of the spacing and what correcting it would cost.
+    Whether any other account can take a request before `until`.
 
-    `suggest_realign` is off when `realign` is itself the caller, which is
-    already showing the fuller version of that advice. `note_waiting` is off
-    when the caller is about to correct the spacing regardless — an explicit
-    request overrides the wait, and saying both would contradict itself.
+    A held account counts: it can always be used, which opens it. That is the
+    point of holding being harmless — and the reason this check exists is the
+    one case where it is not: everything else spent, and the tool sitting on the
+    one account that could serve, to save a minute of average wait.
     """
-    delays, total, participants, settled = alignment_plan(accounts, states, now,
-                                                         record=record)
+    for other in accounts:
+        if other.name == account.name:
+            continue
+        avail = account_availability(other, states[other.name], now)
+        if avail.tier == USABLE:
+            return True
+        if avail.tier == WAITING and avail.until is not None \
+                and avail.until <= until:
+            return True
+    return False
+
+
+def should_open_window(account, accounts, states, now):
+    """
+    Whether this tick's ping should go ahead: (go, until, why).
+
+    `why` is None, or (kind, sentence) when the window opens for a reason the
+    log should carry: "last" or "valve".
+
+    A ping inside a running window moves nothing and always goes ahead — so
+    does one to an account outside the rotation, because pings are how the tool
+    notices it coming back. The only ping ever skipped is the one that would
+    open a window in the wrong slot, and `until` is when the right one starts.
+
+    Two exceptions open the window regardless, and `why` names them for the
+    log: when no other account could serve a request before then, and the
+    safety valve below.
+    """
+    state = states[account.name]
+    if len(accounts) < 2 or window_running(state, now):
+        return True, None, None
+    delays, phases, participants = spacing_plan(accounts, states, now)
+    if len(participants) < 2 or not delays.get(account.name):
+        return True, None, None
+    until = slot_start(now) + delays[account.name] * GRID_SEC
+    if not _someone_else_can_serve(account, accounts, states, now, until):
+        return True, None, ("last", "Opening the window now rather than at {} "
+                                    "for spacing: no other account can serve a "
+                                    "request before then.".format(
+                                        fmt_time(until)))
+    # A plan holds an account for at most WINDOW_SLOTS - 1 ticks. Reaching this
+    # means something here is wrong, and the account is pinged rather than left
+    # without a window for longer than a window lasts.
+    if state.get("skipped_in_a_row", 0) >= WINDOW_SLOTS:
+        return True, None, ("valve", "Held for a whole window, which the "
+                                     "spacing should never do — pinging anyway. "
+                                     "This is a bug; `{} doctor` reports it."
+                                     .format(COMMAND))
+    return False, until, None
+
+
+def spacing_lines(accounts, states, now):
+    """A human summary of the spacing, for `status`."""
     lines = []
-    window = WINDOW_HOURS * 3600
-    # Measured rather than assumed: an account labelled "1 (personal)" is wider
-    # than the fixed column this used to have, so it pushed its own line out of
-    # line with every other one.
     width = max([len(a.display) for a in accounts] or [0])
+    delays, phases, participants = spacing_plan(accounts, states, now)
     if len(participants) < 2:
         # A brand-new install is not a fault, and must not read like one: no
         # account has a window yet because nothing has been pinged yet.
-        if not participants and all(next_expiry(states[a.name], now) == float("inf")
-                                    for a in accounts):
+        if not participants and all(next_expiry(states[a.name], now)
+                                    == float("inf") for a in accounts):
             lines.append("No account has been pinged yet — the spacing is "
                          "worked out from the first ping onwards.")
-            return lines, delays, total, settled
-
+            return lines
         lines.append("{} — nothing to space.".format(
             "No account is holding a window" if not participants
             else "Only one account is holding a window"))
@@ -1551,132 +1634,54 @@ def describe_alignment(accounts, states, now, suggest_realign=True,
             if not holding:
                 lines.append("  account {:<{}} is not: {}".format(
                     account.display, width, why))
-        return lines, delays, total, settled
+        return lines
 
-    # The target is 5/N over the accounts that will actually start a window, not
-    # over the accounts that exist. Say so when those differ, because otherwise
-    # the spacing looks wrong to anyone counting their subscriptions.
+    # Said as the gaps the grid allows, because "5/N" is not what three or four
+    # accounts can actually get, and a report that promised it would look
+    # broken to anyone counting.
+    target = optimal_targets(len(participants))[0]
+    ordered = sorted(target)
+    gaps = sorted(((ordered[(i + 1) % len(ordered)] - ordered[i]) % WINDOW_SLOTS)
+                  * GRID_SEC for i in range(len(ordered)))
+    shape = (fmt_delta(gaps[0]) + " apart" if len(set(gaps)) == 1 else
+             "{} apart — as even as the 30-minute grid allows".format(
+                 ", ".join(fmt_delta(g) for g in gaps)))
     if len(participants) < len(accounts):
-        lines.append("Windows should sit {} apart — {} of {} accounts are "
-                     "holding a window.".format(
-                         fmt_delta(window / float(len(participants))),
-                         len(participants), len(accounts)))
+        lines.append("Windows should sit {} ({} of {} accounts are holding a "
+                     "window).".format(shape, len(participants), len(accounts)))
     else:
-        lines.append("Windows should sit {} apart.".format(
-            fmt_delta(window / float(len(participants)))))
+        lines.append("Windows should sit {}.".format(shape))
 
-    # A hold that has been booked but not yet served leaves the phases exactly
-    # where they were, so the arithmetic still reports the full error. Saying
-    # only that would read as though nothing had been done.
-    booked = False
+    held = False
     for account in accounts:
+        state = states[account.name]
         if account.name not in delays:
             lines.append("  account {:<{}} not holding a window right now — "
                          "{}".format(account.display, width,
-                                     participation(account, states[account.name],
-                                                   now)[1]))
+                                     participation(account, state, now)[1]))
             continue
-        delay = delays[account.name]
-        boundary = next_expiry(states[account.name], now)
-        hold = states[account.name].get("hold") or {}
-        if hold.get("until", 0) > now:
-            booked = True
-            note = "   already held back to {}".format(fmt_time(hold["until"]))
-        elif delay < ALIGN_DEADBAND_SEC:
-            note = ""
+        until = held_until(state, now)
+        if until:
+            held = True
+            lines.append("  account {:<{}} held until {} to space it — using "
+                         "it before then just starts its window early".format(
+                             account.display, width, fmt_time(until)))
+        elif window_running(state, now):
+            lines.append("  account {:<{}} next window starts {}".format(
+                account.display, width, fmt_time(raw_reset(state))))
         else:
-            note = "   hold {} to line up".format(fmt_delta(delay))
-        lines.append("  account {:<{}} next window starts {}{}".format(
-            account.display, width, fmt_time(boundary), note))
+            lines.append("  account {:<{}} no window running — the next ping "
+                         "{}".format(account.display, width,
+                                     "opens one" if not delays[account.name]
+                                     else "decides when to open one"))
 
-    if total < ALIGN_DEADBAND_SEC:
+    if not any(delays.values()) and not held:
         lines.append("Spacing is correct.")
-    elif booked:
-        lines.append("A correction is already booked. The spacing will be right "
-                     "once those windows have started.")
-    elif not settled:
-        if note_waiting:
-            lines.append("Spacing is off, but the set of active accounts changed "
-                         "recently — waiting for it to settle before correcting.")
-    elif total > AUTO_CORRECT_MAX_SEC:
-        # The flag suppresses the sentence, not the branch: dropping into the
-        # "small enough" case for a correction this size would contradict the
-        # very next line `realign` prints.
-        if suggest_realign:
-            lines.append("Correcting this means {} with no window running on "
-                         "the accounts being held, which is too much to do "
-                         "unasked. See what it involves with:  {} "
-                         "realign".format(fmt_delta(total), COMMAND))
     else:
-        lines.append("Small enough to fix without asking — the ping at the next "
-                     "window boundary will do it.")
-    return lines, delays, total, settled
-
-
-def apply_alignment(account, accounts, states, state, now, boundary):
-    """
-    How long this account should hold its next window back, in seconds.
-
-    `boundary` is the moment the next window could otherwise start, and is passed
-    in rather than recomputed: the caller derives it from *both* limits, while
-    the spacing arithmetic only ever reasons about the 5-hour cycle. Those two
-    coincide for a healthy account and diverge when a weekly limit is in the way,
-    so mixing them would place a hold relative to the wrong instant.
-    """
-    if not boundary or len(accounts) < 2:
-        return 0.0
-
-    # A hold already booked for this account is the answer to this question,
-    # and it was reached once already. The phases do not move until it has been
-    # served, so recomputing here would find the same error every half hour and
-    # either re-book the identical hold or — after `realign --confirm` — go on
-    # telling the user to confirm a correction they have just confirmed. What
-    # the anchor needs is the moment that hold ends, expressed the way the
-    # caller wants it: as an amount to add to the boundary.
-    booked = state.get("hold")
-    if booked and booked.get("until", 0) > now:
-        return max(0.0, booked["until"] - boundary)
-
-    delays, total, participants, settled = alignment_plan(accounts, states, now)
-    delay = delays.get(account.name, 0.0)
-
-    if delay < ALIGN_DEADBAND_SEC:
-        return 0.0
-    if not settled:
-        log(account, "Spacing is out by {} but the active accounts changed "
-                     "recently — leaving it alone until that settles.".format(
-                         fmt_delta(delay)))
-        return 0.0
-
-    if total > AUTO_CORRECT_MAX_SEC:
-        # Said, not stored. `realign` prices the correction from live state when
-        # it is asked to, because a plan recorded half a day ago describes
-        # windows that have since moved on.
-        log(account, "Spacing is out by {} in total, which needs a hold of {} "
-                     "on this account. That is too long to do unasked — run "
-                     "`{} realign --confirm` to apply it.".format(
-                         fmt_delta(total), fmt_delta(delay), COMMAND))
-        return 0.0
-
-    state["hold"] = {"from": boundary, "until": boundary + delay,
-                     "reason": "spacing this account {} later".format(
-                         fmt_delta(delay))}
-    log(account, "Holding the next window back by {} so the accounts stay "
-                 "{} apart: it will start at {}.".format(
-                     fmt_delta(delay),
-                     fmt_delta(WINDOW_HOURS * 3600 / float(len(participants))),
-                     fmt_time(boundary + delay)))
-    return delay
-
-
-def active_hold(state, now):
-    """The hold currently suppressing pings for this account, or None."""
-    hold = state.get("hold")
-    if not hold:
-        return None
-    if hold.get("from", 0) <= now < hold.get("until", 0):
-        return hold
-    return None
+        lines.append("Being spaced: an account whose window has ended is opened "
+                     "in the slot that spaces it, not the first one available. "
+                     "Nothing needs doing.")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -3770,38 +3775,51 @@ def acquire_ping_lock(account):
     return fd
 
 
-def ping(account, accounts=None):
+def ping(account, accounts=None, force=False):
     lock = acquire_ping_lock(account)
     if lock is None:
         log(account, "A ping for account {} is already running — skipping this "
                      "one rather than pinging twice.".format(account.display))
         return True
     try:
-        return _ping(account, accounts)
+        return _ping(account, accounts, force)
     finally:
         os.close(lock)          # releases the flock with it
 
 
-def _ping(account, accounts=None):
+def _ping(account, accounts=None, force=False):
     rotate_log(account)
     accounts = accounts or [account]
     states = {a.name: read_state(a) for a in accounts}
     state = states[account.name]
     now = time.time()
 
-    # A hold is the one reason a ping is ever skipped, and it is always about
-    # timing, never about whether the account looks usable. Pings to an account
-    # that cannot serve anything carry on regardless: they cost nothing and they
-    # are the only way to notice it coming back.
-    hold = active_hold(state, now)
-    if hold:
-        log(account, "Holding account {} until {} — {}. Not pinging, because a "
-                     "ping now would start the window at the wrong time.".format(
-                         account.display, fmt_time(hold["until"]),
-                         hold.get("reason", "alignment")))
-        schedule_anchor(account, hold["until"] + account.guard_sec)
-        write_state(account, state)
-        return True                   # deliberately not pinging is not a failure
+    # Holding a window back to space it is the one reason a ping is ever
+    # skipped, and it is always about timing, never about whether the account
+    # looks usable. Pings to an account that cannot serve anything carry on
+    # regardless: they cost nothing and they are the only way to notice it
+    # coming back. `force` is a person asking for this account now -- `switch`
+    # -- which no plan overrides.
+    if not force:
+        go, until, why = should_open_window(account, accounts, states, now)
+        if not go:
+            state["skipped_in_a_row"] = state.get("skipped_in_a_row", 0) + 1
+            state["withheld_since"] = state.get("withheld_since") or now
+            state["held_until"] = until
+            log(account, "Not pinging account {}: its window has ended, and "
+                         "opening the next one now would put it in the wrong "
+                         "slot. It opens at {} (in {}) to space the windows — "
+                         "using the account before then simply opens it "
+                         "early.".format(account.display, fmt_time(until),
+                                         fmt_delta(until - now)))
+            write_state(account, state)
+            return True       # deliberately not pinging is not a failure
+        if why:
+            log(account, why[1])
+            if why[0] == "valve":
+                state["valve_at"] = now
+    for key in ("skipped_in_a_row", "withheld_since", "held_until"):
+        state.pop(key, None)
 
     log(account, "Starting ping run for account {}...".format(
         account.display))
@@ -3834,13 +3852,6 @@ def _ping(account, accounts=None):
     if not result["completed"]:
         log(account, "WARNING: ping run did not confirm a completed turn.")
 
-    # Clear a hold only once it has actually been served. A hold set for a
-    # future boundary — by `realign --confirm`, say — has to survive every
-    # ordinary ping between now and then, or the correction is discarded by the
-    # next tick and nothing says so.
-    spent = state.get("hold")
-    if spent and time.time() >= spent.get("until", 0):
-        state.pop("hold", None)
     state["last_run"] = time.time()
 
     # Work out the earliest moment the next ping could start a window — which
@@ -3952,20 +3963,8 @@ def _ping(account, accounts=None):
         if error:
             state["last_error"] = dict(error, at=time.time())
 
-    # Spacing is decided from what every account is *observed* to be doing, not
-    # from a schedule agreed earlier — so nothing here can fall out of date, and
-    # a user who ignored the setup advice simply gets a different plan.
-    states[account.name] = state
-    extra = apply_alignment(account, accounts, states, state, time.time(),
-                            boundary)
-
-    # The anchor has to land on the *held* moment, and the horizon that
-    # sanity-checks it has to stretch by the same amount or it would reject its
-    # own target as implausible.
-    maybe_schedule_anchor(account,
-                          boundary + extra if boundary else boundary,
-                          horizon + extra if horizon else horizon,
-                          label, state, result["limited"])
+    maybe_schedule_anchor(account, boundary, horizon, label, state,
+                          result["limited"])
     write_state(account, state)
 
     log(account, "Ping run finished.\n")
@@ -3974,47 +3973,6 @@ def _ping(account, accounts=None):
     # in `systemctl --user --failed` and to any OnFailure= notifier. A refusal
     # is not a failure -- the account answered.
     return bool(result["limited"] or (result["completed"] and not error))
-
-
-def realign(accounts, confirm=False):
-    """Show what correcting the spacing would cost, and apply it when asked."""
-    now = time.time()
-    states = {a.name: read_state(a) for a in accounts}
-    lines, delays, total, settled = describe_alignment(
-        accounts, states, now, suggest_realign=False, note_waiting=not confirm)
-    for line in lines:
-        print(line)
-
-    if total < ALIGN_DEADBAND_SEC:
-        return 0
-    print()
-    print("Correcting this costs {} in total with no window running — the "
-          "accounts being held cannot start a new window until they are back "
-          "in step.".format(fmt_delta(total)))
-    if confirm and not settled:
-        # The wait exists to stop the tool re-spacing on its own initiative
-        # while accounts come and go. An explicit request is not that.
-        print("The set of active accounts changed recently, so this would not "
-              "have happened by itself — but you asked, so here it is.")
-    if not confirm:
-        print("Re-run with --confirm to apply it.")
-        return 0
-
-    for account in accounts:
-        delay = delays.get(account.name, 0.0)
-        if delay < ALIGN_DEADBAND_SEC:
-            continue
-        state = states[account.name]
-        boundary = next_expiry(state, now)
-        if boundary == float("inf"):
-            continue
-        state["hold"] = {"from": boundary, "until": boundary + delay,
-                         "reason": "realigning, on your say-so"}
-        write_state(account, state)
-        schedule_anchor(account, boundary + delay + account.guard_sec)
-        print("  account {}: next window will start {}".format(
-            account.display, fmt_time(boundary + delay)))
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -4180,10 +4138,13 @@ def status(accounts):
                 print("  Next start-of-window opportunity: not known yet — "
                       "run one ping first")
 
-            hold = state.get("hold")
-            if hold and hold.get("until", 0) > now:
-                print("  Holding       : until {} — {}".format(
-                    fmt_time(hold["until"]), hold.get("reason", "alignment")))
+            until = held_until(state, now)
+            if until:
+                print("  Holding       : until {} (in {}) to space the windows "
+                      "— using the account".format(fmt_time(until),
+                                                   fmt_delta(until - now)))
+                print("                  before then just opens its window "
+                      "early")
 
             pending = anchor_pending(account)
             if isinstance(pending, float):
@@ -4210,7 +4171,7 @@ def status(accounts):
     if len(accounts) > 1 and pings:
         print()
         print("Spacing")
-        for line in describe_alignment(accounts, states, now)[0]:
+        for line in spacing_lines(accounts, states, now):
             print("  {}".format(line))
 
     # A second machine has nothing of its own to report and does not want the
@@ -4401,12 +4362,11 @@ def doctor(accounts):
                     COMMAND, INTERVAL_MIN,
                     fmt_time(state.get("live_problem_at") or 0))))
 
-        # A hold is the tool deliberately not pinging, for as long as it takes
-        # to line the windows up -- hours, when `realign --confirm` asked for
-        # it. Counting those skipped pings as silence turns the one command
-        # that says what is wrong into one that complains about what it was
-        # just told to do.
-        hold = active_hold(state, now)
+        # A hold is the tool deliberately not pinging, for up to four and a
+        # half hours while it spaces the windows. Counting those skipped pings
+        # as silence turns the one command that says what is wrong into one
+        # that complains about what it chose to do.
+        hold = state.get("skipped_in_a_row")
         last_run = state.get("last_run")
         # A run that started counts as a run, so `last_run` is fresh even when
         # every one of them failed -- which made the staleness check below
@@ -4480,17 +4440,19 @@ def doctor(accounts):
     if reachable:
         findings.extend(_stray_unit_findings(accounts))
 
-    if len(accounts) > 1:
-        _, total, _, settled = alignment_plan(
-            accounts, {a.name: read_state(a) for a in accounts}, now,
-            record=False)
-        if total >= ALIGN_DEADBAND_SEC and settled:
+    # Spacing corrects itself and needs nothing from anyone, so it earns no
+    # finding of its own. The one thing worth saying is the planner having
+    # held an account longer than any plan can, which is a bug in it.
+    for account in accounts:
+        tripped = read_state(account).get("valve_at")
+        if tripped and now - tripped < 7 * 24 * 3600:
             findings.append(Finding(
                 "warning",
-                "The windows are {} away from evenly spaced".format(
-                    fmt_delta(total)),
-                "See what correcting it would cost: {} realign".format(
-                    COMMAND)))
+                "Account {} was held back for a whole window by the spacing, "
+                "at {}".format(account.name, fmt_time(tripped)),
+                "No plan should ever do that, so it was pinged anyway and "
+                "nothing was lost — but it means the spacing is misbehaving. "
+                "The account's log around that time says what it was doing."))
 
     order = {"error": 0, "warning": 1}
     return report_findings(sorted(findings, key=lambda f: order.get(f.level, 2)))
@@ -5655,6 +5617,31 @@ def _existing_mode(path, fallback=0o600):
         return fallback
 
 
+def open_held_window(account):
+    """
+    Open the window of an account the spacing is holding back, now. True if it
+    opened.
+
+    The ping's own lines go to its log, not the terminal: in the middle of a
+    switch they would bury the one line that matters.
+    """
+    if not pings_here() or not held_until(read_state(account), time.time()):
+        return False
+    print("  It was being held back to space the windows — opening its window "
+          "now...")
+    sys.stdout.flush()
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            ping(account, [account], force=True)
+        except SystemExit:
+            pass                      # its log says why; the switch stands
+    opened = window_running(read_state(account), time.time())
+    if not opened:
+        print("  The ping did not open it — the log says why: {} log {}".format(
+            COMMAND, account.name))
+    return opened
+
+
 def report_live_usage(account):
     """
     What the account just switched to actually has left, read from Claude now.
@@ -5918,6 +5905,37 @@ def take_login():
     return credential, (_read_json(USER_CONFIG_JSON).get("oauthAccount") or {})
 
 
+def parked_login_is_dead(store):
+    """
+    Whether the login parked in `store` can never be used again.
+
+    A refresh token past its expiry cannot be refreshed, and an access token
+    without one dies within hours; either way nothing can bring it back short of
+    a new sign-in. That is the one kind of parked login it costs nothing to
+    move out of the way -- and the kind that accumulates on its own, because a
+    store nobody switches to is a login nobody refreshes.
+    """
+    creds = _read_json(credentials_path(store)).get("claudeAiOauth") or {}
+    if not creds.get("refreshToken"):
+        return True
+    expires = _epoch_seconds(creds.get("refreshTokenExpiresAt"))
+    return bool(expires and expires <= time.time())
+
+
+def set_aside_dead_login(store):
+    """
+    Move a dead parked login out of `store` into .orphaned, and say where.
+
+    Moved rather than deleted, like everything else here that holds a login:
+    it is dead by every test this tool can apply, and those tests could still
+    be wrong.
+    """
+    taken = (_read_text(credentials_path(store)), None)
+    directory = orphan_login(taken)
+    os.remove(credentials_path(store))
+    return directory
+
+
 def park_login(account, taken):
     """
     Write a login previously read by take_login() into `account`'s store.
@@ -5936,6 +5954,10 @@ def park_login(account, taken):
         # it, that something is a login too, and writing over it destroys it
         # with no copy anywhere. Refused rather than clobbered.
         held = login_fingerprint(store)
+        if held and held != grant_fingerprint(credential) \
+                and parked_login_is_dead(store):
+            set_aside_dead_login(store)
+            held = ""
         if held and held != grant_fingerprint(credential):
             raise ConfigError(
                 "account {}'s store already holds a different login. Parking "
@@ -6467,6 +6489,18 @@ def _perform_switch(account, current, states):
     if current is not None:
         held = login_fingerprint(switch_store(current))
         mine = login_fingerprint(user_login())
+        # A dead login in the way is not a login worth protecting -- it is what
+        # a store holds after weeks of nobody switching to it, while its owner
+        # signed in again directly. It is set aside when the live one is
+        # parked; refusing here would make the account impossible to switch
+        # away from with nothing gained.
+        if held and mine and held != mine \
+                and parked_login_is_dead(switch_store(current)):
+            print("  Account {}'s store held an expired login; it will be moved "
+                  "to {} when\n  this one is parked.".format(
+                      current.display,
+                      _tilde(os.path.join(SWITCH_ROOT, ".orphaned"))))
+            held = ""
         if held and mine and held != mine:
             sys.stderr.write(
                 "Account {}'s store already holds a different login.\n"
@@ -6610,6 +6644,13 @@ def _perform_switch(account, current, states):
               "reports")
         print("  you signed in. Finish the first-run questions once and it "
               "stops asking.")
+
+    # An account held back for spacing has no window running, and the planner
+    # learns that one has opened only from a ping -- it pings nothing while it
+    # holds. Switching is somebody saying they are about to use this account,
+    # so open its window here, with the ordinary ping, rather than leave every
+    # other account planned around a phase this one no longer has.
+    open_held_window(account)
 
     # Read from Claude, now, with the login just installed. Somebody switching
     # is about to spend this account, and the figure they most want is the one
@@ -6786,7 +6827,12 @@ def switch_findings(accounts):
             continue
         identity = account_identity(store)
         expires = identity["refresh_expires_at"]
-        if expires and expires <= time.time():
+        mine = live is not None and live.name == account.name
+        if expires and expires <= time.time() and mine:
+            # The account you are on needs no parked login: the next switch
+            # away parks the live one, and sets the dead one aside to do it.
+            pass
+        elif expires and expires <= time.time():
             findings.append(Finding(
                 "error",
                 "Account {}'s parked login expired {}".format(
@@ -7343,20 +7389,14 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
         # be, and telling someone not to use their accounts for no reason is
         # how a tool gets uninstalled.
         if built:
-            print("Accounts starting together are the one case it will not fix")
-            print("on its own: lining them up costs hours with no window")
-            print("running, which is not something to do unasked. Once every")
-            print("account has pinged, `{} realign` prices it.".format(COMMAND))
-            print()
-            print("For the quickest result, avoid using the accounts other than")
-            print("{} for the next few hours. If you do use them, nothing "
-                  "breaks —".format(accounts[0].display))
-            print("the service re-plans from wherever things actually end up.")
+            print("Building the checkpoints opened a window on every account at")
+            print("about the same time, so for the next few hours some of them")
+            print("will be held back at the end of a window to spread them out.")
+            print("A held account is never locked: use it whenever you like, and")
+            print("the service simply plans again from wherever things end up.")
             print()
         print("  {} status      what each account is doing".format(COMMAND))
         print("  {} which       which one to use right now".format(COMMAND))
-        print("  {} realign     what evening out the spacing would "
-              "cost".format(COMMAND))
         print()
         # Worth one line here rather than none: the whole point of knowing
         # which account to spend is being able to go and spend it, and nobody
@@ -7829,7 +7869,7 @@ def build_parser():
         usage="%(prog)s [<command>] [options]\n"
               "       %(prog)s help [<command>]",
         epilog="With no command at all, reports status.\n"
-               "Run `{0} help realign`, or any other command, to see what it "
+               "Run `{0} help switch`, or any other command, to see what it "
                "does and takes.".format(COMMAND),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     # `prog` must be given explicitly. Without it argparse derives each
@@ -7911,10 +7951,6 @@ def build_parser():
                      help="keep watching for new lines")
     log.add_argument("-n", "--lines", type=int, default=40,
                      metavar="N", help="how many lines to show (default 40)")
-
-    realign = add("realign", "Show how far the windows are from evenly spaced.")
-    realign.add_argument("--confirm", action="store_true",
-                         help="apply the correction rather than describing it")
 
     add("doctor", "Check a deployed setup and say what is wrong.")
     setup_ = add("setup", "Create the ping directories, sign them in, and start "
@@ -8154,7 +8190,11 @@ def status_json(accounts):
             "consecutive_failures": state.get("consecutive_failures", 0),
             "expires_at": None if expiry == float("inf") else expiry,
             "rate_limits": state.get("rate_limits", {}),
-            "hold": state.get("hold"),
+            # Kept under the name it always had. What fills it changed: the
+            # planner's intention for an account whose window it is holding
+            # back, rather than a booked correction.
+            "hold": ({"until": held_until(state, now), "reason": "spacing"}
+                     if held_until(state, now) else None),
             "boundary": state.get("boundary"),
             "boundary_label": state.get("boundary_label"),
             "limits_source": state.get("limits_source"),
@@ -8227,18 +8267,15 @@ def cli(argv=None):
                 # rest exist. Naming a few beats pointing at `help`, which is
                 # only useful to someone who already suspects there is more.
                 print()
-                # Only what this machine can actually do: `switch` and
-                # `realign` both answer "there is only one account" on a
-                # single-account install, and a suggestion that refuses is
-                # worse than one that was never made.
+                # Only what this machine can actually do: `switch` answers
+                # "there is only one account" on a single-account install, and
+                # a suggestion that refuses is worse than one never made.
                 offered = ["which"]
                 if len(accounts) > 1:
                     offered.append("switch")
                 offered.append("doctor")
                 if pings_here():
                     offered.append("log")
-                    if len(accounts) > 1:
-                        offered.append("realign")
                 offered.append("setup")
                 print("Other commands: {} — run `{} help` for all of "
                       "them.".format(", ".join(offered), COMMAND))
@@ -8258,11 +8295,6 @@ def cli(argv=None):
             return switch_account(accounts, args.account, sign_in=args.sign_in)
         if command == "log":
             return show_log(accounts, args.account, args.lines, args.follow)
-        if command == "realign":
-            if not pings_here():
-                return not_a_pinging_machine("so there is no schedule of its "
-                                             "own to realign")
-            return realign(accounts, confirm=args.confirm)
         if command == "doctor":
             return doctor(accounts)
         if command == "check":

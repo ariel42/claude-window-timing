@@ -1326,9 +1326,13 @@ def test_the_command_surface():
     # Flat verbs with the account as a positional, like systemctl — not
     # `<noun> <verb>`, which would invent structure around a single resource.
     commands = sorted(known_names(parser))
-    for expected in ("status", "which", "ping", "log", "realign", "doctor",
+    for expected in ("status", "which", "ping", "log", "doctor", "switch",
                      "setup", "check", "accounts", "install-command"):
         check_true("`{}` is a command".format(expected), expected in commands)
+    # Spacing corrects itself now, so the command that priced and booked a
+    # correction went with the machinery behind it.
+    check_true("`realign` is gone with the holds it booked",
+               "realign" not in commands)
 
     check("an account is a positional, not a flag",
           vars(parser.parse_args(["ping", "2"]))["account"], "2")
@@ -1389,8 +1393,8 @@ def test_the_command_surface():
     check("an ordinary command is untouched",
           ew.normalise_help(["ping", "2"], commands), ["ping", "2"])
     check("and neither is a command that merely takes a flag",
-          ew.normalise_help(["realign", "--confirm"], commands),
-          ["realign", "--confirm"])
+          ew.normalise_help(["switch", "--no-sign-in"], commands),
+          ["switch", "--no-sign-in"])
 
     # The screen must not tell you two different things. argparse's generated
     # usage line puts -h *before* the command; every other line of help put it
@@ -1399,7 +1403,7 @@ def test_the_command_surface():
     epilog = parser.epilog or ""
     check_true("the usage line shows the help form", "help [<command>]" in usage)
     check_true("and the closing line shows the same one",
-               "help realign" in epilog)
+               "help switch" in epilog)
     check_true("neither suggests putting -h before the command",
                "[-h] <command>" not in usage and "-h <command>" not in epilog)
     check_true("and the bare command is explained, since it is the default",
@@ -1525,7 +1529,7 @@ def test_two_accounts_stay_out_of_each_others_files():
         shown = buf.getvalue()
         check_true("it points at the other commands", "Other commands" in shown)
         check_true("and names some rather than only pointing at help",
-                   "doctor" in shown and "realign" in shown)
+                   "doctor" in shown and "switch" in shown)
         check_true("and says how to see the rest",
                    "{} help".format(ew.COMMAND) in shown)
 
@@ -2137,7 +2141,7 @@ def test_an_account_the_schedule_has_never_heard_of():
     """
     section("An account the published schedule has never heard of")
     now = time.time()
-    saved = (ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.ALIGNMENT_FILE,
+    saved = (ew.STATE_ROOT, ew.SCHEDULE_FILE,
              ew._systemctl, ew._run)
 
     class Ok(object):
@@ -2147,7 +2151,6 @@ def test_an_account_the_schedule_has_never_heard_of():
     try:
         root = tempfile.mkdtemp()
         ew.STATE_ROOT = os.path.join(root, "state")
-        ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
         ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
         ew._systemctl = lambda *a: Ok()
         ew._run = lambda cmd: Ok()
@@ -2189,7 +2192,7 @@ def test_an_account_the_schedule_has_never_heard_of():
         check("and is not what the answer points at",
               document["use"]["account"], "1")
     finally:
-        (ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.ALIGNMENT_FILE,
+        (ew.STATE_ROOT, ew.SCHEDULE_FILE,
          ew._systemctl, ew._run) = saved
 
 
@@ -2394,15 +2397,13 @@ def test_what_it_says_in_every_state_it_can_be_in():
 
     # The spacing report when there is nothing to space. Account 2's weekly
     # limit outlasts its own window, so it will not start one.
-    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
-    ew.write_alignment({})
     blocked = {one.name: dict(fresh, available_at=now - 1),
                two.name: {"available_at": now - 1,
                           "rate_limits": {
                               "five_hour": {"resets_at": now + 600},
                               "seven_day": {"resets_at": now + 4 * 86400,
                                             "used_percentage": 100}}}}
-    said = " ".join(ew.describe_alignment([one, two], blocked, now)[0])
+    said = " ".join(ew.spacing_lines([one, two], blocked, now))
     check_true("one account holding a window is not a fault to report",
                "Only one account is holding a window" in said
                and "nothing to space" in said)
@@ -2619,7 +2620,7 @@ def test_one_usage_figure_reaches_every_surface_unchanged():
     section("One usage figure, every surface, unchanged")
     now = time.time()
     root = tempfile.mkdtemp()
-    saved = (ew.STATE_ROOT, ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE,
+    saved = (ew.STATE_ROOT, ew.SCHEDULE_FILE,
              ew._systemctl, ew._run, ew.pings_here)
 
     class Ok(object):
@@ -2627,7 +2628,6 @@ def test_one_usage_figure_reaches_every_surface_unchanged():
         stdout = ""
 
     ew.STATE_ROOT = root
-    ew.ALIGNMENT_FILE = os.path.join(root, "alignment.json")
     ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
     ew._systemctl = lambda *a: Ok()
     ew._run = lambda cmd: Ok()
@@ -2651,7 +2651,6 @@ def test_one_usage_figure_reaches_every_surface_unchanged():
             with open(account.session_id_file, "w") as f:
                 f.write("sid-{}\n".format(account.name))
             open(account.checkpoint_backup, "w").close()
-        ew.write_alignment({})
 
         def store(used, read_ago=90):
             """One figure on disk, for account 1. Account 2 stays untouched."""
@@ -2775,7 +2774,7 @@ def test_one_usage_figure_reaches_every_surface_unchanged():
         check_true("status distinguishes that from the ping's own time",
                    "Last ping     :" in said)
     finally:
-        (ew.STATE_ROOT, ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE,
+        (ew.STATE_ROOT, ew.SCHEDULE_FILE,
          ew._systemctl, ew._run, ew.pings_here) = saved
         shutil.rmtree(root, ignore_errors=True)
 
@@ -2789,7 +2788,6 @@ def test_the_status_display_shows_the_unusual_parts():
     section("status shows the parts that only appear when they matter")
     now = time.time()
     ew.STATE_ROOT = tempfile.mkdtemp()
-    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
     saved = (ew._systemctl, ew._run, ew.SCHEDULE_FILE)
     class Ok(object):
         returncode = 0
@@ -2811,7 +2809,7 @@ def test_the_status_display_shows_the_unusual_parts():
             "boundary_label": "weekly limit",
             "limits_source": "refusal-text",
             "available_at": now + 900,
-            "hold": {"from": now - 10, "until": now + 3600, "reason": "spacing"},
+            "held_until": now + 3600,
             "rate_limits": {
                 "five_hour": {"resets_at": now + 900, "used_percentage": 100},
                 "seven_day": {"resets_at": now + 86400, "used_percentage": 41}}})
@@ -2847,7 +2845,9 @@ def test_the_status_display_shows_the_unusual_parts():
         check_true("in words, not in the internal name for the source",
                    "refusal-text" not in said and "statusline" not in said)
         check_true("a hold in force is stated with its reason",
-                   "Holding       : until" in said and "spacing" in said)
+                   "Holding       : until" in said and "space the windows" in said)
+        check_true("and with what using the account does to it",
+                   "opens its window" in said and "early" in said)
 
         # The figure nobody has refreshed: its reset is two days behind. This
         # is what a machine whose pings stopped looks like, and it printed
@@ -2914,73 +2914,6 @@ def test_every_reading_a_figure_can_come_from_can_be_said_in_words():
           sorted(ew._SOURCE_NAMES), sorted(stored))
     check("a source nothing recorded is not invented a name",
           ew.fmt_source("no-such-source"), None)
-
-
-def test_spacing_optimiser():
-    section("The cheapest way to space windows evenly")
-    W = ew.WINDOW_HOURS * HOUR
-
-    def plan(**phases):
-        return ew.plan_alignment(phases, W)
-
-    delays, total = plan(a=0.0)
-    check("one account has nothing to space", (delays, total), ({"a": 0.0}, 0.0))
-
-    delays, total = plan(a=0.0, b=2.5 * HOUR)
-    check("already evenly spaced -> no delay at all", total, 0.0)
-
-    # The worked example: b drifts 20 minutes late. Dragging b round to the next
-    # slot costs 4h40m; nudging a costs 20 minutes. The account that did *not*
-    # drift is the one to hold.
-    delays, total = plan(a=0.0, b=2.5 * HOUR + 20 * 60)
-    check("correcting drift holds the account that did not drift",
-          round(delays["a"] / 60), 20)
-    check("and leaves the drifted one alone", delays["b"], 0.0)
-    check("for a total of 20 minutes, not 4h40m", round(total / 60), 20)
-
-    # Two accounts that restarted together after an outage: the worst case, and
-    # the reason a correction this size has to be asked for rather than assumed.
-    delays, total = plan(a=0.0, b=0.0)
-    check("fully synced accounts cost half a window to separate",
-          round(total / 60), 150)
-    check("and only one of them is held", sorted(delays.values()), [0.0, 2.5 * HOUR])
-
-    # Three accounts want 1h40m spacing, not 2h30m.
-    delays, total = plan(a=0.0, b=W / 3, c=2 * W / 3)
-    check("three already-spaced accounts need no correction", round(total), 0)
-    delays, total = plan(a=0.0, b=0.0, c=0.0)
-    check("three synced accounts cost 1h40m + 3h20m", round(total / 60), 300)
-
-    # Never advance: every delay must be forward, and inside one window.
-    for phases in ({"a": 0.0, "b": 1.0 * HOUR},
-                   {"a": 4.9 * HOUR, "b": 0.1 * HOUR},
-                   {"a": 0.0, "b": 1.0 * HOUR, "c": 3.0 * HOUR, "d": 4.0 * HOUR}):
-        delays, total = ew.plan_alignment(phases, W)
-        check_true("delays are forward-only and under a window ({})".format(
-            sorted(phases)), all(0 <= d < W + 1e-6 for d in delays.values()))
-        spaced = sorted(((phases[n] + delays[n]) % W) for n in phases)
-        gaps = [round((spaced[(i + 1) % len(spaced)] - spaced[i]) % W)
-                for i in range(len(spaced))]
-        check("the result really is evenly spaced ({})".format(sorted(phases)),
-              set(gaps), {round(W / len(phases))})
-
-    # Brute force says the same thing, which is the real check on the shortcut
-    # of only trying the offsets that zero one account.
-    import random
-    random.seed(7)
-    worst = 0.0
-    for _ in range(200):
-        count = random.choice([2, 3, 4])
-        phases = {str(i): random.uniform(0, W) for i in range(count)}
-        _, chosen = ew.plan_alignment(phases, W)
-        spacing = W / count
-        best = min(
-            sum(((offset + i * spacing) - phases[n]) % W
-                for i, n in enumerate(sorted(phases, key=lambda k: phases[k])))
-            for offset in [x * W / 2000.0 for x in range(2000)])
-        worst = max(worst, chosen - best)
-    check_true("it matches an exhaustive search of offsets (within {:.0f}s)"
-               .format(worst), worst < W / 1000.0)
 
 
 def test_phase_is_lost_only_when_pings_cannot_get_through():
@@ -3080,281 +3013,6 @@ def test_phase_is_lost_only_when_pings_cannot_get_through():
                not holds(state(3600, -1)))
     check("and says why", ew.participation(account, state(3600, -1), now)[1],
           "no paid subscription (free)")
-
-
-def test_correction_policy():
-    section("Small corrections happen; expensive ones are proposed")
-    now = time.time()
-    ew.STATE_ROOT = tempfile.mkdtemp()
-    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
-    W = ew.WINDOW_HOURS * HOUR
-    a = ew.Account(TEST_PREFIX + "-a", "/tmp/cfg-a", 0)
-    b = ew.Account(TEST_PREFIX + "-b", "/tmp/cfg-b", 1)
-    a.ensure_state_dir(); b.ensure_state_dir()
-
-    def states(offset):
-        return {a.name: {"rate_limits": {"five_hour": {"resets_at": now + 600}},
-                         "available_at": now - 1},
-                b.name: {"rate_limits": {"five_hour": {"resets_at": now + 600 + offset}},
-                         "available_at": now - 1}}
-
-    def settle():
-        # Pretend the current set of accounts has been steady for a while.
-        alignment = ew.read_alignment()
-        alignment["participants_since"] = now - 2 * W
-        ew.write_alignment(alignment)
-
-    # Noise is left alone: chasing it would pay real dead time for nothing.
-    st = states(2.5 * HOUR + 60)
-    ew.alignment_plan([a, b], st, now); settle()
-    check("a minute of drift is inside the deadband",
-          ew.apply_alignment(a, [a, b], st, st[a.name], now, now + 600), 0.0)
-
-    # A correction worth minutes just happens.
-    st = states(2.5 * HOUR + 20 * 60)
-    ew.alignment_plan([a, b], st, now); settle()
-    delay = ew.apply_alignment(a, [a, b], st, st[a.name], now, now + 600)
-    check("20 minutes is corrected without asking", round(delay / 60), 20)
-    check_true("and the hold is recorded on the account", "hold" in st[a.name])
-    # The hold has to hang off the boundary the caller passed in, not one this
-    # function worked out for itself — the two differ whenever a weekly limit is
-    # the thing standing in the way.
-    check("the hold starts at the boundary it was given",
-          round(st[a.name]["hold"]["from"] - now), 600)
-    check("and ends the delay later",
-          round(st[a.name]["hold"]["until"] - now), 600 + 20 * 60)
-
-    # A correction worth hours is described and left for the user to approve.
-    st = states(0.0)                     # both accounts fully synced
-    ew.alignment_plan([a, b], st, now); settle()
-    check("a multi-hour hold is not applied unasked",
-          ew.apply_alignment(b, [a, b], st, st[b.name], now, now + 600), 0.0)
-    said = open(b.log_file).read()
-    check_true("it says so in the log instead of acting", "too long to do "
-               "unasked" in said)
-    check_true("with the real cost attached, and how to apply it",
-               "2h30m00s in total" in said and "realign --confirm" in said)
-    check_true("and nothing was booked", "hold" not in st[b.name])
-
-    # Hysteresis: an account dropping out and coming back changes the ideal
-    # spacing for everyone twice over, so the set has to hold steady before
-    # that moves the target. `ever` is what says it has been here before.
-    ew.write_alignment({"participants": [b.name], "ever": [a.name, b.name],
-                        "participants_since": now - 10 * W})
-    st = states(2.5 * HOUR + 20 * 60)
-    ew.alignment_plan([a, b], st, now)   # an account came back
-    check("an account returning to the set is not acted on at once",
-          ew.apply_alignment(a, [a, b], st, st[a.name], now, now + 600), 0.0)
-
-    # Losing one is the case that costs most to get wrong, and it is never a
-    # first sighting however new the accounts are.
-    ew.write_alignment({"participants": [a.name, b.name], "ever": [a.name, b.name],
-                        "participants_since": now - 10 * W})
-    st = states(2.5 * HOUR + 20 * 60)
-    ew.alignment_plan([a, b], {a.name: st[a.name],
-                               b.name: dict(st[b.name], available_at=None)}, now)
-    check("an account dropping out is not acted on at once",
-          ew.apply_alignment(a, [a, b], st, st[a.name], now, now + 600), 0.0)
-
-    # An install upgraded from before `ever` existed has no history recorded,
-    # but its current participants have obviously been seen — reading them as
-    # new would hand a free re-space to the one account that must not get one.
-    ew.write_alignment({"participants": [a.name, b.name],
-                        "participants_since": now - 10 * W})
-    ew.alignment_plan([a, b], {a.name: states(0)[a.name],
-                               b.name: dict(states(0)[b.name],
-                                            available_at=None)}, now)
-    st = states(2.5 * HOUR + 20 * 60)
-    ew.alignment_plan([a, b], st, now)   # b comes back
-    check("an upgraded install does not treat its own accounts as new",
-          ew.apply_alignment(a, [a, b], st, st[a.name], now, now + 600), 0.0)
-
-    # But an account nobody has ever seen cannot be thrashing. Without this a
-    # two-account install would restart its own clock on the second ping and
-    # sit misaligned for a whole window on a setup minutes old.
-    ew.write_alignment({"participants": [a.name], "ever": [a.name],
-                        "participants_since": now - 10 * W})
-    st = states(2.5 * HOUR + 20 * 60)
-    ew.alignment_plan([a, b], st, now)   # b is seen for the first time
-    check("an account seen for the first time is acted on straight away",
-          round(ew.apply_alignment(a, [a, b], st, st[a.name], now,
-                                   now + 600) / 60), 20)
-    check_true("and it is remembered, so a later return has to settle",
-               a.name in ew.read_alignment()["ever"]
-               and b.name in ew.read_alignment()["ever"])
-
-    # But a brand-new install has no earlier arrangement to thrash against, and
-    # has paid for nothing, so it should not sit visibly misaligned for a whole
-    # window before anyone is told.
-    ew.write_alignment({})
-    st = states(2.5 * HOUR + 20 * 60)
-    ew.alignment_plan([a, b], st, now)   # first sighting ever
-    check("a first-ever reading is acted on straight away",
-          round(ew.apply_alignment(a, [a, b], st, st[a.name], now,
-                                   now + 600) / 60), 20)
-
-    # The verdict the user reads has to match what the tool will actually do.
-    def verdict(offset, **kw):
-        ew.write_alignment({})
-        st2 = states(offset)
-        ew.alignment_plan([a, b], st2, now)
-        return " ".join(ew.describe_alignment([a, b], st2, now, **kw)[0])
-
-    check_true("a correction worth minutes is described as automatic",
-               "without asking" in verdict(2.5 * HOUR + 20 * 60))
-    check_true("a correction worth hours never claims it is automatic",
-               "without asking" not in verdict(0.0))
-    check_true("and says what it would cost instead",
-               "too much to do unasked" in verdict(0.0))
-    # `realign` prints its own, fuller version of that advice; it must not also
-    # fall through to claiming the correction happens by itself.
-    quiet = verdict(0.0, suggest_realign=False)
-    check_true("suppressing the pointer does not flip the verdict",
-               "without asking" not in quiet and "realign" not in quiet)
-    check_true("correct spacing is simply reported as correct",
-               "Spacing is correct" in verdict(2.5 * HOUR))
-
-    # A booked hold leaves the phases where they were, so the arithmetic still
-    # shows the full error. Reporting only that would read as though the
-    # correction the user just approved had not happened.
-    ew.write_alignment({})
-    st3 = states(0.0)
-    st3[a.name]["hold"] = {"from": now + 600, "until": now + 600 + 2.5 * HOUR,
-                           "reason": "realigning"}
-    ew.alignment_plan([a, b], st3, now)
-    reported = ew.describe_alignment([a, b], st3, now)[0]
-    check_true("a booked correction is acknowledged",
-               any("already booked" in line for line in reported))
-    # Only the account actually holding: the other one, with both windows
-    # synced, still legitimately needs a hold of its own.
-    held_line = [l for l in reported if a.display in l][0]
-    check_true("the held account is shown as held, not as needing a hold",
-               "already held back to" in held_line and "to line up" not in held_line)
-
-    # A weekly limit puts the next usable moment days past the 5-hour boundary.
-    # Nothing may be scheduled relative to the wrong one of those two.
-    blocked = {a.name: {"rate_limits": {"five_hour": {"resets_at": now + 600}},
-                        "available_at": now + 3 * 86400},
-               b.name: states(2.5 * HOUR)[b.name]}
-    ew.alignment_plan([a, b], blocked, now); settle()
-    check("an account blocked past its own boundary is left out of the spacing",
-          ew.apply_alignment(a, [a, b], blocked, blocked[a.name], now,
-                             now + 3 * 86400), 0.0)
-
-    # And the point of leaving it out: N is the accounts that will actually
-    # start a window, so the ones that still supply windows get the whole
-    # 5 hours between them rather than being bunched into 5/3 of it.
-    c = ew.Account(TEST_PREFIX + "-c", "/tmp/cfg-c", 2)
-    c.ensure_state_dir()
-    three = dict(states(1.0 * HOUR))
-    three[c.name] = {"rate_limits": {"five_hour": {"resets_at": now + 900},
-                                     "seven_day": {"resets_at": now + 4 * 86400,
-                                                   "used_percentage": 100}},
-                     "available_at": now - 1}
-    ew.write_alignment({})
-    said = " ".join(ew.describe_alignment([a, b, c], three, now)[0])
-    check_true("with one of three accounts out, the target is 5/2 not 5/3",
-               "2h30m00s apart" in said)
-    check_true("and it says how many accounts are actually holding one",
-               "2 of 3 accounts" in said)
-    check_true("and names the reason the third is not",
-               "weekly limit is spent" in said)
-
-
-def test_realign_is_the_only_way_a_long_hold_happens():
-    """
-    `realign --confirm` is the one command that deliberately leaves an account
-    with no window running, for hours. Nothing else in the tool will do that,
-    which is exactly why what it does has to be pinned down: that it says the
-    price before it asks, that it does nothing at all without --confirm, and
-    that having been told once it stops asking.
-    """
-    section("realign: the correction you have to ask for")
-    now = time.time()
-    ew.STATE_ROOT = tempfile.mkdtemp()
-    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
-    W = ew.WINDOW_HOURS * HOUR
-    a = ew.Account(TEST_PREFIX + "-a", "/tmp/cfg-a", 0)
-    b = ew.Account(TEST_PREFIX + "-b", "/tmp/cfg-b", 1)
-    a.ensure_state_dir(); b.ensure_state_dir()
-
-    anchors = []
-    saved_anchor = ew.schedule_anchor
-    ew.schedule_anchor = lambda account, target: anchors.append(
-        (account.name, target)) or True
-    try:
-        def arrange(offset):
-            for account, at in ((a, now + 600), (b, now + 600 + offset)):
-                ew.write_state(account, {"available_at": now - 1,
-                                         "rate_limits": {"five_hour":
-                                                         {"resets_at": at}}})
-            ew.write_alignment({"participants": [a.name, b.name],
-                                "ever": [a.name, b.name],
-                                "participants_since": now - 2 * W})
-
-        def run(**kw):
-            buf = io.StringIO()
-            out, sys.stdout = sys.stdout, buf
-            try:
-                ew.realign([a, b], **kw)
-            finally:
-                sys.stdout = out
-            return buf.getvalue()
-
-        # Already spaced: there is nothing to offer, and no price to quote.
-        arrange(2.5 * HOUR)
-        said = run()
-        check_true("correct spacing is reported and nothing is offered",
-                   "Spacing is correct" in said and "--confirm" not in said)
-
-        # Out of step: the cost comes before the offer, every time.
-        arrange(0.0)
-        said = run()
-        check_true("the cost is stated in hours of dead window",
-                   "costs 2h30m00s in total with no window running" in said)
-        check_true("and it asks rather than acts", "Re-run with --confirm" in said)
-        check("nothing was booked without --confirm",
-              [ew.read_state(x).get("hold") for x in (a, b)], [None, None])
-        check("and no anchor was moved", anchors, [])
-
-        # Asked for: exactly one account is held, and only as far as it must be.
-        said = run(confirm=True)
-        holds = {x.name: ew.read_state(x).get("hold") for x in (a, b)}
-        held = [n for n, h in holds.items() if h]
-        check("one account is held, not both", len(held), 1)
-        check("held by the spacing, no more",
-              round((holds[held[0]]["until"] - holds[held[0]]["from"]) / 60), 150)
-        check_true("the reason recorded says whose decision it was",
-                   "your say-so" in holds[held[0]]["reason"])
-        check_true("and it says when the window will now start",
-                   "next window will start" in said)
-        # The window cannot begin until the hold ends, so the anchor has to be
-        # placed there and not on the untouched boundary.
-        check("an anchor is booked for the end of the hold, plus the guard",
-              [round(t - holds[held[0]]["until"]) for n, t in anchors
-               if n == held[0]], [ew.find_account([a, b], held[0]).guard_sec])
-
-        # Having been told once, the tool stops asking. This is the half of it
-        # that used to go wrong: `status` said "already booked" while every
-        # ping went on telling the user to confirm what they just confirmed.
-        state = ew.read_state(ew.find_account([a, b], held[0]))
-        states = {x.name: ew.read_state(x) for x in (a, b)}
-        account = ew.find_account([a, b], held[0])
-        before = os.path.getsize(account.log_file) if os.path.exists(
-            account.log_file) else 0
-        extra = ew.apply_alignment(account, [a, b], states, state, time.time(),
-                                   ew.next_expiry(state, time.time()))
-        after = _read_from(account.log_file, before)
-        check_true("a booked hold is not re-proposed on the next ping",
-                   "realign --confirm" not in after)
-        check("and the anchor still lands at the end of the hold",
-              round(ew.next_expiry(state, time.time()) + extra
-                    - state["hold"]["until"]), 0)
-        check_true("the hold itself is left exactly as it was",
-                   ew.read_state(account).get("hold") == holds[held[0]]
-                   or state["hold"] == holds[held[0]])
-    finally:
-        ew.schedule_anchor = saved_anchor
 
 
 def _read_from(path, offset):
@@ -3546,7 +3204,6 @@ def test_a_ping_that_did_not_get_through_records_why():
     """
     section("A ping that did not get through, and what it records")
     ew.STATE_ROOT = tempfile.mkdtemp()
-    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
     saved = (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
              ew.restore_checkpoint, ew._systemctl, ew._run)
 
@@ -3559,7 +3216,6 @@ def test_a_ping_that_did_not_get_through_records_why():
     ew._run = lambda cmd: Ok()
     try:
         account = temp_account(TEST_PREFIX)
-        ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
         # A login that is perfectly good on disk: the case nothing else sees.
         os.makedirs(account.config_dir, 0o700)
         with open(account.config_json, "w") as f:
@@ -3755,6 +3411,503 @@ def test_doctor_says_what_a_failing_ping_was_told():
         ew._systemctl, ew.account_auth_ok, ew.validate_accounts = saved
 
 
+# ---------------------------------------------------------------------------
+# Spacing on Anthropic's 30-minute grid
+# ---------------------------------------------------------------------------
+#
+# Every window start is floored to a 30-minute grid, so a phase is one of ten
+# slots and the planner works on that lattice. These tests drive the real
+# planner and the real per-tick rule, exhaustively where the space is small
+# enough, because a plausible-looking wrong answer here does not crash -- it
+# holds somebody's account back for the wrong two hours.
+
+SLOT = 1800
+
+
+def _gaps(slots):
+    ordered = sorted(slots)
+    return sorted((ordered[(i + 1) % len(ordered)] - ordered[i]) % ew.WINDOW_SLOTS
+                  for i in range(len(ordered)))
+
+
+def _spacing_accounts(count):
+    """Accounts whose files do not exist, which the planner reads as healthy."""
+    root = tempfile.mkdtemp()
+    return [ew.Account(str(i + 1), os.path.join(root, "nope%d" % i), i)
+            for i in range(count)]
+
+
+def _alive(now, resets, **extra):
+    """A participating account's state: proven alive, a known window."""
+    state = {"available_at": now - 60,
+             "rate_limits": {"five_hour": {"resets_at": resets,
+                                           "used_percentage": 10}}}
+    state.update(extra)
+    return state
+
+
+def _tick(accounts, states, now, use=None):
+    """
+    One timer tick for every account, in the order their timers fire, with the
+    conversation replaced by its effect: a ping that goes ahead opens a window
+    in this slot if none is running. `use` names an account a person starts
+    using this tick, which opens its window whatever the plan says.
+    """
+    held = []
+    for account in accounts:
+        state = states[account.name]
+        moment = now + account.guard_sec
+        if use == account.name and not ew.window_running(state, moment):
+            state["rate_limits"]["five_hour"]["resets_at"] = \
+                ew.slot_start(moment) + ew.WINDOW_HOURS * 3600
+            state["available_at"] = moment
+            for key in ("skipped_in_a_row", "withheld_since", "held_until"):
+                state.pop(key, None)
+            continue
+        go, until, why = ew.should_open_window(account, accounts, states, moment)
+        if not go:
+            state["skipped_in_a_row"] = state.get("skipped_in_a_row", 0) + 1
+            state["withheld_since"] = state.get("withheld_since") or moment
+            state["held_until"] = until
+            held.append((account.name, why))
+            continue
+        assert why is None or why[0] != "valve", why
+        if not ew.window_running(state, moment):
+            state["rate_limits"]["five_hour"]["resets_at"] = \
+                ew.slot_start(moment) + ew.WINDOW_HOURS * 3600
+        state["available_at"] = moment
+        for key in ("skipped_in_a_row", "withheld_since", "held_until"):
+            state.pop(key, None)
+    return held
+
+
+def _settled(accounts, states, now):
+    """Every window running, on a best arrangement, with nothing to hold."""
+    if not all(ew.window_running(states[a.name], now) for a in accounts):
+        return False
+    slots = [ew.slot_of(ew.raw_reset(states[a.name])) for a in accounts]
+    return _gaps(slots) == _gaps(ew.optimal_targets(len(accounts))[0])
+
+
+def _run_until_settled(accounts, states, start, limit=40, use=None):
+    """Ticks until settled; returns how many it took, or None."""
+    return _ticks_until_settled(accounts, states, start, limit, use)[0]
+
+
+def _ticks_until_settled(accounts, states, start, limit=40, use=None):
+    """Ticks until settled: (ticks taken or None, time of the next tick)."""
+    now = start
+    for tick in range(limit):
+        _tick(accounts, states, now, use=use(tick) if use else None)
+        now += SLOT
+        if _settled(accounts, states, now - SLOT + 60):
+            return tick, now
+    return None, now
+
+
+def test_the_slot_planner_is_optimal():
+    """
+    plan_slots is checked against an independent brute force over every
+    assignment, not just the cyclic-order-preserving ones it searches, for
+    every phase tuple of two, three and four accounts. The gaps it aims for
+    are the ones the README table promises.
+    """
+    section("The slot planner, against brute force")
+    import itertools
+    import random
+
+    check("two accounts: 2h30m apart", _gaps(ew.optimal_targets(2)[0]), [5, 5])
+    check("three: 1h30m, 1h30m, 2h", _gaps(ew.optimal_targets(3)[0]), [3, 3, 4])
+    check("four: 1h, 1h, 1h30m, 1h30m", _gaps(ew.optimal_targets(4)[0]),
+          [2, 2, 3, 3])
+    check("five: 1h apart", _gaps(ew.optimal_targets(5)[0]), [2] * 5)
+    check("six: as even as ten slots allow", _gaps(ew.optimal_targets(6)[0]),
+          [1, 1, 2, 2, 2, 2])
+    check("one account has nothing to space", ew.plan_slots({"a": 3}), {"a": 0})
+    check("nor do more accounts than slots",
+          set(ew.plan_slots(dict(("a%d" % i, 0) for i in range(11))).values()),
+          {0})
+
+    def brute(phases):
+        n = len(phases)
+        best = None
+        for targets in ew.optimal_targets(n):
+            for perm in itertools.permutations(targets):
+                total = sum((perm[i] - phases[i]) % ew.WINDOW_SLOTS
+                            for i in range(n))
+                best = total if best is None else min(best, total)
+        return best
+
+    def judge(phases):
+        named = dict(("a%d" % i, p) for i, p in enumerate(phases))
+        delays = ew.plan_slots(named)
+        landed = [(named[k] + d) % ew.WINDOW_SLOTS for k, d in delays.items()]
+        problems = []
+        if _gaps(landed) != _gaps(ew.optimal_targets(len(phases))[0]):
+            problems.append("not evenly spaced")
+        if sum(delays.values()) != brute(phases):
+            problems.append("not the cheapest")
+        if not all(isinstance(d, int) and 0 <= d < ew.WINDOW_SLOTS
+                   for d in delays.values()):
+            problems.append("a delay that is not a whole slot")
+        if min(delays.values()) != 0:
+            problems.append("nobody opens this tick")
+        if ew.plan_slots(dict(named)) != delays:
+            problems.append("not deterministic")
+        return problems
+
+    for n in (2, 3, 4):
+        bad = [(p, judge(p)) for p in itertools.product(
+            range(ew.WINDOW_SLOTS), repeat=n) if judge(p)]
+        check("every one of {} phase tuples for {} accounts is planned "
+              "optimally".format(ew.WINDOW_SLOTS ** n, n), bad[:3], [])
+    rng = random.Random(42)
+    for n in (5, 6):
+        sample = [tuple(rng.randrange(ew.WINDOW_SLOTS) for _ in range(n))
+                  for _ in range(150)]
+        check("and 150 sampled for {}".format(n),
+              [(p, judge(p)) for p in sample if judge(p)][:3], [])
+
+
+def test_the_spacing_converges_from_anywhere_and_stays():
+    """
+    The real per-tick rule, driven from every starting arrangement of two and
+    three accounts and a sample of four, settles on a best arrangement within
+    one window plus the longest hold -- and once settled, a day of ticks holds
+    nothing at all.
+    """
+    section("Spacing converges from any start, and then stays put")
+    import itertools
+    import random
+    base = 1790000000 - 1790000000 % SLOT
+
+    def start(phases, count):
+        accounts = _spacing_accounts(count)
+        states = dict((a.name, _alive(base, base + SLOT * (1 + p)))
+                      for a, p in zip(accounts, phases))
+        return accounts, states
+
+    worst, failures = 0, []
+    starts = [(p, 2) for p in itertools.product(range(10), repeat=2)]
+    starts += [(p, 3) for p in itertools.product(range(10), repeat=3)]
+    rng = random.Random(7)
+    starts += [(tuple(rng.randrange(10) for _ in range(4)), 4)
+               for _ in range(300)]
+    for phases, count in starts:
+        accounts, states = start(phases, count)
+        took = _run_until_settled(accounts, states, base)
+        if took is None:
+            failures.append(phases)
+            continue
+        worst = max(worst, took)
+    check("every start settles", failures[:3], [])
+    check_true("within one window plus the longest hold (at most 20 ticks), "
+               "worst seen {}".format(worst), worst <= 20)
+
+    # Settled means settled: a day of ticks afterwards holds nothing. Ticked
+    # straight on from where it settled -- skipping ticks would let every
+    # window lapse, which is an outage, not a settled schedule.
+    accounts, states = start((0, 0, 0), 3)
+    _, now = _ticks_until_settled(accounts, states, base)
+    held = []
+    for _ in range(48):
+        held += _tick(accounts, states, now)
+        now += SLOT
+    check("once settled, a whole day of ticks holds nothing", held, [])
+
+    # And an outage that lets every window lapse is repaired like any start.
+    accounts, states = start((0, 0, 0), 3)
+    for st in states.values():
+        st["rate_limits"]["five_hour"]["resets_at"] = base - 3600
+    check_true("windows that all lapsed together are spread out again",
+               _run_until_settled(accounts, states, base) is not None)
+
+
+def test_using_a_held_account_does_not_stop_the_spacing_settling():
+    """
+    A hold is not a lockout: a person can use a held account at any moment,
+    which opens its window there and then. The plan must simply start again
+    from where that leaves things, from every start and every moment of
+    interruption.
+    """
+    section("Using a held account interrupts a correction, harmlessly")
+    import itertools
+    base = 1790000000 - 1790000000 % SLOT
+    failures = []
+    for phases in itertools.product(range(10), repeat=2):
+        for when in range(6):
+            accounts = _spacing_accounts(2)
+            states = dict((a.name, _alive(base, base + SLOT * (1 + p)))
+                          for a, p in zip(accounts, phases))
+            took = _run_until_settled(
+                accounts, states, base,
+                use=lambda tick, when=when: "2" if tick == when else None)
+            if took is None:
+                failures.append((phases, when))
+    check("every interrupted correction still settles", failures[:3], [])
+
+
+def test_an_account_leaving_or_joining_is_respaced():
+    """
+    N is the accounts that will start a window at their next boundary. One
+    whose weekly limit outlasts its window drops out and the rest re-space for
+    one fewer; when it comes back they re-space again.
+    """
+    section("An account leaving and rejoining the rotation")
+    base = 1790000000 - 1790000000 % SLOT
+    accounts = _spacing_accounts(3)
+    states = dict((a.name, _alive(base, base + SLOT * (1 + i)))
+                  for i, a in enumerate(accounts))
+    check_true("three settle", _run_until_settled(accounts, states, base)
+               is not None)
+
+    _, now = _ticks_until_settled(accounts, states, base)
+    out = states["3"]
+    out["rate_limits"]["seven_day"] = {"used_percentage": 100,
+                                       "resets_at": now + 3 * 86400}
+    check("an account whose weekly limit outlasts its window stops counting",
+          ew.is_participating(accounts[2], out, now), False)
+    two = [a for a in accounts if a.name != "3"]
+    settled = False
+    for _ in range(30):
+        _tick(accounts, states, now)
+        settled = settled or _settled(two, states, now + 60)
+        now += SLOT
+    check_true("and the other two re-space for two", settled)
+
+    out["rate_limits"].pop("seven_day")
+    out["available_at"] = now
+    took = _run_until_settled(accounts, states, now)
+    check_true("when it comes back, all three are re-spaced", took is not None)
+
+
+def test_the_last_account_that_can_serve_is_never_held():
+    """
+    Holding an account saves at most a minute or so of average wait. It is never
+    worth leaving somebody with nothing: when every other account is spent until
+    after the held one's slot, the held one opens now. When another comes back
+    first, the hold stands -- "some account is out of quota" is the normal state
+    of a day and must not cancel every correction.
+    """
+    section("The one account that can serve is never held back")
+    base = 1790000000 - 1790000000 % SLOT
+    now = base + 30
+    a, b = _spacing_accounts(2)
+    # A's window opened this slot; B's has just ended, so B would open in the
+    # same slot. The plan holds B five slots, to base + 2h30m.
+    def states_with(a_used, a_back):
+        a_state = _alive(now, base + 10 * SLOT)
+        a_state["rate_limits"]["five_hour"]["used_percentage"] = a_used
+        if a_back:
+            a_state["available_at"] = a_back
+        return {"1": a_state, "2": _alive(now, now - 60)}
+
+    states = states_with(10, None)
+    go, until, why = ew.should_open_window(b, [a, b], states, now)
+    check("with the other account usable, B is held", go, False)
+    check("until the slot that spaces it", until, base + 5 * SLOT)
+
+    # A spent until its own window ends, five hours out: past B's slot.
+    states = states_with(100, None)
+    go, until, why = ew.should_open_window(b, [a, b], states, now)
+    check("with the other account spent past the held slot, it opens now",
+          (go, why and why[0]), (True, "last"))
+    check_true("and the log says why",
+               why and "no other account can serve" in why[1])
+
+    # A refused, but back in ten minutes -- long before B's slot.
+    states = states_with(10, now + 600)
+    go, _, _ = ew.should_open_window(b, [a, b], states, now)
+    check("with the other back before then, the hold stands", go, False)
+
+
+def test_a_hold_longer_than_any_plan_is_refused():
+    """
+    No plan holds an account for a whole window. If one ever does, the account
+    is pinged anyway, the run says it is a bug, and doctor reports it for a week.
+    """
+    section("The spacing's safety valve")
+    base = 1790000000 - 1790000000 % SLOT
+    now = base + 30
+    a, b = _spacing_accounts(2)
+    # The same collision as above: the plan wants B held.
+    states = {"1": _alive(now, base + 10 * SLOT),
+              "2": _alive(now, now - 60, skipped_in_a_row=ew.WINDOW_SLOTS)}
+    go, until, why = ew.should_open_window(b, [a, b], states, now)
+    check("held for a whole window, it opens regardless", go, True)
+    check("and says it is the valve", why and why[0], "valve")
+    states["2"]["skipped_in_a_row"] = ew.WINDOW_SLOTS - 1
+    check("one tick short of that, the plan still decides",
+          ew.should_open_window(b, [a, b], states, now)[0], False)
+
+
+def test_a_held_account_is_still_counted_as_alive():
+    """
+    Proof of life is a ping getting through, and a held account gets no pings
+    -- by choice. Measured from now, a long hold would read as an account that
+    has died, drop it from N, and re-space everyone around a hole that is not
+    there. Measured from when the holding started, it does not.
+    """
+    section("A held account is not mistaken for a dead one")
+    now = 1790000000.0
+    account = _spacing_accounts(1)[0]
+    long_hold = {"available_at": now - 4.5 * 3600 - 60,
+                 "withheld_since": now - 4.5 * 3600,
+                 "rate_limits": {"five_hour": {"resets_at": now - 4.5 * 3600}}}
+    check("held for four and a half hours, it still takes part",
+          ew.is_participating(account, long_hold, now), True)
+    silent = dict(long_hold)
+    silent.pop("withheld_since")
+    silent["available_at"] = now - 5 * 3600 - 60
+    check("the same silence without a hold is what drops an account",
+          ew.is_participating(account, silent, now), False)
+
+
+def test_a_ping_the_plan_holds_never_reaches_claude():
+    """
+    The real ping path, with the conversation stubbed: a tick the plan holds
+    sends nothing, records what it decided, and is not a failure; the tick at
+    the planned slot pings and clears it; `force` -- which is `switch` -- pings
+    whatever the plan says.
+    """
+    section("A held tick sends nothing and says when it will")
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    saved = (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
+             ew.restore_checkpoint)
+    sent = []
+
+    def run(account, extra_args, prompt, session_id, **kwargs):
+        sent.append(account.name)
+        return {"completed": True, "limited": False, "text": "ok", "error": None}
+    ew.run_interactive = run
+    ew.schedule_anchor = lambda account, target: True
+    ew.restore_checkpoint = lambda account, session: None
+    try:
+        a, b = _spacing_accounts(2)
+        for account in (a, b):
+            account.ensure_state_dir()
+            with open(account.session_id_file, "w") as f:
+                f.write("sess-" + account.name)
+            stamp_checkpoint(account)
+            open(account.checkpoint_backup, "w").close()
+        now = time.time()
+        ew.write_state(a, _alive(now, now + 3 * 3600))
+        ew.write_state(b, _alive(now, now - 60))     # ended in A's slot... nearly
+        # Put B's last window exactly where the plan will want to move it from:
+        # A's next window starts in slot_of(A's reset); B must not join it.
+        delays, _, _ = ew.spacing_plan([a, b], {"1": ew.read_state(a),
+                                                "2": ew.read_state(b)}, now)
+        ew.read_statusline_limits = lambda acct, records=None: {}
+        if not delays.get("2"):
+            print("  SKIP  this moment's slot happens to be the planned one")
+            return
+        result = ew.ping(b, [a, b])
+        check("a held tick is not a failure", result, True)
+        check("and nothing was sent to Claude", sent, [])
+        state = ew.read_state(b)
+        check("it counts the hold", state.get("skipped_in_a_row"), 1)
+        check_true("records when holding started",
+                   abs(state["withheld_since"] - time.time()) < 5)
+        check_true("and when the window will open, on a slot boundary",
+                   state["held_until"] % SLOT == 0
+                   and state["held_until"] > time.time())
+        log = open(b.log_file).read()
+        check_true("the log says so, and that using it opens it early",
+                   "Not pinging account" in log and "early" in log)
+
+        ew.ping(b, [a, b], force=True)
+        check("`force` pings whatever the plan says", sent, ["2"])
+        state = ew.read_state(b)
+        check("and clears the hold", [k for k in ("skipped_in_a_row",
+                                                  "withheld_since", "held_until")
+                                      if k in state], [])
+    finally:
+        (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
+         ew.restore_checkpoint) = saved
+
+
+def test_every_surface_tells_the_truth_about_a_held_account():
+    """
+    A held account has no window running and its full quota waiting: usable,
+    last among the usable because nothing of its is perishing, and the one
+    recommended when nothing else is. `which`, the JSON report, the published
+    schedule and the copy another machine reads must all say the same, and
+    `switch` must open its window.
+    """
+    section("Which, JSON, schedule.json and switch, for a held account")
+    now = time.time()
+    root = tempfile.mkdtemp()
+    saved = (ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.ping, ew.pings_here)
+    ew.STATE_ROOT = os.path.join(root, "state")
+    ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
+    try:
+        a, b = _spacing_accounts(2)
+        held = now + 2 * 3600
+        states = {"1": _alive(now, now + 3600),
+                  "2": _alive(now, now - 60, held_until=held,
+                              skipped_in_a_row=2, withheld_since=now - 3600)}
+        for account in (a, b):
+            ew.write_state(account, states[account.name])
+
+        avail = ew.availabilities([a, b], states, now)
+        check("a held account is usable", avail["2"].tier, ew.USABLE)
+        order = sorted([a, b], key=lambda x: ew.rank_account(
+            x, states[x.name], now, avail[x.name]))
+        check("but ranked after one with a window to spend",
+              [x.name for x in order], ["1", "2"])
+        line = ew.describe_availability(states["2"], avail["2"], now)
+        check_true("its line says no window is running, and why",
+                   "no window running" in line and "held until" in line)
+
+        states["1"]["rate_limits"]["five_hour"]["used_percentage"] = 100
+        avail = ew.availabilities([a, b], states, now)
+        chosen, reason = ew.choose_account([a, b], states, now, avail)
+        check("when the other is spent, the held one is recommended",
+              chosen.name, "2")
+        check_true("saying using it starts a fresh window, and the hold is "
+                   "yours to spend", "starts a fresh 5-hour window" in reason
+                   and "yours to spend" in reason)
+
+        ew.publish_schedule([a, b])
+        doc = json.load(open(ew.SCHEDULE_FILE))
+        entry = [e for e in doc["accounts"] if e["name"] == "2"][0]
+        check("schedule.json carries the hold", entry["held_until"], held)
+        check("and the window it is being moved to, not the one it left",
+              entry["expires_at"], held + ew.WINDOW_HOURS * 3600)
+        view = ew.schedule_view([a, b])
+        check_true("a machine reading the copy sees the hold too",
+                   view and view[1]["2"].get("held_until") == held)
+
+        out, _, _ = _capture(lambda: ew.status_json([a, b]))
+        report = dict((e["name"], e) for e in json.loads(out)["accounts"])
+        check("the JSON report keeps its `hold` key, filled by the planner",
+              report["2"]["hold"], {"until": held, "reason": "spacing"})
+        check("and null where nothing is held", report["1"]["hold"], None)
+
+        forced = []
+        ew.pings_here = lambda path=None: True
+
+        def ping(account, accounts=None, force=False):
+            forced.append((account.name, force))
+            st = ew.read_state(account)
+            st["rate_limits"]["five_hour"]["resets_at"] = time.time() + 18000
+            for key in ("held_until", "skipped_in_a_row", "withheld_since"):
+                st.pop(key, None)
+            ew.write_state(account, st)
+            return True
+        ew.ping = ping
+        out, _, _ = _capture(lambda: ew.open_held_window(b))
+        check("switching to a held account pings it, overriding the plan",
+              forced, [("2", True)])
+        check_true("and says it is opening its window", "opening its window"
+                   in out)
+        forced[:] = []
+        _capture(lambda: ew.open_held_window(a))
+        check("an account that is not held is left alone", forced, [])
+    finally:
+        ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.ping, ew.pings_here = saved
+
+
 def test_what_a_ping_records_from_how_it_went():
     """
     Everything downstream — when the next window can start, whether the account
@@ -3770,7 +3923,6 @@ def test_what_a_ping_records_from_how_it_went():
     """
     section("What a ping writes down, for each way it can go")
     ew.STATE_ROOT = tempfile.mkdtemp()
-    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
     saved = (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
              ew.restore_checkpoint, ew._systemctl, ew._run)
     class Ok(object):
@@ -3782,7 +3934,6 @@ def test_what_a_ping_records_from_how_it_went():
     ew._run = lambda cmd: Ok()
     try:
         account = temp_account(TEST_PREFIX)
-        ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
         # Signed in on a paid plan, so what the tiers below say comes from the
         # pings and not from the account's own files having something to add.
         os.makedirs(account.config_dir, 0o700)
@@ -3980,63 +4131,6 @@ def test_two_pings_at_once_do_not_tread_on_each_other():
         ew.cancel_anchor(account)
 
 
-def test_a_hold_suppresses_the_ping_and_nothing_else():
-    section("A hold skips the ping, and only for timing")
-    ew.STATE_ROOT = tempfile.mkdtemp()
-    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
-    now = time.time()
-    account = temp_account()
-    with open(account.session_id_file, "w") as f:
-        f.write("sid")
-    stamp_checkpoint(account)
-    with open(account.checkpoint_backup, "w") as f:
-        f.write("{}\n")
-
-    check("a hold in the future has not started yet",
-          ew.active_hold({"hold": {"from": now + 60, "until": now + 600}}, now),
-          None)
-    check("a hold that has run out is over",
-          ew.active_hold({"hold": {"from": now - 600, "until": now - 60}}, now),
-          None)
-    check_true("a hold spanning now is active",
-               ew.active_hold({"hold": {"from": now - 60, "until": now + 600}},
-                              now))
-
-    calls = []
-    original = ew.run_interactive
-    ew.run_interactive = lambda *a, **k: calls.append(a) or {
-        "completed": True, "limited": False, "text": ""}
-    try:
-        ew.write_state(account, {"hold": {"from": now - 60, "until": now + 600,
-                                          "reason": "test"}})
-        ew.ping(account, [account])
-        check("no ping is sent while holding", calls, [])
-        check_true("and the hold survives the run",
-                   "hold" in ew.read_state(account))
-
-        ew.write_state(account, {"hold": {"from": now - 600, "until": now - 60}})
-        ew.ping(account, [account])
-        check("once the hold is over the ping goes out", len(calls), 1)
-        check_true("and the spent hold is cleared",
-                   "hold" not in ew.read_state(account))
-
-        # A hold booked for a future boundary — by `realign --confirm` — has to
-        # survive every ordinary ping between now and then. Clearing it on the
-        # next tick would discard the correction with nothing to show for it.
-        ew.write_state(account, {"hold": {"from": now + 3600, "until": now + 7200,
-                                          "reason": "realigning"}})
-        ew.ping(account, [account])
-        check("a ping still goes out before a future hold starts", len(calls), 2)
-        check_true("and the pending hold is left alone",
-                   ew.read_state(account).get("hold", {}).get("until")
-                   == now + 7200)
-    finally:
-        ew.run_interactive = original
-        # A hold schedules a real transient timer that would start the ping
-        # service for this account name. Leave nothing armed.
-        ew.cancel_anchor(account)
-
-
 def test_an_unusable_account_is_still_pinged():
     """
     The recovery path, and the one thing that must never follow from "unusable".
@@ -4051,7 +4145,6 @@ def test_an_unusable_account_is_still_pinged():
     section("An account that cannot be used is still pinged")
     root = tempfile.mkdtemp()
     ew.STATE_ROOT = os.path.join(root, "state")
-    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
     now = time.time()
     account = temp_account()
     with open(account.session_id_file, "w") as f:
@@ -4930,14 +5023,13 @@ def test_doctor_notices_a_deployment_going_wrong():
         check_true("with the way to ask properly",
                    "XDG_RUNTIME_DIR=/run/user/" in said)
 
-        # A hold is the tool deliberately not pinging, for as long as lining
-        # the windows up takes. Counting those skipped pings as silence made
-        # `doctor` complain about what `realign --confirm` had just been told
-        # to do.
+        # A hold is the tool deliberately not pinging, for up to four and a
+        # half hours while it spaces the windows. Counting those skipped pings
+        # as silence would make `doctor` complain about what it chose to do.
         held = dict(ew.read_state(account))
-        held["hold"] = {"from": time.time() - 3600,
-                        "until": time.time() + 3600,
-                        "reason": "realigning, on your say-so"}
+        held["skipped_in_a_row"] = 7
+        held["withheld_since"] = time.time() - 3 * 3600
+        held["held_until"] = time.time() + 3600
         ew.write_state(account, held)
         check("a held account is not reported as silent",
               "has not pinged since" in doctor_says(), False)
@@ -5137,7 +5229,7 @@ def _clean_install(answers, accounts=2, claude_control=None,
 
     saved = (ew.HOME, ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE,
              ew.CLAUDE_PATH, ew.UNIT_DIR,
-             ew.BIN_DIR, ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE,
+             ew.BIN_DIR, ew.SCHEDULE_FILE,
              ew._systemctl, ew._run, sys.stdin, os.environ.get("HOME"),
              ew.STARTUP_WAIT_SEC, ew.COMPLETION_TIMEOUT_SEC,
              ew.STATUSLINE_WAIT_SEC,
@@ -5158,7 +5250,6 @@ def _clean_install(answers, accounts=2, claude_control=None,
     ew.CLAUDE_PATH = FAKE_CLAUDE
     ew.UNIT_DIR = os.path.join(home, ".config", "systemd", "user")
     ew.BIN_DIR = os.path.join(repo, "bin")
-    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
     ew.SCHEDULE_FILE = os.path.join(repo, "schedule.json")
     # Derived from HOME at import time, so rebinding HOME alone would leave
     # these three pointing at the real user's files — which is the one thing a
@@ -5211,7 +5302,7 @@ def _clean_install(answers, accounts=2, claude_control=None,
     finally:
         (ew.HOME, ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE,
          ew.CLAUDE_PATH, ew.UNIT_DIR, ew.BIN_DIR,
-         ew.ALIGNMENT_FILE, ew.SCHEDULE_FILE, ew._systemctl,
+         ew.SCHEDULE_FILE, ew._systemctl,
          ew._run, sys.stdin, old_home, ew.STARTUP_WAIT_SEC,
          ew.COMPLETION_TIMEOUT_SEC, ew.STATUSLINE_WAIT_SEC,
          ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON, ew.SWITCH_ROOT) = saved
@@ -5560,17 +5651,17 @@ def test_three_accounts_install_and_space_correctly():
           [ew.timer_calendar(a).rsplit(":", 1)[1] for a in accounts],
           ["{:02d}".format(a.guard_sec) for a in accounts])
 
-    # Three accounts want 1h40m apart, not 2h30m, and the optimiser has to reach
-    # that from wherever the three windows actually landed.
-    W = ew.WINDOW_HOURS * HOUR
-    delays, total = ew.plan_alignment({"1": 0.0, "2": 0.0, "3": 0.0}, W)
-    spaced = sorted((delays[n]) % W for n in delays)
-    check("three synced accounts are pushed to 1h40m apart",
-          [round(x / 60) for x in spaced], [0, 100, 200])
-    check("costing 5 hours in total, which is why it must be asked for",
-          round(total / 60), 300)
-    check_true("and that is well past the automatic threshold",
-               total > ew.AUTO_CORRECT_MAX_SEC)
+    # Three accounts cannot sit 1h40m apart: Anthropic floors every window
+    # start to the 30-minute grid, so the best there is is 1h30m, 1h30m and
+    # 2h00m. The old target was the unreachable 1h40m, and chasing it cost half
+    # an hour of dead window every cycle for ever.
+    delays = ew.plan_slots({"1": 4, "2": 4, "3": 4})
+    targets = sorted((4 + d) % ew.WINDOW_SLOTS for d in delays.values())
+    gaps = sorted(((targets[(i + 1) % 3] - targets[i]) % ew.WINDOW_SLOTS) * 30
+                  for i in range(3))
+    check("three accounts starting together are spread 90/90/120 minutes",
+          gaps, [90, 90, 120])
+    check("one of them opens at once", min(delays.values()), 0)
 
 
 def test_removing_an_account_stops_its_timer():
@@ -5933,7 +6024,11 @@ def test_every_command_routes_to_the_thing_it_names():
         check_true("one account's log is only that account's",
                    "account 2" in said and "account 1" not in said)
 
-        check("realign succeeds", run(["realign"])[0], 0)
+        try:
+            gone = run(["realign"])[0]
+        except SystemExit as exc:
+            gone = exc.code
+        check("realign is not a command any more", gone, 2)
 
         # `check` is the one looking command with a verdict to report, so its
         # exit code has to follow the accounts rather than the run.
@@ -6019,33 +6114,37 @@ def test_every_command_routes_to_the_thing_it_names():
 
 def test_looking_at_the_schedule_does_not_change_it():
     """
-    Noting a change in the participating set starts the settling clock, so a
-    command that only reports would quietly move the schedule it is describing.
-    doctor and status both did.
+    The spacing is worked out afresh on every tick and stored nowhere but in
+    the held account's own state, by the ping that held it. So a command that
+    only reports -- status, doctor, which -- must leave every file exactly as it
+    found it, however much planning it does on the way to its answer.
     """
     section("Reporting on the spacing changes nothing")
     now = time.time()
     ew.STATE_ROOT = tempfile.mkdtemp()
-    ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
     a = ew.Account(TEST_PREFIX + "-a", "/tmp/ca", 0)
     b = ew.Account(TEST_PREFIX + "-b", "/tmp/cb", 1)
-    states = {n: {"rate_limits": {"five_hour": {"resets_at": now + 600 + i * 900}},
-                  "available_at": now - 1}
-              for i, n in enumerate((a.name, b.name))}
+    # Account b's window has ended and the plan would hold it.
+    states = {a.name: {"rate_limits": {"five_hour": {"resets_at": now + 600}},
+                       "available_at": now - 1},
+              b.name: {"rate_limits": {"five_hour": {"resets_at": now - 60}},
+                       "available_at": now - 120}}
+    for account in (a, b):
+        ew.write_state(account, states[account.name])
+    before = dict((n, open(os.path.join(ew.STATE_ROOT, n, "state.json")).read())
+                  for n in (a.name, b.name))
+    listing = sorted(os.listdir(ew.STATE_ROOT))
 
-    check_true("nothing recorded yet", not os.path.exists(ew.ALIGNMENT_FILE))
-    ew.describe_alignment([a, b], states, now)
-    check_true("describing the spacing writes nothing",
-               not os.path.exists(ew.ALIGNMENT_FILE))
-    ew.alignment_plan([a, b], states, now, record=False)
-    check_true("and neither does planning it read-only",
-               not os.path.exists(ew.ALIGNMENT_FILE))
-
-    # The ping is the thing that acts, so it is the thing that records.
-    ew.alignment_plan([a, b], states, now, record=True)
-    check_true("the ping's own call does record", os.path.exists(ew.ALIGNMENT_FILE))
-    check("and records who is taking part",
-          ew.read_alignment().get("participants"), sorted([a.name, b.name]))
+    ew.spacing_lines([a, b], states, now)
+    ew.spacing_plan([a, b], states, now)
+    ew.should_open_window(b, [a, b], states, now)
+    check("planning and describing write nothing", sorted(os.listdir(
+        ew.STATE_ROOT)), listing)
+    check("and change no state file", dict(
+        (n, open(os.path.join(ew.STATE_ROOT, n, "state.json")).read())
+        for n in (a.name, b.name)), before)
+    check_true("no shared spacing file exists any more",
+               not hasattr(ew, "ALIGNMENT_FILE"))
 
 
 def test_the_shell_scripts_call_commands_that_exist():
@@ -7942,6 +8041,70 @@ def test_what_a_switch_says_reads_in_order_when_it_is_redirected():
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
+def test_a_dead_login_in_the_way_is_set_aside_not_refused():
+    """
+    The refusal above protects a login that would be destroyed with no copy
+    anywhere. A parked login whose refresh token has expired protects nothing:
+    it can never be used again. And it is the commonest way a store ends up
+    occupied -- park a login, sign in to the same account directly a few weeks
+    later, never switch back -- after which the account could not be switched
+    away from at all. Found on the machine this was written on, a week before
+    it would have mattered.
+
+    Set aside into .orphaned rather than deleted, like every other login here.
+    """
+    section("A dead login in the way is set aside, not refused")
+    restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                              parked=("1", "2"))
+    try:
+        store = ew.switch_store(accounts[0])
+        with open(ew.credentials_path(store)) as f:
+            creds = json.load(f)
+        creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
+            (time.time() - 86400) * 1000)
+        with open(ew.credentials_path(store), "w") as f:
+            json.dump(creds, f)
+        dead = ew.login_fingerprint(store)
+        mine = ew.login_fingerprint(ew.user_login())
+        check_true("the fixture: a different, expired login in the way",
+                   dead and mine and dead != mine
+                   and ew.parked_login_is_dead(store))
+
+        findings = ew.switch_findings(accounts)
+        check("doctor does not tell you to sign in to the account you are on",
+              [f.message for f in findings
+               if "parked login expired" in f.message
+               and "Account 1" in f.message], [])
+
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("the switch goes ahead", code, 0)
+        check_true("saying the expired login is being moved aside",
+                   "expired login" in out and ".orphaned" in out)
+        check("the live login is parked in the store",
+              ew.login_fingerprint(store), mine)
+        orphaned = os.path.join(ew.SWITCH_ROOT, ".orphaned")
+        kept = [ew.login_fingerprint(ew.Account("x", os.path.join(orphaned, d), 0))
+                for d in os.listdir(orphaned)] if os.path.isdir(orphaned) else []
+        check_true("and the dead one is kept in .orphaned, not deleted",
+                   dead in kept)
+        check("you are on account 2", ew.current_account(accounts).name, "2")
+    finally:
+        restore()
+
+    # And a live login in the way is still refused, exactly as before.
+    restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                              parked=("1", "2"))
+    try:
+        check_true("a live login in the way is not dead",
+                   not ew.parked_login_is_dead(ew.switch_store(accounts[0])))
+        out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
+                                                            sign_in=False))
+        check("and still stops the switch", code, 1)
+    finally:
+        restore()
+
+
 def test_parking_never_writes_over_a_login_that_is_already_there():
     """
     A store is meant to be empty: a login is parked there on the way out and
@@ -8714,7 +8877,7 @@ def test_a_machine_that_does_not_ping_is_never_told_to_ping():
     section("A machine that does not ping is never told to ping")
     root = tempfile.mkdtemp()
     saved = (ew.ACCOUNTS_FILE, ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.UNIT_DIR,
-             ew.SWITCH_ROOT, ew.ALIGNMENT_FILE, ew._systemctl, ew._run)
+             ew.SWITCH_ROOT, ew._systemctl, ew._run)
 
     class Ok(object):
         returncode = 0
@@ -8726,7 +8889,6 @@ def test_a_machine_that_does_not_ping_is_never_told_to_ping():
         ew.SCHEDULE_FILE = os.path.join(root, "schedule.json")
         ew.UNIT_DIR = os.path.join(root, "units")
         ew.SWITCH_ROOT = os.path.join(root, "switch")
-        ew.ALIGNMENT_FILE = os.path.join(ew.STATE_ROOT, "alignment.json")
         ew._systemctl = lambda *a: Ok()
         ew._run = lambda cmd: Ok()
         os.makedirs(ew.UNIT_DIR)
@@ -8748,7 +8910,6 @@ def test_a_machine_that_does_not_ping_is_never_told_to_ping():
 
         # -- the commands that only mean something where pings run --------
         for command, expected in (("ping", "sending one by hand"),
-                                  ("realign", "no schedule of its own"),
                                   ("init", "no checkpoint to build")):
             out, err, code = _capture(lambda: ew.cli([command]))
             check("`{}` is refused rather than attempted".format(command),
@@ -8772,8 +8933,7 @@ def test_a_machine_that_does_not_ping_is_never_told_to_ping():
         # -- the discovery line names only what works here ----------------
         said, _, _ = _capture(lambda: ew.cli([]))
         listed = said.split("Other commands:")[1]
-        check_true("realign and log are not offered", "realign" not in listed
-                   and "log" not in listed)
+        check_true("log is not offered", "log" not in listed)
         check_true("switch and which are", "switch" in listed
                    and "which" in listed)
 
@@ -8783,13 +8943,13 @@ def test_a_machine_that_does_not_ping_is_never_told_to_ping():
         said, _, _ = _capture(lambda: ew.cli([]))
         listed = said.split("Other commands:")[1]
         check("with one account, nothing that needs two is offered",
-              [word for word in ("switch", "realign") if word in listed], [])
+              [word for word in ("switch",) if word in listed], [])
         check_true("what is left still works here",
                    "which" in listed and "doctor" in listed
                    and "log" in listed)
     finally:
         (ew.ACCOUNTS_FILE, ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.UNIT_DIR,
-         ew.SWITCH_ROOT, ew.ALIGNMENT_FILE, ew._systemctl, ew._run) = saved
+         ew.SWITCH_ROOT, ew._systemctl, ew._run) = saved
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -10562,18 +10722,23 @@ def main():
                  test_one_usage_figure_reaches_every_surface_unchanged,
                  test_the_status_display_shows_the_unusual_parts,
                  test_every_reading_a_figure_can_come_from_can_be_said_in_words,
-                 test_spacing_optimiser,
                  test_phase_is_lost_only_when_pings_cannot_get_through,
-                 test_correction_policy,
-                 test_realign_is_the_only_way_a_long_hold_happens,
                  test_the_json_report_is_a_contract,
                  test_what_a_ping_records_from_how_it_went,
                  test_a_turn_claude_code_made_up_is_not_a_ping,
                  test_a_ping_that_did_not_get_through_records_why,
                  test_a_clean_install_refuses_a_first_message_claude_never_saw,
                  test_doctor_says_what_a_failing_ping_was_told,
+                 test_the_slot_planner_is_optimal,
+                 test_the_spacing_converges_from_anywhere_and_stays,
+                 test_using_a_held_account_does_not_stop_the_spacing_settling,
+                 test_an_account_leaving_or_joining_is_respaced,
+                 test_the_last_account_that_can_serve_is_never_held,
+                 test_a_hold_longer_than_any_plan_is_refused,
+                 test_a_held_account_is_still_counted_as_alive,
+                 test_a_ping_the_plan_holds_never_reaches_claude,
+                 test_every_surface_tells_the_truth_about_a_held_account,
                  test_two_pings_at_once_do_not_tread_on_each_other,
-                 test_a_hold_suppresses_the_ping_and_nothing_else,
                  test_an_unusable_account_is_still_pinged,
                  test_a_corrupt_file_is_read_as_corrupt_and_not_as_a_crash,
                  test_the_log_reads_in_the_order_it_was_written,
@@ -10636,6 +10801,7 @@ def main():
                  test_switching_says_what_it_will_and_will_not_fix,
                  test_what_a_switch_says_reads_in_order_when_it_is_redirected,
                  test_parking_never_writes_over_a_login_that_is_already_there,
+                 test_a_dead_login_in_the_way_is_set_aside_not_refused,
                  test_a_switch_says_what_the_account_it_moved_to_actually_has_left,
                  test_a_switch_killed_between_its_two_writes_is_finished_not_believed,
                  test_switching_with_no_account_named_follows_which,
