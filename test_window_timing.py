@@ -1888,7 +1888,10 @@ def test_a_checkpoint_from_another_directory_is_rebuilt():
 
 def test_an_impossible_usage_report_is_ignored():
     section("a usage report that contradicts arithmetic is not believed")
-    now = time.time()
+    # Deliberately off the 30-minute grid, as every ping is: a reading of
+    # "now plus a round duration" then lands off it too, which is what tells
+    # a placeholder from a genuine early reset.
+    now = (time.time() // ew.GRID_SEC) * ew.GRID_SEC + 641.5
 
     # The real case: a run reported a fresh window resetting in exactly four
     # hours while the reset it already knew about was still an hour away.
@@ -1934,6 +1937,27 @@ def test_an_impossible_usage_report_is_ignored():
           sorted(ew.implausible_limits(
               {"seven_day": {"resets_at": now + 72 * 3600}},
               {"seven_day": {"resets_at": now + 3600}}, now)), ["seven_day"])
+
+    # But a window can end early -- a quota-reset benefit, a plan upgrade, a
+    # reset for everyone -- and that reading is exactly the shape of the one
+    # above. Every real reset lands on the 30-minute grid; the placeholder
+    # never did. Discarding a real one kept a reset account's spent quota on
+    # screen for hours and the spacing planning around a window that had gone.
+    slot = (now // ew.GRID_SEC) * ew.GRID_SEC
+    known = {"five_hour": {"resets_at": slot + 4 * ew.GRID_SEC,
+                           "used_percentage": 99},
+             "seven_day": {"resets_at": slot + 100 * ew.GRID_SEC,
+                           "used_percentage": 94}}
+    early = {"five_hour": {"resets_at": slot + 10 * ew.GRID_SEC,
+                           "used_percentage": 0},
+             "seven_day": {"resets_at": slot + 336 * ew.GRID_SEC,
+                           "used_percentage": 0}}
+    check("an early reset that lands on the grid is believed, both limits",
+          ew.implausible_limits(early, known, now), {})
+    off = {"five_hour": {"resets_at": slot + 10 * ew.GRID_SEC + 41,
+                         "used_percentage": 0}}
+    check("the same reading off the grid is still a placeholder",
+          sorted(ew.implausible_limits(off, known, now)), ["five_hour"])
 
 
 def test_schedule_carries_account_identity():
@@ -3939,6 +3963,68 @@ def test_every_surface_tells_the_truth_about_a_held_account():
         check("an account that is not held is left alone", forced, [])
     finally:
         ew.STATE_ROOT, ew.SCHEDULE_FILE, ew.ping, ew.pings_here = saved
+
+
+def test_a_window_that_ended_early_is_believed_and_planned_from():
+    """
+    A quota-reset benefit, a plan upgrade, or a reset for everyone ends a
+    window before its time, and the next ping reports a later reset than the
+    one on record. Through the real ping path: the new figures replace the old
+    ones, the log says what happened, and the spacing plans from the new phase.
+    """
+    section("A window that ended early is believed, and planned from")
+    ew.STATE_ROOT = tempfile.mkdtemp()
+    saved = (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
+             ew.restore_checkpoint)
+    ew.run_interactive = lambda *a, **k: {"completed": True, "limited": False,
+                                          "text": "ok", "error": None}
+    ew.schedule_anchor = lambda account, target: True
+    ew.restore_checkpoint = lambda account, session: None
+    try:
+        a, b = _spacing_accounts(2)
+        for account in (a, b):
+            account.ensure_state_dir()
+            with open(account.session_id_file, "w") as f:
+                f.write("sess-" + account.name)
+            stamp_checkpoint(account)
+            open(account.checkpoint_backup, "w").close()
+            # Signed in, as a pinging account is: a ping creates the config
+            # directory, and an empty one reads as signed out.
+            os.makedirs(account.config_dir, 0o700)
+            with open(account.config_json, "w") as f:
+                json.dump({"oauthAccount": {"accountUuid": "u" + account.name}}, f)
+            with open(ew.credentials_path(account), "w") as f:
+                json.dump({"claudeAiOauth": {"accessToken": "t",
+                                             "refreshToken": "r",
+                                             "subscriptionType": "pro"}}, f)
+        now = time.time()
+        slot = ew.slot_start(now)
+        # B is three slots into a window it has spent.
+        ew.write_state(a, _alive(now, slot + 5 * SLOT))
+        b_state = _alive(now, slot + 7 * SLOT)
+        b_state["rate_limits"]["five_hour"]["used_percentage"] = 100
+        ew.write_state(b, b_state)
+        before = ew.spacing_plan([a, b], {"1": ew.read_state(a),
+                                          "2": ew.read_state(b)}, now)[1]["2"]
+
+        # Its quota is reset: the window it was in is gone, and the ping
+        # opens a new one in this slot -- three slots later than the old one.
+        fresh = {"five_hour": {"resets_at": slot + 10 * SLOT,
+                               "used_percentage": 0}}
+        ew.read_statusline_limits = lambda acct, records=None: fresh
+        ew.ping(b, [a, b])
+        state = ew.read_state(b)
+        check("the later reset is believed", state["rate_limits"]["five_hour"],
+              fresh["five_hour"])
+        check_true("the log says the window ended early, and from when to when",
+                   "ended early" in open(b.log_file).read())
+        after = ew.spacing_plan([a, b], {"1": ew.read_state(a), "2": state},
+                                time.time())[1]["2"]
+        check("and the spacing plans from the new phase, not the old one",
+              (after - before) % ew.WINDOW_SLOTS, 3)
+    finally:
+        (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
+         ew.restore_checkpoint) = saved
 
 
 def test_what_a_ping_records_from_how_it_went():
@@ -10758,6 +10844,7 @@ def main():
                  test_phase_is_lost_only_when_pings_cannot_get_through,
                  test_the_json_report_is_a_contract,
                  test_what_a_ping_records_from_how_it_went,
+                 test_a_window_that_ended_early_is_believed_and_planned_from,
                  test_a_turn_claude_code_made_up_is_not_a_ping,
                  test_a_ping_that_did_not_get_through_records_why,
                  test_a_clean_install_refuses_a_first_message_claude_never_saw,

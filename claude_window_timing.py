@@ -2599,6 +2599,15 @@ def implausible_limits(new, previous, now):
     a perfectly good 5-hour one — and a refused ping needs that 5-hour figure
     more than at any other moment, since it is the only thing that says when
     the account comes back.
+
+    "Cannot have happened" turned out to be too strong. A window *can* end
+    early: a quota-reset benefit, a plan upgrade, Anthropic resetting limits
+    for everyone. Each produces exactly this reading, and discarding it kept
+    the old figures on screen for up to five hours and the spacing planning
+    around a window that no longer existed. What separates the two is the
+    grid: every real reset ever observed here falls on it (GRID_SEC), and the
+    placeholder above was "now plus a round duration", which never does. So a
+    later reset on the grid is believed, and one off it is not.
     """
     problems = {}
     if not previous:
@@ -2609,6 +2618,8 @@ def implausible_limits(new, previous, now):
         if not was or not now_says:
             continue
         if now_says > was and was > now + ROLLOVER_SLACK_SEC:
+            if isinstance(now_says, (int, float)) and now_says % GRID_SEC == 0:
+                continue                  # an early reset, not a placeholder
             problems[key] = (
                 "{} claims to reset at {} but the reset already known, {}, "
                 "has not passed yet".format(name, fmt_time(now_says),
@@ -3892,6 +3903,15 @@ def _ping(account, accounts=None, force=False):
             log(account, "Ignoring this run's {} figure: {}. Keeping the "
                          "previous one.".format(names[key], problems[key]))
         believed = dict((k, v) for k, v in limits.items() if k not in problems)
+        for key, name in _LIMIT_NAMES:
+            was = ((state.get("rate_limits") or {}).get(key) or {}).get("resets_at")
+            says = (believed.get(key) or {}).get("resets_at")
+            if was and says and says > was and was > time.time() + ROLLOVER_SLACK_SEC:
+                log(account, "The {} ended early: it was due to reset at {}, "
+                             "and now resets at {}. A quota reset, a plan "
+                             "change, or the account used elsewhere — the "
+                             "spacing plans from the new time.".format(
+                                 names[key], fmt_time(was), fmt_time(says)))
         if believed:
             merged = dict(state.get("rate_limits") or {})
             merged.update(believed)
