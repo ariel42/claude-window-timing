@@ -3907,11 +3907,12 @@ def _ping(account, accounts=None, force=False):
             was = ((state.get("rate_limits") or {}).get(key) or {}).get("resets_at")
             says = (believed.get(key) or {}).get("resets_at")
             if was and says and says > was and was > time.time() + ROLLOVER_SLACK_SEC:
-                log(account, "The {} ended early: it was due to reset at {}, "
-                             "and now resets at {}. A quota reset, a plan "
-                             "change, or the account used elsewhere — the "
+                log(account, "The {} {} ended early: it was due to reset "
+                             "at {}, and now resets at {}. A quota reset, a "
+                             "plan change, or the account used elsewhere — the "
                              "spacing plans from the new time.".format(
-                                 names[key], fmt_time(was), fmt_time(says)))
+                                 names[key], "window" if key == "five_hour"
+                                 else "limit", fmt_time(was), fmt_time(says)))
         if believed:
             merged = dict(state.get("rate_limits") or {})
             merged.update(believed)

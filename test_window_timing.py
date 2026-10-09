@@ -4016,8 +4016,9 @@ def test_a_window_that_ended_early_is_believed_and_planned_from():
         state = ew.read_state(b)
         check("the later reset is believed", state["rate_limits"]["five_hour"],
               fresh["five_hour"])
+        said = open(b.log_file).read()
         check_true("the log says the window ended early, and from when to when",
-                   "ended early" in open(b.log_file).read())
+                   "The 5-hour window ended early" in said)
         after = ew.spacing_plan([a, b], {"1": ew.read_state(a), "2": state},
                                 time.time())[1]["2"]
         check("and the spacing plans from the new phase, not the old one",
