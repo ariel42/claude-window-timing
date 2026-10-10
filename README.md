@@ -17,6 +17,7 @@ It runs quietly in the background on Linux, needs nothing beyond Python and syst
 - **Practically free.** The pings are answered from Claude's prompt cache. Measured on an otherwise idle Pro account: under 1% of its weekly limit after almost a week of pings.
 - **Out of your way.** No wrapper, no proxy, nothing in the path of your requests. Nothing that runs on a timer ever touches your `~/.claude`.
 - **Honest about problems.** `claude-window doctor` catches the failures that are otherwise silent — an expired sign-in, a lapsed subscription, a timer that stopped.
+- **Not built on `claude -p`.** The pings drive Claude Code interactively, so they stay on your subscription even if Anthropic revives its paused plan to bill headless use separately ([details](docs/guide.md#billing-subscription-vs-api)).
 
 ## The same morning
 
