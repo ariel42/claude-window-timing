@@ -172,7 +172,7 @@ The one place the distinction *is* drawn is the advice about which account to us
 
 There are three familiar ways to attack this problem, and this tool is none of them.
 
-**A cron job that sends a message.** The obvious version. It knows nothing about where your window boundary actually is, so it drifts: miss one ping — a suspended laptop, a dropped network, a limit you spent yourself — and the next window starts late, and *every* window after it inherits that late start, with nothing to pull it back. The natural way to write one is `claude --print`, which under a subscription login has a [reported problem where it can be billed as API usage](https://github.com/anthropics/claude-code/issues/43333). And nothing about it is arranged around the prompt cache, so it pays for pings that could have been free.
+**A cron job that sends a message.** The obvious version. It knows nothing about where your window boundary actually is, so it drifts: miss one ping — a suspended laptop, a dropped network, a limit you spent yourself — and the next window starts late, and *every* window after it inherits that late start, with nothing to pull it back. The natural way to write one is `claude -p`, the headless mode whose billing Anthropic has been revising (see [billing](guide.md#billing-subscription-vs-api) in the user guide). And nothing about it is arranged around the prompt cache, so it pays for pings that could have been free.
 
 **A usage monitor.** Tells you how much of your window is left, which is worth knowing and completely orthogonal: it observes the window, it does not start one earlier.
 

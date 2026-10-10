@@ -81,7 +81,7 @@ claude-window-timing sends a small automated request to each of your subscriptio
 
 ## Why not just a cron job?
 
-- **A cron job drifts.** One missed ping — a sleeping laptop, a dropped connection — delays that window and every window after it, with nothing to pull them back; and the easy way to write one, `claude --print`, has a [reported billing problem](https://github.com/anthropics/claude-code/issues/43333). claude-window-timing aims at the window boundary itself, on the same 30-minute grid Anthropic uses, so a missed ping costs one late start and nothing more.
+- **A cron job drifts.** One missed ping — a sleeping laptop, a dropped connection — delays that window and every window after it, with nothing to pull them back. claude-window-timing aims at the window boundary itself, on the same 30-minute grid Anthropic uses, so a missed ping costs one late start and nothing more.
 - **A usage monitor** tells you how much of your window is left. It can't start your next one earlier.
 - **A proxy or router** puts software in the path of every request you make. `switch` hands Claude Code a different login and gets out of the way.
 

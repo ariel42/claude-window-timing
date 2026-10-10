@@ -260,7 +260,7 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 
 - This is only useful when Claude Code is signed in to a **Pro or Max subscription**. With an API key the pings would simply be billed per token.
 - If `ANTHROPIC_API_KEY` is set, the CLI prefers it and bills the API account. The tool runs Claude with a clean environment that leaves that variable out.
-- Pings run in interactive mode rather than `--print`, because `claude --print` under a subscription login has a reported problem where it can be billed as API usage ([anthropics/claude-code#43333](https://github.com/anthropics/claude-code/issues/43333)).
+- Pings run Claude Code interactively, the way you do, rather than headless with `claude -p` (`--print`). Headless use is the part of Claude Code whose billing Anthropic has been revising: in May 2026 it announced moving `claude -p` and the Agent SDK onto a separate credit billed at API rates, it paused that change on June 15, 2026, and as of its [October 7, 2026 update](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) `claude -p` still draws from subscription limits. An earlier bug that billed `claude -p` as API usage under a subscription login ([anthropics/claude-code#43333](https://github.com/anthropics/claude-code/issues/43333)) was fixed in April 2026.
 
 ## What it does not do
 
