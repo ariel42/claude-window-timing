@@ -2513,6 +2513,22 @@ def take_reading(account, login=None, now=None):
     if now - (state.get("limits_read_at") or 0) < LIVE_REUSE_SEC:
         return stored, ""      # already fresh; hand back what is on disk
 
+    # An access token past its expiry is refused with a 401, and refreshing
+    # it is Claude Code's job, not this tool's: a refresh rotates the token,
+    # and rotation done here would sign out whoever holds the copy. It is the
+    # normal state of a login that has sat unused for more than a few hours --
+    # above all one `switch` has just taken out of its store after a week --
+    # and Claude Code renews it on its first request. So it is not asked with,
+    # and not recorded as a fault: `doctor` reported it as one, against an
+    # account whose pings were all fine.
+    creds = _read_json(credentials_path(login or account)).get(
+        "claudeAiOauth") or {}
+    expires = _epoch_seconds(creds.get("expiresAt"))
+    if expires and expires <= now + 60:
+        return stored, ("its access token has expired; Claude Code renews it "
+                        "on its next request, and the figures after that are "
+                        "live")
+
     limits, problem = read_live_limits(login or account)
     account.ensure_state_dir()
     if problem or not limits:

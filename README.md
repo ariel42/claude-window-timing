@@ -4,12 +4,12 @@
 
 This puts that timing back under your control. It starts your window before you arrive, keeps one running around the clock, and — with more than one subscription — holds their windows apart so a fresh one is never far away, tells you which to spend, and moves you there in a single command.
 
-- **A window already running when you sit down.** Pings keep one open around the clock, so you never start the clock yourself — you arrive partway into a window that is already running, and the next one comes sooner. Where in the window you land is luck; averaged over many days it is about 2.5 hours of waiting for a fresh one instead of a flat 5. The pings cost almost nothing against the 5-hour limit — Claude serves them from its prompt cache — and a little against the separate weekly one ([the numbers](#notes-and-caveats)).
+- **A window already running when you sit down.** Pings keep one open around the clock, so you never start the clock yourself — you arrive partway into a window that is already running, and the next one comes sooner. Where in the window you land is luck; averaged over many days it is about 2.5 hours of waiting for a fresh one instead of a flat 5. The pings cost almost nothing against the 5-hour limit — Claude serves them from its prompt cache — and too little to register against the separate weekly one: under 1% after a week of nothing but pings ([the numbers](#notes-and-caveats)).
 - **Hit the limit, keep working.** `claude-window switch` points your own Claude Code at an account that still has quota. No logging out, no browser, no losing your place — and it refuses when it would not actually work.
 - **A fresh window every 2½ hours with two subscriptions, instead of every 5.** Three sit 1h30m, 1h30m and 2h apart — as even as Anthropic's 30-minute grid allows. Kept that way on their own, through outages and your own use, with nothing to approve. Not more quota — quota that arrives when you need it, instead of all at once and then not for hours.
 - **A straight answer to which account to spend.** The window that expires first, skipping any account that cannot serve a request at all — a spent weekly limit, a lapsed plan, an expired sign-in.
 
-It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 8,000 lines of Python standard library and a systemd timer — no dependencies and no daemon. The only traffic it makes is the pings themselves, plus the one very small request per account that `which` and `status` use to read your limits ([how fresh those figures are](#which-account-to-use-now)).
+It does all of this without touching how you use Claude Code: no wrapper, no proxy, no shared config directory, nothing intercepted. Nothing that runs on a timer goes near `~/.claude`. The one command that writes there is `switch`, only when you run it, to two files, after backing both up. About 8,500 lines of Python standard library and a systemd timer — no dependencies and no daemon. The only traffic it makes is the pings themselves, plus the one very small request per account that `which` and `status` use to read your limits ([how fresh those figures are](#which-account-to-use-now)).
 
 ---
 
@@ -35,7 +35,7 @@ Plenty of people work around it by hand: fire a throwaway "hi" at Claude early i
 
 It sends that message for you, every 30 minutes, all day and all night.
 
-Each one is tiny — a single "bye" to a saved one-line conversation — and **they cost as close to nothing as makes no difference**, because Claude serves them from its prompt cache and [cache reads are not deducted from your rate limit](https://platform.claude.com/docs/en/build-with-claude/prompt-caching). Every ping in the logs this machine keeps — 48 hours of them, which is all `LOG_RETENTION_HOURS` holds — was served from cache, apart from a run of misses traced to the one thing that can spoil it — see [where the pings run](#where-the-pings-run).
+Each one is tiny — a single "bye" to a saved one-line conversation — and **they cost as close to nothing as makes no difference**, because Claude serves them from its prompt cache and [cache reads are not deducted from your rate limit](https://platform.claude.com/docs/en/build-with-claude/prompt-caching). Almost every ping in this machine's logs is served from cache. The exceptions are small and known: once a day, around midnight, a few hundred tokens of the prompt are written afresh (most likely the date, which Claude Code puts in it); now and then the whole cache is rebuilt, a handful of times a week; and a Claude Code update rewrites it once. A miss costs what one ordinary short request costs. The one thing that used to spoil it routinely is gone — see [where the pings run](#where-the-pings-run).
 
 Same morning, with it running:
 
@@ -362,7 +362,7 @@ Uninstalling stops the timers and removes every unit, and by default leaves this
 |---|---|
 | `claude_window_timing.py` | The whole tool. |
 | `install.sh` / `uninstall.sh` | Prerequisite checks, then the wizard; and the teardown. |
-| `test_window_timing.py` | Over 1,600 checks. `python3 test_window_timing.py`. |
+| `test_window_timing.py` | Over 1,700 checks. `python3 test_window_timing.py`. |
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 
@@ -381,8 +381,7 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 ## Notes and caveats
 
 - Not affiliated with or endorsed by Anthropic. The full version of this is under [Before you install](#before-you-install), at the top, where it belongs: this sends automated requests to your subscription around the clock, Anthropic's [consumer terms](https://www.anthropic.com/legal/consumer-terms) address automated access, and the decision is yours to make with the terms in front of you. Running several subscriptions is a separate decision with its own considerations.
-- **What the pings cost against the weekly limit is bounded, not measured.** The longest stretch of ping-only activity observed here is 13 consecutive readings with the weekly figure unmoved, and that figure is reported to the nearest 1% — so all the data supports is "less than 1 percentage point per 13 idle pings". Over ~340 pings a week that bound is too loose to be useful. It is stated here as a bound rather than dressed up as a measurement. Leaving one account unused for a full weekly cycle with the pings running would settle it exactly.
-- Pings are cheap but not free, and they also draw a little from the separate **weekly** limit — about 48 pings a day per account. How little is below what can be measured from outside: the weekly figure is reported to the nearest 1%, and in this machine's logs it did not move across 13 consecutive pings that spent nothing at all of the 5-hour window. Read "a little" as an upper bound nobody has been able to tighten, not as a measurement.
+- **What the pings cost against the weekly limit: under 1%.** Measured on a Pro account left otherwise unused from one weekly reset to the next: about 270 pings over five and a half days, and its weekly figure read 0% at the end. Claude reports that figure in whole percentages, so this says "less than one point a week", not "nothing" — but less than one point it is.
 - Pings ask Claude for no thinking and never update the CLI. Thinking is billed as output and a ping's reply is discarded; an update rewrites the tool definitions that sit at the front of every cached prompt, which would make your own open sessions expensive to resume. Neither affects how you run Claude Code yourself.
 - Accounts must be genuinely different Claude accounts. Signing in twice as the same one looks like it works and buys nothing; setup checks for it.
 - **Do not point a ping directory at a *different* account with `/login`.** That directory's identity is how the tool knows which account it is pinging. Signing the *same* account in again is fine and is what `doctor` tells you to do when a login expires; changing which account lives there means editing `accounts.json` and re-running `./install.sh`.

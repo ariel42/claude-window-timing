@@ -2557,6 +2557,32 @@ def test_a_reading_taken_a_moment_ago_is_not_taken_again():
                                      "resets_at": now + 3600}}})
         ew.refresh_limits([account])
         check("a first reading is always taken", taken, ["1"])
+
+        # A login whose access token has run out: what `switch` installs after
+        # a week parked. Asking with it is a 401 that `doctor` then reported
+        # as a fault against an account whose pings were all fine. Claude Code
+        # renews it on its first request; this tool must not refresh it itself.
+        del taken[:]
+        with open(ew.credentials_path(account), "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r",
+                                         "expiresAt": int((now - 3600) * 1000)}}, f)
+        ew.write_state(account, {"last_run": now - 300, "available_at": now - 300,
+                                 "rate_limits": {"five_hour": {
+                                     "used_percentage": 3,
+                                     "resets_at": now + 3600}}})
+        got, problem = ew.take_reading(account, now=now)
+        check("an expired access token is not asked with", taken, [])
+        check_true("it says Claude Code renews it, rather than that it failed",
+                   "renews it" in problem)
+        check("and records nothing for doctor to report",
+              ew.read_state(account).get("live_problem"), None)
+        check("the stored figures come back", got["five_hour"]["used_percentage"], 3)
+
+        with open(ew.credentials_path(account), "w") as f:
+            json.dump({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r",
+                                         "expiresAt": int((now + 3600) * 1000)}}, f)
+        ew.take_reading(account, now=now)
+        check("one still valid is asked with", taken, ["1"])
     finally:
         ew.STATE_ROOT, ew.pings_here, ew.read_live_limits = saved
         shutil.rmtree(root, ignore_errors=True)
