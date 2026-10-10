@@ -11,7 +11,7 @@ It runs quietly in the background on Linux, needs nothing beyond Python and syst
 ## What you get
 
 - **Half the wait for a fresh window.** You arrive to a window that is already running, so the next fresh one is on average 2½ hours away instead of a fixed 5.
-- **More subscriptions, one steady supply.** Two Pro or Max accounts deliver a fresh window every 2½ hours — held apart automatically, and back in place on their own after an outage or a busy day.
+- **More subscriptions, one steady supply.** Two Pro or Max accounts give you a fresh window every 2½ hours; three, every 1h40m on average; four, every 1h15m — and so on. The windows are held apart automatically, and fall back into place on their own after an outage or a busy day.
 - **A straight answer to "which account now?"** `claude-window which` names the window to spend first, and skips any account that can't serve you: a spent weekly limit, a lapsed plan, an expired sign-in.
 - **Switch in one command.** `claude-window switch` moves your Claude Code to that account. No logging out, no browser — and the sessions you already have open follow it.
 - **Practically free.** The pings are answered from Claude's prompt cache. Measured on an otherwise idle Pro account: under 1% of its weekly limit after almost a week of pings.
@@ -34,8 +34,9 @@ Where in the window you arrive varies from day to day — sometimes it has just 
 |---|---|---|
 | 1 | every 5 hours | 2h 30m |
 | 2 | every 2½ hours | 1h 15m |
-| 3 | every 1½–2 hours | 51m |
-| 4 | every 1–1½ hours | 39m |
+| 3 | every 1h40m on average (1½–2 hours apart) | 51m |
+| 4 | every 1h15m on average (1–1½ hours apart) | 39m |
+| 5 | every hour | 30m |
 
 The windows are kept apart without anything to approve: when an account's window ends, the tool waits for the slot that keeps the spacing before opening the next one. That wait is never a lockout — use the account and its window opens at once. ([Why these numbers](docs/how-it-works.md#more-than-one-subscription).)
 

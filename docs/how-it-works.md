@@ -7,7 +7,7 @@ The design, the facts it rests on, and why each decision is the way it is. For i
 - Claude Code's 5-hour usage window starts with the first request on an account, not at a fixed hour.
 - The tool keeps a window running on every account, around the clock, by sending each one a tiny **ping** every 30 minutes: a single "bye" replayed into a saved one-line conversation, answered from Claude's prompt cache.
 - Anthropic **floors every window start to a 30-minute grid** in UTC. The pings fire on the same grid — at `:00:30` and `:30:30` UTC — so each one lands just after a possible window boundary, and a missed ping never shifts the ones after it.
-- With several subscriptions, windows are **spaced as evenly as the grid allows** (2h30m apart for two). Spacing is kept by sometimes *not* opening an account's next window until the right slot. That wait is never a lockout: using the account opens its window immediately.
+- With several subscriptions, windows are **spaced as evenly as the grid allows**: 2h30m apart for two, 1h40m apart on average for three, and so on. Spacing is kept by sometimes *not* opening an account's next window until the right slot. That wait is never a lockout: using the account opens its window immediately.
 - Nothing the tool runs on a timer touches your own Claude Code configuration. The one command that does is `claude-window switch`, and only when you type it.
 
 ## The problem

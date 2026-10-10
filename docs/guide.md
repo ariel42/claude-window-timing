@@ -64,7 +64,7 @@ Claude Code Window Timing — status
 ==================================
 
 Use account 2 (work)
-  its window ends first, 2026-08-11 13:00:00 IDT (in 1h21m29s)
+  its window ends first, 2026-08-11 13:00:00 IDT (in 1h28m12s)
 
 Your Claude Code  : account 1 (personal)
                     `claude-window switch` moves it to account 2 (work)
