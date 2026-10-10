@@ -6282,12 +6282,25 @@ def test_every_command_the_output_suggests_can_be_typed():
                      for f in flags
                      if f.strip("[]") not in options.get(v, ()))), [])
 
-    with open(os.path.join(here, "README.md")) as f:
-        readme = f.read()
-    documented = _suggested_invocations(readme)
-    check_true("the README's command table was actually read",
+    # Every document a person or an agent is sent to: the landing page, the
+    # docs it links to, and the guide for agents. The full command table
+    # lives in the user guide now, so that is where the coverage is counted.
+    docs = [os.path.join(here, "README.md"), os.path.join(here, "AGENTS.md")]
+    docs += sorted(os.path.join(here, "docs", name)
+                   for name in os.listdir(os.path.join(here, "docs"))
+                   if name.endswith(".md"))
+    texts = {}
+    for path in docs:
+        with open(path) as f:
+            texts[os.path.relpath(path, here)] = f.read()
+    check_true("the documents were found, the guide among them",
+               "docs/guide.md" in texts and "README.md" in texts)
+    documented = _suggested_invocations(texts["docs/guide.md"])
+    check_true("the guide's command table was actually read",
                len(set(v for v, _ in documented)) >= 10)
-    check("and documents only commands that exist", unusable(readme), [])
+    for name in sorted(texts):
+        check("{} documents only commands that exist".format(name),
+              unusable(texts[name]), [])
 
 
 def test_every_command_routes_to_the_thing_it_names():

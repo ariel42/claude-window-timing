@@ -8217,8 +8217,10 @@ def build_parser():
                                 "parked — for scripts, where a prompt would "
                                 "hang")
 
-    add("ping", "Send one ping. Spends a little quota, and starts a new window "
-                "if the last one has ended. This is what the timer runs.",
+    add("ping", "Run one tick: send one ping, which spends a little quota and "
+                "starts a new window if the last one has ended -- or, with "
+                "several accounts, hold this one back when its window belongs "
+                "in a later slot. This is what the timer runs.",
         account="optional")
 
     log = sub.add_parser("log", help="Show a ping log.",
