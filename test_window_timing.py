@@ -10184,7 +10184,7 @@ def test_the_reset_grid_is_checked_rather_than_assumed():
     Every spacing decision this tool makes rests on Anthropic flooring each
     5-hour reset to a 30-minute grid — and that is an observation about someone
     else's service, not a documented guarantee. If it ever stops holding, the
-    reachable-spacing table in ALIGNMENT-PLAN.md is wrong and nothing else
+    spacing table in docs/how-it-works.md is wrong and nothing else
     anywhere would notice: the tool would go on computing targets from a lattice
     that no longer exists, and the only symptom would be corrections that never
     settle. So the grid is counted, sampled, and reported when it breaks.
@@ -10243,8 +10243,15 @@ def test_the_reset_grid_is_checked_rather_than_assumed():
     check("and a warning, not an error", findings[0].level, "warning")
     check_true("naming the account", "Account {}".format(account.name)
                in findings[0].message)
-    check_true("and pointing at the document that depends on it",
-               "ALIGNMENT-PLAN.md" in findings[0].hint)
+    check_true("and pointing at the document that explains it",
+               "docs/how-it-works.md" in findings[0].hint)
+    # The document it points at ships with the tool: a hint naming a file the
+    # user does not have is no hint. (It used to name a local plan file that
+    # was never published.)
+    check_true("which exists, with the section it names",
+               os.path.exists(ew.GRID_DOC.split(" (")[0])
+               and "## Anthropic's 30-minute grid" in open(
+                   ew.GRID_DOC.split(" (")[0]).read())
 
     clean = temp_account()
     ew.write_state(clean, {"grid": {"checked": 40, "recent": []}})

@@ -138,7 +138,7 @@ WINDOW_HOURS = 5
 # Anthropic snaps every 5-hour reset down to a 30-minute grid: a ping at
 # 15:30:44 opens a window reported as resetting at 20:30:00, not 20:30:44.
 # Observed on every window-opening ping in this machine's logs, across both
-# accounts (see ALIGNMENT-REVIEW.md §2 and ALIGNMENT-PLAN.md §1).
+# accounts -- over 150 resets, none off the grid (docs/how-it-works.md).
 #
 # Two consequences, and the spacing design rests on both:
 #
@@ -149,9 +149,11 @@ WINDOW_HOURS = 5
 # This is an observation about someone else's service, not a documented
 # guarantee — so it is *checked* rather than assumed. note_reset_grid() compares
 # every distinct reset this machine is told about against the grid, and `doctor`
-# reports a miss. The day that finding appears, the reachable-spacing table in
-# ALIGNMENT-PLAN.md needs revisiting.
+# reports a miss. The day that finding appears, the spacing table in
+# docs/how-it-works.md, and the planner built on it, need revisiting.
 GRID_SEC = 30 * 60
+GRID_DOC = os.path.join(SCRIPT_DIR, "docs", "how-it-works.md") + \
+    " (\"Anthropic's 30-minute grid\")"
 WINDOW_SLOTS = WINDOW_HOURS * 3600 // GRID_SEC          # 10
 
 # How many distinct reset times to keep per account as the raw sample behind
@@ -2431,9 +2433,9 @@ def note_reset_grid(account, state, resets):
                                  "off_by": off}
         log(account,
             "Reset {} is {} off the {}-minute grid the spacing assumes — {} of "
-            "{} distinct resets seen here. See ALIGNMENT-PLAN.md.".format(
+            "{} distinct resets seen here. See {}.".format(
                 fmt_time(resets), fmt_delta(off), GRID_SEC // 60,
-                grid["off_grid"], grid["checked"]))
+                grid["off_grid"], grid["checked"], GRID_DOC))
     state["grid"] = grid
 
 
@@ -2488,11 +2490,11 @@ def reset_grid_findings(accounts):
             "Account {}: {} of {} reset times Claude reported were not on the "
             "{}-minute grid".format(
                 account.name, off, grid.get("checked") or off, GRID_SEC // 60),
-            "The window spacing assumes every reset is floored to that grid — "
-            "ALIGNMENT-PLAN.md rests on it entirely. The most recent exception "
-            "was {}, off by {}. If this keeps happening, the reachable-spacing "
-            "table in that document is wrong and the plan needs revisiting."
-            .format(fmt_time(last.get("resets_at") or 0),
+            "The window spacing assumes every reset is floored to that grid "
+            "({}). The most recent exception was {}, off by {}. If this keeps "
+            "happening, Anthropic has changed how windows are dated and the "
+            "spacing needs revisiting — please report it."
+            .format(GRID_DOC, fmt_time(last.get("resets_at") or 0),
                     fmt_delta(last.get("off_by") or 0))))
     return findings
 
