@@ -1388,6 +1388,18 @@ def slot_start(moment):
     return moment - moment % GRID_SEC
 
 
+def cyclic_gaps(slots):
+    """
+    The gaps between these slots around the 5-hour cycle, in slots, smallest
+    first. One slot alone has the whole cycle to itself.
+    """
+    ordered = sorted(s % WINDOW_SLOTS for s in slots)
+    if len(ordered) < 2:
+        return [WINDOW_SLOTS] * len(ordered)
+    return sorted((ordered[(i + 1) % len(ordered)] - ordered[i]) % WINDOW_SLOTS
+                  for i in range(len(ordered)))
+
+
 def gap_cost(slots):
     """
     The sum of the squared gaps between these slots, around the cycle.
@@ -1396,12 +1408,9 @@ def gap_cost(slots):
     which is the quantity spacing exists to make small. It also orders the
     worst gap the same way, so "evenly spaced" means one thing.
     """
-    ordered = sorted(slots)
-    if len(ordered) < 2:
+    if len(slots) < 2:
         return WINDOW_SLOTS ** 2
-    gaps = [(ordered[(i + 1) % len(ordered)] - ordered[i]) % WINDOW_SLOTS
-            for i in range(len(ordered))]
-    return sum(g * g for g in gaps)
+    return sum(g * g for g in cyclic_gaps(slots))
 
 
 _OPTIMAL_TARGETS = {}
@@ -1524,6 +1533,8 @@ def participation(account, state, now):
     # that has died -- that would change N, and re-space every other account
     # around a hole that is not there.
     reference = state.get("withheld_since") or now
+    if reference != now and hold_went_stale(state, now):
+        reference = now           # the machine was off; see forget_stale_hold
     if proven <= reference - WINDOW_HOURS * 3600:
         return False, "nothing has got through since {}".format(
             fmt_time(proven))
@@ -1535,23 +1546,60 @@ def is_participating(account, state, now):
     return participation(account, state, now)[0]
 
 
+def earliest_slot(account, state, now):
+    """
+    The first slot this account's next window can start in, or None when there
+    is nothing to plan around.
+
+    An account with its window open is fixed: the next one starts when this
+    one ends, on the phase it is already on. One whose window has ended starts
+    in the first slot it can actually be served in -- this one, if it can serve
+    now; the slot its refusal lifts in, if Claude has said when (a spent weekly
+    limit about to reset); and nothing at all if its pings simply keep failing.
+
+    Treating every ended window as free to open *now* was wrong for the second
+    and third: the plan put a refused account in the current slot, held the
+    others to space around it, and on the next tick found it still unopened
+    and "now" moved on -- holding a healthy account for hours behind one that
+    could not open, until the safety valve fired. Found by a randomized
+    stress run of the real planner, before any real install met it.
+    """
+    if window_running(state, now):
+        return slot_of(raw_reset(state))
+    avail = account_availability(account, state, now)
+    if avail.tier == USABLE:
+        return slot_of(now)
+    if avail.tier == WAITING and avail.until is not None:
+        # The first tick at or after the moment it comes back. Ticks fire a
+        # few seconds past each grid line, so a return on the line is caught
+        # by that line's tick; one inside a cell waits for the next.
+        slot = slot_of(avail.until)
+        return slot if avail.until % GRID_SEC <= RESET_GUARD_SEC \
+            else (slot + 1) % WINDOW_SLOTS
+    return None
+
+
 def spacing_plan(accounts, states, now):
     """
-    The plan for every account taking part: (delays, phases, participants).
+    The plan for every account it can be made for: (delays, phases, planned).
 
-    An account with its window open is fixed — its next window will start when
-    this one ends, at the phase it is already on. One whose window has ended is
-    free to start in the current slot or any later one. Everything else follows
-    from plan_slots().
+    `planned` is the accounts taking part in the rotation (participation())
+    that also have an earliest slot (earliest_slot()) -- an account whose pings
+    keep failing takes part, but cannot be planned around until one gets
+    through. Everything else follows from plan_slots(). A delay is counted
+    from the account's earliest slot, which for an account that can serve now
+    is the current one.
     """
-    participants = [a for a in accounts
-                    if is_participating(a, states[a.name], now)]
     phases = {}
-    for account in participants:
+    for account in accounts:
         state = states[account.name]
-        phases[account.name] = slot_of(raw_reset(state)) \
-            if window_running(state, now) else slot_of(now)
-    return plan_slots(phases), phases, participants
+        if not is_participating(account, state, now):
+            continue
+        slot = earliest_slot(account, state, now)
+        if slot is not None:
+            phases[account.name] = slot
+    planned = [a for a in accounts if a.name in phases]
+    return plan_slots(phases), phases, planned
 
 
 def _someone_else_can_serve(account, accounts, states, now, until):
@@ -1575,6 +1623,73 @@ def _someone_else_can_serve(account, accounts, states, now, until):
     return False
 
 
+HOLD_KEYS = ("skipped_in_a_row", "withheld_since", "held_until", "held_at")
+
+
+def clear_hold(state):
+    """Forget that this account was being held."""
+    for key in HOLD_KEYS:
+        state.pop(key, None)
+
+
+def record_hold(state, until, now):
+    """Write down one held tick: when holding began, the count, the target."""
+    state["skipped_in_a_row"] = state.get("skipped_in_a_row", 0) + 1
+    state["withheld_since"] = state.get("withheld_since") or now
+    state["held_until"] = until
+    state["held_at"] = now
+
+
+def decide_tick(account, accounts, states, now, force=False):
+    """
+    The whole of one tick's decision, and the bookkeeping that goes with it:
+    (go, until, why), with `states[account.name]` updated in place.
+
+    The only caller that acts on it is _ping, and the tests drive exactly this
+    function, so what they check is what runs. `force` is a person asking for
+    this account now -- `switch` -- which no plan overrides.
+    """
+    state = states[account.name]
+    if force:
+        clear_hold(state)
+        return True, None, None
+    forget_stale_hold(state, now)
+    go, until, why = should_open_window(account, accounts, states, now)
+    if not go:
+        record_hold(state, until, now)
+        return go, until, why
+    if why and why[0] == "valve":
+        state["valve_at"] = now
+    clear_hold(state)
+    return go, until, why
+
+
+def forget_stale_hold(state, now):
+    """
+    Drop a hold whose ticks stopped coming, and say whether there was one.
+
+    Held ticks arrive every interval. One that is further back than that means
+    the machine was off or asleep in between, and the plan the hold belonged to
+    went with it: every window lapsed and is planned afresh. Carried over, the
+    count of held ticks reached the safety valve on a laptop that merely slept
+    through the night -- and `doctor` called that a bug -- and the time the
+    hold began kept an account that nothing had pinged for hours counting as
+    alive.
+    """
+    if not hold_went_stale(state, now):
+        return False
+    clear_hold(state)
+    return True
+
+
+def hold_went_stale(state, now):
+    """Whether this account was being held and its held ticks stopped coming."""
+    held_at = state.get("held_at")
+    if held_at is None and state.get("skipped_in_a_row"):
+        held_at = state.get("withheld_since")      # written before held_at was
+    return bool(held_at) and now - held_at > 1.5 * INTERVAL_MIN * 60
+
+
 def should_open_window(account, accounts, states, now):
     """
     Whether this tick's ping should go ahead: (go, until, why).
@@ -1593,6 +1708,11 @@ def should_open_window(account, accounts, states, now):
     """
     state = states[account.name]
     if len(accounts) < 2 or window_running(state, now):
+        return True, None, None
+    # An account that cannot be served yet is pinged as ever: the ping is
+    # refused and opens nothing, and it is the only thing that notices the
+    # account coming back. Its place in the plan is the slot it returns in.
+    if account_availability(account, state, now).tier != USABLE:
         return True, None, None
     delays, phases, participants = spacing_plan(accounts, states, now)
     if len(participants) < 2 or not delays.get(account.name):
@@ -1631,19 +1751,24 @@ def spacing_lines(accounts, states, now):
             "No account is holding a window" if not participants
             else "Only one account is holding a window"))
         for account in accounts:
-            holding, why = participation(account, states[account.name], now)
-            if not holding:
-                lines.append("  account {:<{}} is not: {}".format(
-                    account.display, width, why))
+            if account.name in delays:
+                continue
+            why = participation(account, states[account.name], now)[1] or \
+                account_availability(account, states[account.name], now).note
+            lines.append("  account {:<{}} is not: {}".format(
+                account.display, width, why))
+        return lines
+    if len(participants) > WINDOW_SLOTS:
+        lines.append("{} accounts are holding a window: more than the {} "
+                     "slots a window can start in, so they are not spaced."
+                     .format(len(participants), WINDOW_SLOTS))
         return lines
 
     # Said as the gaps the grid allows, because "5/N" is not what three or four
     # accounts can actually get, and a report that promised it would look
     # broken to anyone counting.
-    target = optimal_targets(len(participants))[0]
-    ordered = sorted(target)
-    gaps = sorted(((ordered[(i + 1) % len(ordered)] - ordered[i]) % WINDOW_SLOTS)
-                  * GRID_SEC for i in range(len(ordered)))
+    gaps = [g * GRID_SEC for g in
+            cyclic_gaps(optimal_targets(len(participants))[0])]
     shape = (fmt_delta(gaps[0]) + " apart" if len(set(gaps)) == 1 else
              "{} apart — as even as the 30-minute grid allows".format(
                  ", ".join(fmt_delta(g) for g in gaps)))
@@ -1657,9 +1782,10 @@ def spacing_lines(accounts, states, now):
     for account in accounts:
         state = states[account.name]
         if account.name not in delays:
+            why = participation(account, state, now)[1] or \
+                account_availability(account, state, now).note
             lines.append("  account {:<{}} not holding a window right now — "
-                         "{}".format(account.display, width,
-                                     participation(account, state, now)[1]))
+                         "{}".format(account.display, width, why))
             continue
         until = held_until(state, now)
         if until:
@@ -2327,15 +2453,18 @@ def stale_timer_findings():
             body = f.read()
     except (IOError, OSError):
         return []                       # not installed here; not this check
-    if "OnCalendar=" in body:
+    if calendar_on_grid(body):
         return []
     return [Finding(
         "warning",
-        "The installed ping timer is the older monotonic one",
-        "It drifts off the {}-minute grid Claude resets on, so a ping that "
-        "opens a window can date it from up to that much earlier and lose the "
-        "difference. Re-run ./install.sh to rewrite the units.".format(
-            GRID_SEC // 60))]
+        "The installed ping timer is an older one ({})".format(
+            "local time" if "OnCalendar=" in body else "monotonic"),
+        "It does not fire on the {}-minute grid Claude resets on, which is "
+        "in UTC: a monotonic timer drifts off it, and a local-time one misses "
+        "it on the night the clocks go back (and everywhere, where the offset "
+        "ends in :45). A ping that opens a window off the grid dates it from "
+        "the start of the cell and loses the difference. Re-run ./install.sh "
+        "to rewrite the units.".format(GRID_SEC // 60))]
 
 
 def reset_grid_findings(accounts):
@@ -3188,7 +3317,7 @@ def maybe_schedule_anchor(account, boundary, horizon, label, state, was_limited)
     # Off-grid boundaries still get one, which is the point: the anchor stops
     # being the mechanism that makes the schedule work and becomes the safety
     # net for the assumption that the grid exists (GRID_SEC).
-    if not int(boundary) % GRID_SEC:
+    if not int(boundary) % GRID_SEC and timer_ticks_on_grid(account):
         log(account,
             "Next window can start at {} (in {}, set by the {}) — on the "
             "{}-minute grid, so the ordinary ping lands on it. No anchor "
@@ -3460,6 +3589,11 @@ def classify_turn(record):
                          "needs_you": bool(needs_you)}
 
 
+def failure_record(error, started, ended):
+    """What a failed ping keeps of its error: the error, and when it ran."""
+    return dict(error, started=started, at=ended)
+
+
 def ping_error_superseded(account, state):
     """
     When the account's login was written after its last failed ping started,
@@ -3468,20 +3602,39 @@ def ping_error_superseded(account, state):
     The ordinary sequence after fixing a login: the ping that failed is the
     newest evidence there is until the next one, half an hour away, and every
     command goes on quoting it -- to somebody who has just done exactly what it
-    told them. A login written since the failing ping began is the one thing
-    that can have changed the answer, so it is said instead of the failure.
-    Measured from when the ping *started*: a sign-in finished while a ping was
-    already running is invisible to that ping.
+    told them. A login written since the failing ping is the one thing that can
+    have changed the answer, so it is said instead of the failure.
+
+    Measured from when the failing ping *ended*, not when it started. Claude
+    Code refreshes an expired token at the start of a request, and does so for
+    an account it is about to refuse: seen on a lapsed account, whose token was
+    rewritten one second into a ping that then failed. Measured from the start,
+    that refresh read as a fresh sign-in, and every eight hours a lapsed account
+    stopped being reported as one for half an hour. The cost of measuring from
+    the end is a sign-in completed *during* a ping, which waits for the next
+    one to be believed -- rare, and at most half an hour.
     """
     error = state.get("last_error") or {}
-    started = error.get("started") or error.get("at")
-    if not started:
+    ended = error.get("at")
+    if not ended:
         return None
     try:
         written = os.path.getmtime(credentials_path(account))
     except (OSError, TypeError):
         return None
-    return written if written > started else None
+    return written if written > ended else None
+
+
+def turn_outcome(entries, baseline):
+    """
+    What one run achieved, from the assistant turns in its session file:
+    {completed, limited, text, error}. `baseline` is how many there were before
+    the run. What run_interactive returns, and what the tests feed _ping.
+    """
+    if len(entries) <= baseline:
+        return {"completed": False, "limited": False, "text": "", "error": None}
+    text, limited, error = classify_turn(entries[-1])
+    return {"completed": True, "limited": limited, "text": text, "error": error}
 
 
 def describe_ping_error(error):
@@ -3660,12 +3813,11 @@ def run_interactive(account, extra_args, prompt_text, session_id,
     # Now that the process has exited, the session file is flushed: verify a new
     # assistant turn was recorded and log its token usage (cache read vs write).
     entries = _assistant_entries(account, session_id)
-    completed = len(entries) > baseline
-    text, limited, error = "", False, None
+    outcome = turn_outcome(entries, baseline)
+    completed, limited = outcome["completed"], outcome["limited"]
+    text, error = outcome["text"], outcome["error"]
     if completed:
-        record = entries[-1]
-        usage = record.get("message", {}).get("usage", {})
-        text, limited, error = classify_turn(record)
+        usage = entries[-1].get("message", {}).get("usage", {})
         if error:
             # Not "Turn confirmed": the turn exists, but Claude Code wrote it
             # itself, and nothing reached the account.
@@ -3690,8 +3842,7 @@ def run_interactive(account, extra_args, prompt_text, session_id,
         log(account, usage)
 
     log(account, f"Exited with code: {proc.returncode}")
-    return {"completed": completed, "limited": limited, "text": text,
-            "error": error}
+    return outcome
 
 
 # ---------------------------------------------------------------------------
@@ -3839,6 +3990,148 @@ def ping(account, accounts=None, force=False):
         os.close(lock)          # releases the flock with it
 
 
+def record_ping(account, state, result, limits, started, at=None):
+    """
+    Everything one ping run tells this tool, written into `state`: when it
+    ran, the figures the status line gave it, the boundary they imply, and
+    whether the account answered. Returns (boundary, horizon, label), which is
+    what the boundary anchor is decided from.
+
+    `result` is what run_interactive returned (see turn_outcome); `limits`
+    what the status line reported during the run; `started` and `at` when the
+    run began and ended. Split out of _ping so that the tests drive the
+    recording the real ping does, rather than a copy of it that would drift.
+    """
+    at = time.time() if at is None else at
+    state["last_run"] = at
+
+    # Work out the earliest moment the next ping could start a window — which
+    # depends on both the 5-hour and the weekly limit — then decide whether that
+    # moment needs a one-shot anchor. A successful ping reports both limits
+    # exactly via the statusLine; a refused one says so in the refusal text.
+    # A turn Claude Code made up itself never reached Claude, so nothing the
+    # status line says about limits during it was reported by Claude either:
+    # at best stale, and the stand-in CLI emits placeholders there. Believed,
+    # a placeholder would record a window that does not exist -- an off-grid
+    # one at that, which `doctor` would then blame on Anthropic's grid.
+    if result.get("error"):
+        limits = {}
+    if limits:
+        names = dict(_LIMIT_NAMES)
+        problems = implausible_limits(limits, state.get("rate_limits"), at)
+        for key in sorted(problems):
+            log(account, "Ignoring this run's {} figure: {}. Keeping the "
+                         "previous one.".format(names[key], problems[key]))
+        believed = dict((k, v) for k, v in limits.items() if k not in problems)
+        for key, name in _LIMIT_NAMES:
+            was = ((state.get("rate_limits") or {}).get(key) or {}).get("resets_at")
+            says = (believed.get(key) or {}).get("resets_at")
+            if was and says and says > was and was > at + ROLLOVER_SLACK_SEC:
+                log(account, "The {} {} ended early: it was due to reset "
+                             "at {}, and now resets at {}. A quota reset, a "
+                             "plan change, or the account used elsewhere — the "
+                             "spacing plans from the new time.".format(
+                                 names[key], "window" if key == "five_hour"
+                                 else "limit", fmt_time(was), fmt_time(says)))
+        if believed:
+            merged = dict(state.get("rate_limits") or {})
+            merged.update(believed)
+            state["rate_limits"] = merged
+            state["limits_source"] = "statusline"
+            # When, as well as where from. Without this a live reading taken
+            # earlier leaves its own timestamp behind, and every later command
+            # reports figures this ping had just refreshed as half an hour old.
+            state["limits_read_at"] = at
+        limits = state.get("rate_limits") or {}
+
+    # Check the 30-minute grid rather than assume it. Every spacing decision
+    # this tool makes is built on it, and it is someone else's implementation
+    # detail — so each distinct reset is compared against it and counted.
+    note_reset_grid(account, state,
+                    ((state.get("rate_limits") or {}).get("five_hour")
+                     or {}).get("resets_at"))
+
+    boundary, horizon, label = next_window_start(
+        limits, result["text"], result["limited"])
+    if boundary:
+        state["boundary"] = boundary
+        state["boundary_label"] = label
+        if not limits:
+            state["limits_source"] = "refusal-text"
+    else:
+        log(account, "No reset time reported this run — leaving the schedule "
+                     "as it is.")
+
+    # Availability is an observation, never a stored belief. A ping that got
+    # through proves the account is usable right now; a refusal reports when it
+    # will be. Nothing here asks *which* limit refused: a weekly limit spent, a
+    # lapsed subscription and a revoked login are the same state, and all three
+    # recover the same way — by an ordinary ping succeeding again.
+    error = result.get("error")
+    if result["completed"] and not result["limited"] and not error:
+        state["available_at"] = at                   # proven by demonstration
+        state["consecutive_failures"] = 0
+        state.pop("last_error", None)
+        state["anchor_streak"] = 0    # back to normal; forget past corrections
+        # A live reading that failed is recorded so `doctor` keeps saying it
+        # after the moment has scrolled by -- but only a live reading cleared
+        # it, so one bad minute of network left a warning standing for as long
+        # as nobody happened to run `which`. A ping getting through is the
+        # stronger proof of the two. If the probe itself is what is broken,
+        # the next reading records it again immediately.
+        state.pop("live_problem", None)
+        state.pop("live_problem_at", None)
+    elif result["limited"]:
+        state.pop("last_error", None)                # it answered
+        if boundary:
+            state["available_at"] = boundary
+        else:
+            # Refused, and nothing in the reply says when it comes back: no
+            # statusLine figures, and no reset in the text that its own limit
+            # could plausibly reach. The refusal is still an answer, and
+            # recorded the way a refused live reading is -- a limit spent with
+            # no reset time, which reads as "back no later than" its own length
+            # rather than as an account worth recommending.
+            spent = dict(state.get("rate_limits") or {})
+            five = dict(spent.get("five_hour") or {})
+            five["used_percentage"] = LIMIT_SPENT_PCT
+            # A reset already in the past would be read as a window that has
+            # since rolled over, and the refusal forgotten. Rolled forward on
+            # the phase this account is already believed to be on, which keeps
+            # both facts: spent now, and back at the boundary it was going to
+            # reach anyway. Only where nothing is known at all does it fall
+            # back to the limit's own length.
+            rolled = next_expiry(state, at)
+            if rolled == float("inf"):
+                five.pop("resets_at", None)
+            else:
+                five["resets_at"] = rolled
+                # A refusal is Claude answering, which is proof this account is
+                # reachable and that the phase it is on is still real. Without
+                # recording that, the only account whose news is refusals reads
+                # as one nothing has been heard from, and drops out of the
+                # spacing it is still entitled to a place in.
+                state["available_at"] = rolled
+            spent["five_hour"] = five
+            state["rate_limits"] = spent
+            log(account, "Refused with no usable reset time — recording the "
+                         "5-hour limit as spent until something says "
+                         "otherwise.")
+        state["consecutive_failures"] = 0            # it answered; it just said no
+    else:
+        # No answer at all says nothing about the account — that is a local
+        # problem until it keeps happening. An answer Claude Code made up
+        # itself is the same: nothing reached the account, so nothing here is
+        # proof of life, and `available_at` is left exactly where the last real
+        # answer put it. What the error *said* is kept, because "the last three
+        # pings failed" is only half a diagnosis.
+        state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+        if error:
+            state["last_error"] = failure_record(error, started, at)
+
+    return boundary, horizon, label
+
+
 def _ping(account, accounts=None, force=False):
     rotate_log(account)
     accounts = accounts or [account]
@@ -3852,26 +4145,18 @@ def _ping(account, accounts=None, force=False):
     # regardless: they cost nothing and they are the only way to notice it
     # coming back. `force` is a person asking for this account now -- `switch`
     # -- which no plan overrides.
-    if not force:
-        go, until, why = should_open_window(account, accounts, states, now)
-        if not go:
-            state["skipped_in_a_row"] = state.get("skipped_in_a_row", 0) + 1
-            state["withheld_since"] = state.get("withheld_since") or now
-            state["held_until"] = until
-            log(account, "Not pinging account {}: its window has ended, and "
-                         "opening the next one now would put it in the wrong "
-                         "slot. It opens at {} (in {}) to space the windows — "
-                         "using the account before then simply opens it "
-                         "early.".format(account.display, fmt_time(until),
-                                         fmt_delta(until - now)))
-            write_state(account, state)
-            return True       # deliberately not pinging is not a failure
-        if why:
-            log(account, why[1])
-            if why[0] == "valve":
-                state["valve_at"] = now
-    for key in ("skipped_in_a_row", "withheld_since", "held_until"):
-        state.pop(key, None)
+    go, until, why = decide_tick(account, accounts, states, now, force)
+    if not go:
+        log(account, "Not pinging account {}: its window has ended, and "
+                     "opening the next one now would put it in the wrong "
+                     "slot. It opens at {} (in {}) to space the windows — "
+                     "using the account before then simply opens it "
+                     "early.".format(account.display, fmt_time(until),
+                                     fmt_delta(until - now)))
+        write_state(account, state)
+        return True       # deliberately not pinging is not a failure
+    if why:
+        log(account, why[1])
 
     log(account, "Starting ping run for account {}...".format(
         account.display))
@@ -3904,126 +4189,8 @@ def _ping(account, accounts=None, force=False):
     if not result["completed"]:
         log(account, "WARNING: ping run did not confirm a completed turn.")
 
-    state["last_run"] = time.time()
-
-    # Work out the earliest moment the next ping could start a window — which
-    # depends on both the 5-hour and the weekly limit — then decide whether that
-    # moment needs a one-shot anchor. A successful ping reports both limits
-    # exactly via the statusLine; a refused one says so in the refusal text.
-    limits = read_statusline_limits(account)
-    if limits:
-        names = dict(_LIMIT_NAMES)
-        problems = implausible_limits(limits, state.get("rate_limits"),
-                                      time.time())
-        for key in sorted(problems):
-            log(account, "Ignoring this run's {} figure: {}. Keeping the "
-                         "previous one.".format(names[key], problems[key]))
-        believed = dict((k, v) for k, v in limits.items() if k not in problems)
-        for key, name in _LIMIT_NAMES:
-            was = ((state.get("rate_limits") or {}).get(key) or {}).get("resets_at")
-            says = (believed.get(key) or {}).get("resets_at")
-            if was and says and says > was and was > time.time() + ROLLOVER_SLACK_SEC:
-                log(account, "The {} {} ended early: it was due to reset "
-                             "at {}, and now resets at {}. A quota reset, a "
-                             "plan change, or the account used elsewhere — the "
-                             "spacing plans from the new time.".format(
-                                 names[key], "window" if key == "five_hour"
-                                 else "limit", fmt_time(was), fmt_time(says)))
-        if believed:
-            merged = dict(state.get("rate_limits") or {})
-            merged.update(believed)
-            state["rate_limits"] = merged
-            state["limits_source"] = "statusline"
-            # When, as well as where from. Without this a live reading taken
-            # earlier leaves its own timestamp behind, and every later command
-            # reports figures this ping had just refreshed as half an hour old.
-            state["limits_read_at"] = time.time()
-        limits = state.get("rate_limits") or {}
-
-    # Check the 30-minute grid rather than assume it. Every spacing decision
-    # this tool makes is built on it, and it is someone else's implementation
-    # detail — so each distinct reset is compared against it and counted.
-    note_reset_grid(account, state,
-                    ((state.get("rate_limits") or {}).get("five_hour")
-                     or {}).get("resets_at"))
-
-    boundary, horizon, label = next_window_start(
-        limits, result["text"], result["limited"])
-    if boundary:
-        state["boundary"] = boundary
-        state["boundary_label"] = label
-        if not limits:
-            state["limits_source"] = "refusal-text"
-    else:
-        log(account, "No reset time reported this run — leaving the schedule "
-                     "as it is.")
-
-    # Availability is an observation, never a stored belief. A ping that got
-    # through proves the account is usable right now; a refusal reports when it
-    # will be. Nothing here asks *which* limit refused: a weekly limit spent, a
-    # lapsed subscription and a revoked login are the same state, and all three
-    # recover the same way — by an ordinary ping succeeding again.
-    error = result.get("error")
-    if result["completed"] and not result["limited"] and not error:
-        state["available_at"] = time.time()          # proven by demonstration
-        state["consecutive_failures"] = 0
-        state.pop("last_error", None)
-        state["anchor_streak"] = 0    # back to normal; forget past corrections
-        # A live reading that failed is recorded so `doctor` keeps saying it
-        # after the moment has scrolled by -- but only a live reading cleared
-        # it, so one bad minute of network left a warning standing for as long
-        # as nobody happened to run `which`. A ping getting through is the
-        # stronger proof of the two. If the probe itself is what is broken,
-        # the next reading records it again immediately.
-        state.pop("live_problem", None)
-        state.pop("live_problem_at", None)
-    elif result["limited"]:
-        state.pop("last_error", None)                # it answered
-        if boundary:
-            state["available_at"] = boundary
-        else:
-            # Refused, and nothing in the reply says when it comes back: no
-            # statusLine figures, and no reset in the text that its own limit
-            # could plausibly reach. The refusal is still an answer, and
-            # recorded the way a refused live reading is -- a limit spent with
-            # no reset time, which reads as "back no later than" its own length
-            # rather than as an account worth recommending.
-            spent = dict(state.get("rate_limits") or {})
-            five = dict(spent.get("five_hour") or {})
-            five["used_percentage"] = LIMIT_SPENT_PCT
-            # A reset already in the past would be read as a window that has
-            # since rolled over, and the refusal forgotten. Rolled forward on
-            # the phase this account is already believed to be on, which keeps
-            # both facts: spent now, and back at the boundary it was going to
-            # reach anyway. Only where nothing is known at all does it fall
-            # back to the limit's own length.
-            rolled = next_expiry(state, time.time())
-            if rolled == float("inf"):
-                five.pop("resets_at", None)
-            else:
-                five["resets_at"] = rolled
-                # A refusal is Claude answering, which is proof this account is
-                # reachable and that the phase it is on is still real. Without
-                # recording that, the only account whose news is refusals reads
-                # as one nothing has been heard from, and drops out of the
-                # spacing it is still entitled to a place in.
-                state["available_at"] = rolled
-            spent["five_hour"] = five
-            state["rate_limits"] = spent
-            log(account, "Refused with no usable reset time — recording the "
-                         "5-hour limit as spent until something says "
-                         "otherwise.")
-        state["consecutive_failures"] = 0            # it answered; it just said no
-    else:
-        # No answer at all says nothing about the account — that is a local
-        # problem until it keeps happening. An answer Claude Code made up
-        # itself is the same: nothing reached the account, so nothing here is
-        # proof of life, and `available_at` is left exactly where the last real
-        # answer put it. What the error *said* is kept, because "the last three
-        # pings failed" is only half a diagnosis.
-        state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
-        if error:
-            state["last_error"] = dict(error, at=time.time(), started=now)
+    boundary, horizon, label = record_ping(
+        account, state, result, read_statusline_limits(account), now)
 
     maybe_schedule_anchor(account, boundary, horizon, label, state,
                           result["limited"])
@@ -4034,7 +4201,8 @@ def _ping(account, accounts=None, force=False):
     # that fails exits non-zero, so systemd marks the unit failed and it shows
     # in `systemctl --user --failed` and to any OnFailure= notifier. A refusal
     # is not a failure -- the account answered.
-    return bool(result["limited"] or (result["completed"] and not error))
+    return bool(result["limited"]
+                or (result["completed"] and not result.get("error")))
 
 
 # ---------------------------------------------------------------------------
@@ -4427,8 +4595,11 @@ def doctor(accounts):
         # A hold is the tool deliberately not pinging, for up to four and a
         # half hours while it spaces the windows. Counting those skipped pings
         # as silence turns the one command that says what is wrong into one
-        # that complains about what it chose to do.
-        hold = state.get("skipped_in_a_row")
+        # that complains about what it chose to do. Only a hold whose ticks
+        # are still coming, though: one whose timer stopped mid-hold leaves
+        # its marker behind for ever, and would otherwise silence this check
+        # in exactly the case it exists for.
+        hold = state.get("skipped_in_a_row") and not hold_went_stale(state, now)
         last_run = state.get("last_run")
         # A run that started counts as a run, so `last_run` is fresh even when
         # every one of them failed -- which made the staleness check below
@@ -7558,7 +7729,11 @@ Description=Claude Code Window Timing — ping account %i every {interval} minut
 #     there until a one-shot anchor drags it back.
 #   * no window opened part-way through a grid cell. A ping at :17 opens a
 #     window dated from :00 and throws away seventeen minutes of it.
-OnCalendar=*-*-* *:{minutes}:{second:02d}
+OnCalendar=*-*-* *:{minutes}:{second:02d} UTC
+# In UTC, because the grid is: every reset is a whole number of half hours
+# since the epoch. A local-time tick lands 15 minutes into every cell wherever
+# the offset ends in :45 (Nepal, Chatham, Eucla), and on the night clocks go
+# back it skips the repeated hour -- two ticks, and any boundary in them.
 # systemd's default accuracy is 1 minute, which would let a ping land in the
 # *next* grid cell and lose half an hour of window. Tighten it.
 AccuracySec=1s
@@ -7595,8 +7770,42 @@ def calendar_minutes(interval=None):
 
 
 def timer_calendar(account):
-    """This account's wall-clock tick: on the grid, at its own second."""
-    return "*-*-* *:{}:{:02d}".format(calendar_minutes(), account.guard_sec)
+    """This account's wall-clock tick: on the grid, at its own second, in UTC."""
+    return "*-*-* *:{}:{:02d} UTC".format(calendar_minutes(), account.guard_sec)
+
+
+def calendar_on_grid(unit_text):
+    """
+    Whether a timer unit's own tick is the grid-aligned one this version
+    writes: a wall-clock calendar in UTC. Anything else -- the monotonic timer
+    of an install never re-run since, or a local-time calendar from the first
+    version of this one -- fires somewhere else, and the boundary anchor is
+    still needed to land a ping on each window.
+    """
+    lines = [line.strip() for line in (unit_text or "").splitlines()]
+    calendars = [line for line in lines
+                 if line.startswith("OnCalendar=") and line != "OnCalendar="]
+    return bool(calendars) and all(line.endswith(" UTC") for line in calendars)
+
+
+def timer_ticks_on_grid(account=None):
+    """
+    Whether the installed ping timer fires on the grid -- the template, and the
+    account's own drop-in if it has one. Unreadable counts as no: an anchor
+    booked when it was not needed costs one skipped duplicate ping, and one
+    skipped when it was needed costs a window opened late.
+    """
+    texts = []
+    for path in [os.path.join(UNIT_DIR, "claude-window-timing@.timer")] + (
+            [os.path.join(UNIT_DIR, account.timer_unit + ".d", "stagger.conf")]
+            if account is not None else []):
+        try:
+            with open(path) as f:
+                texts.append(f.read())
+        except (IOError, OSError):
+            if path.endswith("@.timer"):
+                return False
+    return all(calendar_on_grid(t) for t in texts)
 
 
 def unit_path():

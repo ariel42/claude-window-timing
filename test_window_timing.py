@@ -496,6 +496,24 @@ def _log_of(account, fn):
 # Scheduling, replacing and cancelling the anchor
 # ---------------------------------------------------------------------------
 
+def _calendar_parses_as_utc(expression):
+    """
+    systemd's own verdict on a calendar expression: that it parses, and that
+    its next elapses fall on the 30-minute grid in UTC. True where systemd is
+    not there to ask, since nothing then reads the expression anyway.
+    """
+    try:
+        out = subprocess.run(["systemd-analyze", "calendar", "--iterations=3",
+                              expression], capture_output=True, text=True,
+                             timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if out.returncode != 0:
+        return False
+    utc = re.findall(r"\(in UTC\): \w+ \S+ (\d\d):(\d\d):(\d\d) UTC", out.stdout)
+    return bool(utc) and all(m in ("00", "30") for _, m, _ in utc)
+
+
 def _off_grid(moment):
     """
     Nudge a moment off the 30-minute reset grid.
@@ -537,12 +555,22 @@ def test_anchor_scheduling():
                abs(state["anchor_target"] - (boundary + account.guard_sec)) < 2)
 
     # The regular tick fires at exactly boundary + guard_sec when the boundary
-    # is on the grid, so an anchor there would run the same ping twice in one
-    # second and one of them would lose the lock for nothing.
-    on_grid = (int(now) // ew.GRID_SEC + 1) * ew.GRID_SEC
+    # is on the grid -- provided the installed timer is the UTC calendar one.
+    # Then an anchor there would run the same ping twice in one second and one
+    # of them would lose the lock for nothing.
+    on_grid = ew.slot_start(now) + ew.GRID_SEC
+    saved_units = ew.UNIT_DIR
+    ew.UNIT_DIR = tempfile.mkdtemp()
+    with open(os.path.join(ew.UNIT_DIR, "claude-window-timing@.timer"), "w") as f:
+        f.write(ew._TIMER_UNIT.format(interval=ew.INTERVAL_MIN,
+                                      minutes=ew.calendar_minutes(),
+                                      second=ew.RESET_GUARD_SEC))
     booked = {}
-    ew.maybe_schedule_anchor(account, on_grid, ew.FIVE_HOUR_HORIZON,
-                             "5-hour window", booked, False)
+    try:
+        ew.maybe_schedule_anchor(account, on_grid, ew.FIVE_HOUR_HORIZON,
+                                 "5-hour window", booked, False)
+    finally:
+        ew.UNIT_DIR = saved_units
     check("a boundary on the grid books no anchor at all", booked, {})
     check_true("and the earlier one is left alone", bool(ew.anchor_pending(account)))
     if on_grid + account.guard_sec - time.time() <= ew.INTERVAL_MIN * 60:
@@ -552,6 +580,22 @@ def test_anchor_scheduling():
                 if os.path.exists(account.log_file) else "")
         check_true("and says the ordinary ping already lands on it",
                    "No anchor" in tail)
+
+        # An install still running the monotonic timer -- an upgrade never
+        # followed by setup -- has no tick on the grid, so the anchor stays
+        # the thing that lands a ping on the boundary.
+        ew.UNIT_DIR = tempfile.mkdtemp()
+        with open(os.path.join(ew.UNIT_DIR, "claude-window-timing@.timer"),
+                  "w") as f:
+            f.write("[Timer]\nOnActiveSec=1min\nOnUnitActiveSec=30min\n")
+        old_timer = {}
+        try:
+            ew.maybe_schedule_anchor(account, on_grid, ew.FIVE_HOUR_HORIZON,
+                                     "5-hour window", old_timer, False)
+        finally:
+            ew.UNIT_DIR = saved_units
+        check_true("with the old timer still installed, it gets its anchor",
+                   "anchor_target" in old_timer)
 
     ew.maybe_schedule_anchor(account, _off_grid(now + 1200), ew.FIVE_HOUR_HORIZON,
                              "5-hour window", {}, False)
@@ -1891,7 +1935,7 @@ def test_an_impossible_usage_report_is_ignored():
     # Deliberately off the 30-minute grid, as every ping is: a reading of
     # "now plus a round duration" then lands off it too, which is what tells
     # a placeholder from a genuine early reset.
-    now = (time.time() // ew.GRID_SEC) * ew.GRID_SEC + 641.5
+    now = ew.slot_start(time.time()) + 641.5
 
     # The real case: a run reported a fresh window resetting in exactly four
     # hours while the reset it already knew about was still an hour away.
@@ -1943,7 +1987,7 @@ def test_an_impossible_usage_report_is_ignored():
     # above. Every real reset lands on the 30-minute grid; the placeholder
     # never did. Discarding a real one kept a reset account's spent quota on
     # screen for hours and the spacing planning around a window that had gone.
-    slot = (now // ew.GRID_SEC) * ew.GRID_SEC
+    slot = ew.slot_start(now)
     known = {"five_hour": {"resets_at": slot + 4 * ew.GRID_SEC,
                            "used_percentage": 99},
              "seven_day": {"resets_at": slot + 100 * ew.GRID_SEC,
@@ -3281,10 +3325,7 @@ def test_a_ping_that_did_not_get_through_records_why():
         limits = {"five_hour": {"resets_at": now + 600, "used_percentage": 7}}
 
         def ping_with(record):
-            text, limited, error = ew.classify_turn(record)
-            ew.run_interactive = lambda *a, **k: {
-                "completed": True, "limited": limited, "text": text,
-                "error": error}
+            ew.run_interactive = lambda *a, **k: ew.turn_outcome([record], 0)
             ew.read_statusline_limits = lambda a, records=None: limits
             return ew.ping(account), ew.read_state(account)
 
@@ -3333,6 +3374,18 @@ def test_a_ping_that_did_not_get_through_records_why():
         check("one ping getting through clears it", ok, True)
         check("the counter", state["consecutive_failures"], 0)
         check("and the error", state.get("last_error"), None)
+
+        # A turn that never reached Claude cannot have brought figures from
+        # Claude. The stand-in CLI emits placeholders on its status line then;
+        # believed, they record a window that does not exist.
+        before = ew.read_state(account).get("rate_limits")
+        limits["five_hour"] = {"resets_at": time.time() + 4 * 3600 + 17,
+                               "used_percentage": 3}
+        ok, state = ping_with(overloaded)
+        check("figures that came with a turn Claude never saw are ignored",
+              state.get("rate_limits"), before)
+        limits["five_hour"] = {"resets_at": now + 600, "used_percentage": 7}
+        ok, state = ping_with(_served())
 
         refusal = _synthetic("You've hit your session limit · resets 9:30pm",
                              "rate_limit", 429)
@@ -3414,9 +3467,10 @@ def test_doctor_says_what_a_failing_ping_was_told():
     ew.account_auth_ok = lambda a: login["ok"]
     try:
         now = time.time()
-        org_off = {"error": "oauth_org_not_allowed", "status": 403,
-                   "text": "Your organization has disabled Claude subscription "
-                           "access for Claude Code", "needs_you": True, "at": now}
+        # What a ping records for these turns, made by the code that records it.
+        org_off = ew.failure_record(ew.classify_turn(_synthetic(
+            "Your organization has disabled Claude subscription access for "
+            "Claude Code", "oauth_org_not_allowed", 403))[2], now - 20, now)
         ew.write_state(account, {"last_run": now, "available_at": now - 60,
                                  "consecutive_failures": 1,
                                  "last_error": org_off})
@@ -3444,7 +3498,6 @@ def test_doctor_says_what_a_failing_ping_was_told():
             json.dump({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r",
                                          "subscriptionType": "pro"}}, f)
         os.utime(creds, (now + 5, now + 5))
-        org_off["started"] = now - 20
         ew.write_state(account, {"last_run": now, "available_at": now - 60,
                                  "consecutive_failures": 1,
                                  "last_error": org_off})
@@ -3457,6 +3510,17 @@ def test_doctor_says_what_a_failing_ping_was_told():
         check("nor does `which` call the account unusable on that evidence",
               ew.account_availability(account, state, now + 10).tier
               == ew.NEEDS_ACTION, False)
+        # Written *during* the failing ping: what Claude Code itself does when
+        # it refreshes an expired token at the start of a request -- seen on a
+        # lapsed account, one second into a ping that was then refused. That
+        # is not somebody fixing anything, and every eight hours it used to
+        # take a lapsed account off the list of ones needing you.
+        os.utime(creds, (now - 10, now - 10))
+        check_true("a token refreshed during the refused ping does not hide it",
+                   "Claude refuses its pings" in doctor_says())
+        check("nor does it make the account look usable",
+              ew.account_availability(account, ew.read_state(account),
+                                      now + 10).tier, ew.NEEDS_ACTION)
         # Signed in *before* the ping started: the ping saw that login, and
         # it was refused. That is still the account's problem.
         os.utime(creds, (now - 60, now - 60))
@@ -3467,9 +3531,8 @@ def test_doctor_says_what_a_failing_ping_was_told():
                                       now + 10).tier, ew.NEEDS_ACTION)
         os.remove(creds)
 
-        overloaded = {"error": "server_error", "status": 529,
-                      "text": "API Error: 529 Overloaded.", "needs_you": False,
-                      "at": now}
+        overloaded = ew.failure_record(ew.classify_turn(_synthetic(
+            "API Error: 529 Overloaded.", "server_error", 529))[2], now - 20, now)
         ew.write_state(account, {"last_run": now, "available_at": now - 60,
                                  "consecutive_failures": 1,
                                  "last_error": overloaded})
@@ -3507,15 +3570,10 @@ def test_doctor_says_what_a_failing_ping_was_told():
 SLOT = 1800
 
 
-def _gaps(slots):
-    ordered = sorted(slots)
-    return sorted((ordered[(i + 1) % len(ordered)] - ordered[i]) % ew.WINDOW_SLOTS
-                  for i in range(len(ordered)))
-
-
 def _spacing_accounts(count):
     """Accounts whose files do not exist, which the planner reads as healthy."""
     root = tempfile.mkdtemp()
+    ew.STATE_ROOT = os.path.join(root, "state")
     return [ew.Account(str(i + 1), os.path.join(root, "nope%d" % i), i)
             for i in range(count)]
 
@@ -3529,63 +3587,97 @@ def _alive(now, resets, **extra):
     return state
 
 
-def _tick(accounts, states, now, use=None):
+class _World(object):
     """
-    One timer tick for every account, in the order their timers fire, with the
-    conversation replaced by its effect: a ping that goes ahead opens a window
-    in this slot if none is running. `use` names an account a person starts
-    using this tick, which opens its window whatever the plan says.
+    Claude's side of things, kept apart from what the tool has seen of it.
+
+    Only Claude's behaviour is modelled here: a window opens when a request
+    reaches an account with none running, dated from the grid slot it fell in;
+    an account whose weekly limit is spent refuses, and says when it is back;
+    and every answer reports both limits, as the status line does. Setting
+    `out` spends an account's weekly limit until the time given; clearing it
+    before then is a limit lifted early, which keeps its reset time, as the
+    quota-reset benefit did.
+    A person using an account opens its window the same way -- and the tool
+    learns of that only through a ping of its own, exactly as in life, since a
+    held account is neither pinged nor read.
+
+    Everything on the tool's side is the real code: decide_tick for the
+    decision and its bookkeeping, turn_outcome for what the run produced,
+    record_ping for what the ping writes down. Nothing here re-implements
+    any of it, so a change to them is a change to what these tests check.
     """
-    held = []
-    for account in accounts:
-        state = states[account.name]
-        moment = now + account.guard_sec
-        if use == account.name and not ew.window_running(state, moment):
-            state["rate_limits"]["five_hour"]["resets_at"] = \
-                ew.slot_start(moment) + ew.WINDOW_HOURS * 3600
-            state["available_at"] = moment
-            for key in ("skipped_in_a_row", "withheld_since", "held_until"):
-                state.pop(key, None)
-            continue
-        go, until, why = ew.should_open_window(account, accounts, states, moment)
-        if not go:
-            state["skipped_in_a_row"] = state.get("skipped_in_a_row", 0) + 1
-            state["withheld_since"] = state.get("withheld_since") or moment
-            state["held_until"] = until
-            held.append((account.name, why))
-            continue
-        assert why is None or why[0] != "valve", why
-        if not ew.window_running(state, moment):
-            state["rate_limits"]["five_hour"]["resets_at"] = \
-                ew.slot_start(moment) + ew.WINDOW_HOURS * 3600
-        state["available_at"] = moment
-        for key in ("skipped_in_a_row", "withheld_since", "held_until"):
-            state.pop(key, None)
-    return held
 
+    def __init__(self, accounts, states):
+        self.accounts, self.states = accounts, states
+        self.ends = dict((a.name, ew.raw_reset(states[a.name]))
+                         for a in accounts)
+        self.out = {}            # account -> when its spent weekly limit resets
+        self.weekly = {}         # account -> its weekly reset, once one is known
+        self.valves = []
 
-def _settled(accounts, states, now):
-    """Every window running, on a best arrangement, with nothing to hold."""
-    if not all(ew.window_running(states[a.name], now) for a in accounts):
-        return False
-    slots = [ew.slot_of(ew.raw_reset(states[a.name])) for a in accounts]
-    return _gaps(slots) == _gaps(ew.optimal_targets(len(accounts))[0])
+    def use(self, name, moment):
+        """A person sends a request on this account, outside the tool."""
+        if name not in self.out and self.ends[name] <= moment:
+            self.ends[name] = ew.slot_start(moment) + ew.WINDOW_HOURS * 3600
 
+    def tick(self, now):
+        """Every account's timer fires once; returns the accounts held."""
+        held = []
+        for account in self.accounts:
+            moment = now + account.guard_sec
+            go, until, why = ew.decide_tick(account, self.accounts,
+                                            self.states, moment)
+            if why and why[0] == "valve":
+                self.valves.append((account.name, moment))
+            if go:
+                self._ping(account, moment)
+            else:
+                held.append(account.name)
+        return held
 
-def _run_until_settled(accounts, states, start, limit=40, use=None):
-    """Ticks until settled; returns how many it took, or None."""
-    return _ticks_until_settled(accounts, states, start, limit, use)[0]
+    def _ping(self, account, moment):
+        name = account.name
+        if name in self.out:
+            self.weekly[name] = self.out[name]
+            record = _synthetic("You've hit your weekly limit", "rate_limit", 429)
+            limits = {"five_hour": {"resets_at": self.ends[name],
+                                    "used_percentage": 0},
+                      "seven_day": {"resets_at": self.out[name],
+                                    "used_percentage": 100}}
+        else:
+            if self.ends[name] <= moment:
+                self.ends[name] = ew.slot_start(moment) + ew.WINDOW_HOURS * 3600
+            weekly = self.weekly.get(name)
+            if not weekly or weekly <= moment:
+                weekly = self.weekly[name] = \
+                    ew.slot_start(moment) + 7 * 24 * 3600
+            record = _served()
+            limits = {"five_hour": {"resets_at": self.ends[name],
+                                    "used_percentage": 10},
+                      "seven_day": {"resets_at": weekly,
+                                    "used_percentage": 20}}
+        ew.record_ping(account, self.states[name], ew.turn_outcome([record], 0),
+                       limits, moment, moment + 15)
 
+    def settled(self, moment, accounts=None):
+        """Every window open, on a best arrangement -- judged on Claude's side."""
+        accounts = accounts or self.accounts
+        if not all(self.ends[a.name] > moment for a in accounts):
+            return False
+        return ew.cyclic_gaps([ew.slot_of(self.ends[a.name]) for a in accounts]) \
+            == ew.cyclic_gaps(ew.optimal_targets(len(accounts))[0])
 
-def _ticks_until_settled(accounts, states, start, limit=40, use=None):
-    """Ticks until settled: (ticks taken or None, time of the next tick)."""
-    now = start
-    for tick in range(limit):
-        _tick(accounts, states, now, use=use(tick) if use else None)
-        now += SLOT
-        if _settled(accounts, states, now - SLOT + 60):
-            return tick, now
-    return None, now
+    def run_until_settled(self, now, limit=40, use=None):
+        """Ticks until settled: (ticks taken or None, time of the next tick)."""
+        for tick in range(limit):
+            if use and use(tick):
+                self.use(use(tick), now + 300)
+            self.tick(now)
+            now += SLOT
+            if self.settled(now - SLOT + 60):
+                return tick, now
+        return None, now
 
 
 def test_the_slot_planner_is_optimal():
@@ -3599,12 +3691,12 @@ def test_the_slot_planner_is_optimal():
     import itertools
     import random
 
-    check("two accounts: 2h30m apart", _gaps(ew.optimal_targets(2)[0]), [5, 5])
-    check("three: 1h30m, 1h30m, 2h", _gaps(ew.optimal_targets(3)[0]), [3, 3, 4])
-    check("four: 1h, 1h, 1h30m, 1h30m", _gaps(ew.optimal_targets(4)[0]),
+    check("two accounts: 2h30m apart", ew.cyclic_gaps(ew.optimal_targets(2)[0]), [5, 5])
+    check("three: 1h30m, 1h30m, 2h", ew.cyclic_gaps(ew.optimal_targets(3)[0]), [3, 3, 4])
+    check("four: 1h, 1h, 1h30m, 1h30m", ew.cyclic_gaps(ew.optimal_targets(4)[0]),
           [2, 2, 3, 3])
-    check("five: 1h apart", _gaps(ew.optimal_targets(5)[0]), [2] * 5)
-    check("six: as even as ten slots allow", _gaps(ew.optimal_targets(6)[0]),
+    check("five: 1h apart", ew.cyclic_gaps(ew.optimal_targets(5)[0]), [2] * 5)
+    check("six: as even as ten slots allow", ew.cyclic_gaps(ew.optimal_targets(6)[0]),
           [1, 1, 2, 2, 2, 2])
     check("one account has nothing to space", ew.plan_slots({"a": 3}), {"a": 0})
     check("nor do more accounts than slots",
@@ -3626,7 +3718,8 @@ def test_the_slot_planner_is_optimal():
         delays = ew.plan_slots(named)
         landed = [(named[k] + d) % ew.WINDOW_SLOTS for k, d in delays.items()]
         problems = []
-        if _gaps(landed) != _gaps(ew.optimal_targets(len(phases))[0]):
+        if ew.cyclic_gaps(landed) != \
+                ew.cyclic_gaps(ew.optimal_targets(len(phases))[0]):
             problems.append("not evenly spaced")
         if sum(delays.values()) != brute(phases):
             problems.append("not the cheapest")
@@ -3662,7 +3755,7 @@ def test_the_spacing_converges_from_anywhere_and_stays():
     section("Spacing converges from any start, and then stays put")
     import itertools
     import random
-    base = 1790000000 - 1790000000 % SLOT
+    base = ew.slot_start(1790000000)
 
     def start(phases, count):
         accounts = _spacing_accounts(count)
@@ -3677,10 +3770,10 @@ def test_the_spacing_converges_from_anywhere_and_stays():
     starts += [(tuple(rng.randrange(10) for _ in range(4)), 4)
                for _ in range(300)]
     for phases, count in starts:
-        accounts, states = start(phases, count)
-        took = _run_until_settled(accounts, states, base)
-        if took is None:
-            failures.append(phases)
+        world = _World(*start(phases, count))
+        took, _ = world.run_until_settled(base)
+        if took is None or world.valves:
+            failures.append((phases, world.valves[:1]))
             continue
         worst = max(worst, took)
     check("every start settles", failures[:3], [])
@@ -3690,11 +3783,11 @@ def test_the_spacing_converges_from_anywhere_and_stays():
     # Settled means settled: a day of ticks afterwards holds nothing. Ticked
     # straight on from where it settled -- skipping ticks would let every
     # window lapse, which is an outage, not a settled schedule.
-    accounts, states = start((0, 0, 0), 3)
-    _, now = _ticks_until_settled(accounts, states, base)
+    world = _World(*start((0, 0, 0), 3))
+    _, now = world.run_until_settled(base)
     held = []
     for _ in range(48):
-        held += _tick(accounts, states, now)
+        held += world.tick(now)
         now += SLOT
     check("once settled, a whole day of ticks holds nothing", held, [])
 
@@ -3703,29 +3796,30 @@ def test_the_spacing_converges_from_anywhere_and_stays():
     for st in states.values():
         st["rate_limits"]["five_hour"]["resets_at"] = base - 3600
     check_true("windows that all lapsed together are spread out again",
-               _run_until_settled(accounts, states, base) is not None)
+               _World(accounts, states).run_until_settled(base)[0] is not None)
 
 
 def test_using_a_held_account_does_not_stop_the_spacing_settling():
     """
     A hold is not a lockout: a person can use a held account at any moment,
-    which opens its window there and then. The plan must simply start again
-    from where that leaves things, from every start and every moment of
+    which opens its window there and then. The tool does not see that happen
+    -- a held account is neither pinged nor read -- and learns of it only at
+    its next ping. It must still settle, from every start and every moment of
     interruption.
     """
     section("Using a held account interrupts a correction, harmlessly")
     import itertools
-    base = 1790000000 - 1790000000 % SLOT
+    base = ew.slot_start(1790000000)
     failures = []
     for phases in itertools.product(range(10), repeat=2):
         for when in range(6):
             accounts = _spacing_accounts(2)
             states = dict((a.name, _alive(base, base + SLOT * (1 + p)))
                           for a, p in zip(accounts, phases))
-            took = _run_until_settled(
-                accounts, states, base,
-                use=lambda tick, when=when: "2" if tick == when else None)
-            if took is None:
+            world = _World(accounts, states)
+            took, _ = world.run_until_settled(
+                base, use=lambda tick, when=when: "2" if tick == when else None)
+            if took is None or world.valves:
                 failures.append((phases, when))
     check("every interrupted correction still settles", failures[:3], [])
 
@@ -3737,31 +3831,31 @@ def test_an_account_leaving_or_joining_is_respaced():
     one fewer; when it comes back they re-space again.
     """
     section("An account leaving and rejoining the rotation")
-    base = 1790000000 - 1790000000 % SLOT
+    base = ew.slot_start(1790000000)
     accounts = _spacing_accounts(3)
     states = dict((a.name, _alive(base, base + SLOT * (1 + i)))
                   for i, a in enumerate(accounts))
-    check_true("three settle", _run_until_settled(accounts, states, base)
-               is not None)
+    world = _World(accounts, states)
+    took, now = world.run_until_settled(base)
+    check_true("three settle", took is not None)
 
-    _, now = _ticks_until_settled(accounts, states, base)
-    out = states["3"]
-    out["rate_limits"]["seven_day"] = {"used_percentage": 100,
-                                       "resets_at": now + 3 * 86400}
-    check("an account whose weekly limit outlasts its window stops counting",
-          ew.is_participating(accounts[2], out, now), False)
+    # Account 3 spends its weekly limit, which outlasts its window. The tool
+    # finds out the way it always does: at its next ping, refused.
+    world.out["3"] = now + 3 * 86400
     two = [a for a in accounts if a.name != "3"]
     settled = False
     for _ in range(30):
-        _tick(accounts, states, now)
-        settled = settled or _settled(two, states, now + 60)
+        world.tick(now)
+        settled = settled or world.settled(now + 60, two)
         now += SLOT
+    check("once it has been refused, it stops counting",
+          ew.is_participating(accounts[2], states["3"], now), False)
     check_true("and the other two re-space for two", settled)
 
-    out["rate_limits"].pop("seven_day")
-    out["available_at"] = now
-    took = _run_until_settled(accounts, states, now)
+    del world.out["3"]                    # the limit resets
+    took, _ = world.run_until_settled(now)
     check_true("when it comes back, all three are re-spaced", took is not None)
+    check("and the safety valve never fired on the way", world.valves, [])
 
 
 def test_the_last_account_that_can_serve_is_never_held():
@@ -3773,7 +3867,7 @@ def test_the_last_account_that_can_serve_is_never_held():
     of a day and must not cancel every correction.
     """
     section("The one account that can serve is never held back")
-    base = 1790000000 - 1790000000 % SLOT
+    base = ew.slot_start(1790000000)
     now = base + 30
     a, b = _spacing_accounts(2)
     # A's window opened this slot; B's has just ended, so B would open in the
@@ -3810,7 +3904,7 @@ def test_a_hold_longer_than_any_plan_is_refused():
     is pinged anyway, the run says it is a bug, and doctor reports it for a week.
     """
     section("The spacing's safety valve")
-    base = 1790000000 - 1790000000 % SLOT
+    base = ew.slot_start(1790000000)
     now = base + 30
     a, b = _spacing_accounts(2)
     # The same collision as above: the plan wants B held.
@@ -3971,11 +4065,13 @@ def test_every_surface_tells_the_truth_about_a_held_account():
         ew.pings_here = lambda path=None: True
 
         def ping(account, accounts=None, force=False):
+            # Claude's side only: the window opens. The tool's side -- clearing
+            # the hold -- is the real decide_tick, as in _ping.
             forced.append((account.name, force))
             st = ew.read_state(account)
+            ew.decide_tick(account, [account], {account.name: st}, time.time(),
+                           force)
             st["rate_limits"]["five_hour"]["resets_at"] = time.time() + 18000
-            for key in ("held_until", "skipped_in_a_row", "withheld_since"):
-                st.pop(key, None)
             ew.write_state(account, st)
             return True
         ew.ping = ping
@@ -4052,6 +4148,164 @@ def test_a_window_that_ended_early_is_believed_and_planned_from():
     finally:
         (ew.run_interactive, ew.read_statusline_limits, ew.schedule_anchor,
          ew.restore_checkpoint) = saved
+
+
+def test_an_account_that_cannot_open_is_planned_from_when_it_can():
+    """
+    An account whose window has ended but which Claude refuses -- a weekly limit
+    spent, about to reset -- cannot open its next window now. Planned as though
+    it could, it took the current slot, the healthy account was held to space
+    around it, and on the next tick it was still unopened and "now" had moved
+    on: a healthy account held for hours behind one that could not open, until
+    the safety valve fired and `doctor` reported a bug. Found by the randomized
+    run below, before any real install met it.
+    """
+    section("An account that cannot open is planned from when it can")
+    base = ew.slot_start(1790000000)
+    now = base + 30
+    a, b = _spacing_accounts(2)
+    # Both windows have just ended. A's weekly limit is spent until 1h30m from
+    # now; B can serve.
+    def states(a_weekly_back):
+        a_state = _alive(now, now - 60)
+        a_state["rate_limits"]["seven_day"] = {"used_percentage": 100,
+                                               "resets_at": a_weekly_back}
+        return {"1": a_state, "2": _alive(now, now - 60)}
+
+    st = states(base + 3 * SLOT)
+    check("A still takes part: it will be back before its next boundary",
+          ew.is_participating(a, st["1"], now), True)
+    check("its earliest slot is the one its limit lifts in",
+          ew.earliest_slot(a, st["1"], now), ew.slot_of(base + 3 * SLOT))
+    check("B's is this one", ew.earliest_slot(b, st["2"], now), ew.slot_of(now))
+    go, until, why = ew.should_open_window(b, [a, b], st, now)
+    check("B is not held behind an account that cannot open", go, True)
+    go, _, _ = ew.should_open_window(a, [a, b], st, now)
+    check("and A is pinged as ever, which is how its return is noticed", go, True)
+
+    # A return inside a cell is caught by the next cell's tick.
+    st = states(base + 3 * SLOT + 600)
+    check("a return part-way through a cell counts from the next one",
+          ew.earliest_slot(a, st["1"], now), ew.slot_of(base + 4 * SLOT))
+
+    # An account whose pings simply keep failing has no earliest slot at all,
+    # and is not planned around -- but it still takes part, and says why.
+    failing = _alive(now, now - 60, consecutive_failures=ew.UNHEALTHY_AFTER,
+                     last_error={"error": "server_error", "status": 529,
+                                 "text": "API Error: 529 Overloaded.",
+                                 "needs_you": False, "at": now - 30})
+    st = {"1": failing, "2": _alive(now, now - 60)}
+    check("an account whose pings keep failing has no slot to plan around",
+          ew.earliest_slot(a, failing, now), None)
+    check("so the healthy one is not held behind it",
+          ew.should_open_window(b, [a, b], st, now)[0], True)
+    said = " ".join(ew.spacing_lines([a, b], st, now))
+    check_true("and status says why it is out of the plan",
+               "pings keep failing" in said)
+
+
+def test_a_hold_does_not_survive_the_machine_being_off():
+    """
+    Held ticks come every interval. When they stop -- a laptop asleep for the
+    night -- every window lapses and the plan the hold belonged to is gone.
+    Carried over, its count reached the safety valve after a few nights' holds
+    (and `doctor` called that a bug), and the time it began kept an account
+    nothing had pinged for hours counting as alive.
+    """
+    section("A hold does not survive the machine being off")
+    now = 1790000000.0
+    account = _spacing_accounts(1)[0]
+    held = {"available_at": now - 3600, "skipped_in_a_row": 7,
+            "withheld_since": now - 3 * 3600, "held_until": now + 3600,
+            "held_at": now - 30 * 60,
+            "rate_limits": {"five_hour": {"resets_at": now - 3 * 3600}}}
+    state = dict(held)
+    check("a hold whose last tick was one interval ago is kept",
+          ew.forget_stale_hold(state, now), False)
+    check("with its count", state["skipped_in_a_row"], 7)
+
+    state = dict(held, held_at=now - 9 * 3600)
+    check("one whose ticks stopped hours ago is dropped",
+          ew.forget_stale_hold(state, now), True)
+    check("all of it", [k for k in ew.HOLD_KEYS if k in state], [])
+
+    # Proof of life, as other accounts' plans see it before this account's
+    # own next tick has run: a stale hold no longer vouches for it.
+    sleeping = dict(held, available_at=now - 10 * 3600,
+                    withheld_since=now - 10 * 3600 - 60,
+                    held_at=now - 9 * 3600)
+    check("a stale hold does not keep an account counting as alive",
+          ew.is_participating(account, sleeping, now), False)
+    check("a live one does", ew.is_participating(
+        account, dict(sleeping, held_at=now - 20 * 60), now), True)
+
+    # A state written before held_at existed is judged by withheld_since.
+    legacy = {"skipped_in_a_row": 3, "withheld_since": now - 6 * 3600}
+    check("an older hold without held_at is judged by when it began",
+          ew.forget_stale_hold(legacy, now), True)
+
+
+def test_more_accounts_than_slots_do_not_break_status():
+    """
+    Eleven accounts cannot be spaced on ten slots. The planner knew that; the
+    summary `status` prints asked for the shape anyway, and crashed.
+    """
+    section("More accounts than slots")
+    now = 1790000000.0
+    accounts = _spacing_accounts(11)
+    states = dict((a.name, _alive(now, now + 600 + i * 60))
+                  for i, a in enumerate(accounts))
+    lines = ew.spacing_lines(accounts, states, now)
+    check_true("status says so instead of failing",
+               any("more than the 10 slots" in line for line in lines))
+
+
+def test_the_spacing_survives_a_randomized_beating():
+    """
+    The exhaustive tests start from every arrangement and then leave the
+    planner alone. Real installs do not: machines sleep, weekly limits run out
+    and come back, people use whichever account they like -- and the tool
+    sees that use only when it next pings. This drives the real code through
+    200 simulated hours of exactly that, many times over, then 30 calm hours,
+    and asks three things: the safety valve never fires, nothing is held once
+    things are calm, and the spacing is right at the end. It is what found the
+    two bugs the tests above now pin down.
+    """
+    section("Spacing under random outages, weekly limits and use")
+    import random
+    problems = []
+    for count in (2, 3, 4):
+        for seed in range(40):
+            rng = random.Random(seed * 7 + count)
+            accounts = _spacing_accounts(count)
+            base = ew.slot_start(1790000000)
+            world = _World(accounts, dict(
+                (a.name, _alive(base, base + SLOT * rng.randrange(1, 11)))
+                for a in accounts))
+            now, calm_from = base, 340
+            for t in range(400):
+                calm = t >= calm_from
+                if not calm and rng.random() < 0.02:
+                    now += SLOT * rng.randrange(1, 13)       # machine off
+                    continue
+                if not calm and rng.random() < 0.03:
+                    world.out[rng.choice(accounts).name] = \
+                        now + SLOT * rng.randrange(5, 60)
+                for name in [n for n, back in world.out.items()
+                             if back <= now or calm]:
+                    del world.out[name]
+                if not calm and rng.random() < 0.15:
+                    world.use(rng.choice(accounts).name, now + 300)
+                held = world.tick(now)
+                if held and t >= calm_from + 24:
+                    problems.append(("held when calm", count, seed, t, held))
+                now += SLOT
+            if world.valves:
+                problems.append(("valve", count, seed, world.valves[:1]))
+            if not world.settled(now - SLOT + 60):
+                problems.append(("unsettled", count, seed))
+    check("120 runs of 200 hours: no valve, no hold once calm, all settled",
+          problems[:5], [])
 
 
 def test_what_a_ping_records_from_how_it_went():
@@ -5177,8 +5431,16 @@ def test_doctor_notices_a_deployment_going_wrong():
         held["withheld_since"] = time.time() - 3 * 3600
         held["held_until"] = time.time() + 3600
         ew.write_state(account, held)
+        held["held_at"] = time.time() - 600
+        ew.write_state(account, held)
         check("a held account is not reported as silent",
               "has not pinged since" in doctor_says(), False)
+        # Unless its held ticks stopped coming: a timer that died mid-hold
+        # leaves the marker behind, and it must not silence this check.
+        held["held_at"] = time.time() - 6 * 3600
+        ew.write_state(account, held)
+        check_true("one whose held ticks stopped hours ago is",
+                   "has not pinged since" in doctor_says())
         ew.write_state(account, {"last_run": time.time() - 10 * ew.INTERVAL_MIN * 60})
         check_true("while one that is simply silent still is",
                    "has not pinged since" in doctor_says())
@@ -5603,7 +5865,7 @@ def test_a_clean_install_from_nothing():
     # Wall-clock and pinned to Anthropic's 30-minute reset grid, which is what
     # makes an ordinary tick land on every window boundary without an anchor.
     check_true("it fires on the grid Claude resets on",
-               "OnCalendar=*-*-* *:00,30:30" in timer)
+               "OnCalendar=*-*-* *:00,30:30 UTC" in timer)
     check_true("it is no longer monotonic, so it cannot drift off that grid",
                "OnUnitActiveSec" not in timer and "OnActiveSec" not in timer)
     check_true("it is tightened past systemd's default minute of slack",
@@ -5627,7 +5889,7 @@ def test_a_clean_install_from_nothing():
     check_true("and its drop-in clears the template's tick before setting its own",
                "OnCalendar=\nOnCalendar=" in stagger)
     check_true("moving only the seconds, so it stays in the same grid cell",
-               "OnCalendar=*-*-* *:00,30:35" in stagger)
+               "OnCalendar=*-*-* *:00,30:35 UTC" in stagger)
 
     enabled = [c for c in calls if c[:2] == ["systemctl", "enable"]]
     check("a timer is enabled per account", len(enabled), 2)
@@ -5782,8 +6044,8 @@ def test_three_accounts_install_and_space_correctly():
         offsets.append([l for l in body.splitlines()
                         if l.startswith("OnCalendar=") and l != "OnCalendar="][0])
     check("each later account takes its own second of the same grid cell",
-          offsets, ["OnCalendar=*-*-* *:00,30:35",
-                    "OnCalendar=*-*-* *:00,30:40"])
+          offsets, ["OnCalendar=*-*-* *:00,30:35 UTC",
+                    "OnCalendar=*-*-* *:00,30:40 UTC"])
 
     # Guards, which offset the *anchored* pings, must separate too — and must
     # agree with the seconds above, or an anchored ping and an ordinary one
@@ -5794,7 +6056,7 @@ def test_three_accounts_install_and_space_correctly():
           [ew.RESET_GUARD_SEC, ew.RESET_GUARD_SEC + ew.PING_STAGGER_SEC,
            ew.RESET_GUARD_SEC + 2 * ew.PING_STAGGER_SEC])
     check("and the timer says the same seconds the guard does",
-          [ew.timer_calendar(a).rsplit(":", 1)[1] for a in accounts],
+          [ew.timer_calendar(a).split()[1].rsplit(":", 1)[1] for a in accounts],
           ["{:02d}".format(a.guard_sec) for a in accounts])
 
     # Three accounts cannot sit 1h40m apart: Anthropic floors every window
@@ -5802,11 +6064,9 @@ def test_three_accounts_install_and_space_correctly():
     # 2h00m. The old target was the unreachable 1h40m, and chasing it cost half
     # an hour of dead window every cycle for ever.
     delays = ew.plan_slots({"1": 4, "2": 4, "3": 4})
-    targets = sorted((4 + d) % ew.WINDOW_SLOTS for d in delays.values())
-    gaps = sorted(((targets[(i + 1) % 3] - targets[i]) % ew.WINDOW_SLOTS) * 30
-                  for i in range(3))
     check("three accounts starting together are spread 90/90/120 minutes",
-          gaps, [90, 90, 120])
+          [g * 30 for g in ew.cyclic_gaps([4 + d for d in delays.values()])],
+          [90, 90, 120])
     check("one of them opens at once", min(delays.values()), 0)
 
 
@@ -9925,7 +10185,7 @@ def test_the_reset_grid_is_checked_rather_than_assumed():
     check("a window's start and its reset share a slot",
           ew.slot_of(1700000000), ew.slot_of(1700000000 + ew.WINDOW_HOURS * HOUR))
 
-    on_grid = 1700000000 - 1700000000 % ew.GRID_SEC
+    on_grid = ew.slot_start(1700000000)
     state = {}
     ew.note_reset_grid(account, state, on_grid)
     check("an on-grid reset is counted", state["grid"]["checked"], 1)
@@ -10002,11 +10262,40 @@ def test_an_upgraded_install_still_running_the_old_timer_is_noticed():
         check_true("saying what it costs", "lose" in findings[0].hint)
         check_true("and how to fix it", "install.sh" in findings[0].hint)
 
+        # The first calendar version ticked in local time: on the grid only
+        # where the offset is a whole half hour, and not on the night clocks
+        # go back.
+        with open(path, "w") as f:
+            f.write("[Timer]\nOnCalendar=*-*-* *:00,30:30\n")
+        findings = ew.stale_timer_findings()
+        check("a local-time calendar timer is reported too", len(findings), 1)
+        check_true("and named as what it is", "local time" in findings[0].message)
+
         with open(path, "w") as f:
             f.write(ew._TIMER_UNIT.format(
                 interval=ew.INTERVAL_MIN, minutes=ew.calendar_minutes(),
                 second=ew.RESET_GUARD_SEC))
         check("the current timer is not reported", ew.stale_timer_findings(), [])
+
+        # The anchor decision reads the same files, the account's own drop-in
+        # included: a template rewritten while a drop-in was left behind would
+        # otherwise read as on the grid when that account's tick is not.
+        account = ew.Account("2", "/tmp/c2", 1)
+        check_true("the template alone, in UTC, ticks on the grid",
+                   ew.timer_ticks_on_grid(account))
+        drop_in = os.path.join(ew.UNIT_DIR, account.timer_unit + ".d")
+        os.makedirs(drop_in)
+        with open(os.path.join(drop_in, "stagger.conf"), "w") as f:
+            f.write("[Timer]\nOnCalendar=\nOnCalendar=*-*-* *:00,30:35\n")
+        check("a local-time drop-in does not", ew.timer_ticks_on_grid(account),
+              False)
+        with open(os.path.join(drop_in, "stagger.conf"), "w") as f:
+            f.write("[Timer]\nOnCalendar=\nOnCalendar={}\n".format(
+                ew.timer_calendar(account)))
+        check("the one setup writes does", ew.timer_ticks_on_grid(account), True)
+        os.remove(path)
+        check("and no timer at all is not on the grid",
+              ew.timer_ticks_on_grid(account), False)
     finally:
         shutil.rmtree(ew.UNIT_DIR, ignore_errors=True)
         ew.UNIT_DIR = saved
@@ -10036,7 +10325,15 @@ def test_the_ping_cadence_is_a_calendar_on_the_grid():
                        "divide 60" in str(exc))
 
     accounts = [ew.Account(str(i + 1), "/tmp/c%d" % i, i) for i in range(8)]
-    seconds = [int(ew.timer_calendar(a).rsplit(":", 1)[1]) for a in accounts]
+    seconds = [int(ew.timer_calendar(a).split()[1].rsplit(":", 1)[1])
+               for a in accounts]
+    # UTC, because the grid is UTC: a local-time tick lands a quarter hour
+    # into every cell where the offset ends in :45, and skips the repeated
+    # hour on the night clocks go back.
+    check_true("every account's tick is in UTC",
+               all(ew.timer_calendar(a).endswith(" UTC") for a in accounts))
+    check_true("and systemd's own reading of it agrees, where systemd exists",
+               _calendar_parses_as_utc(ew.timer_calendar(accounts[0])))
     check_true("every account fires within the same grid cell",
                all(0 <= s < 60 for s in seconds))
     check_true("never before the boundary it is meant to follow",
@@ -10885,6 +11182,10 @@ def main():
                  test_a_held_account_is_still_counted_as_alive,
                  test_a_ping_the_plan_holds_never_reaches_claude,
                  test_every_surface_tells_the_truth_about_a_held_account,
+                 test_an_account_that_cannot_open_is_planned_from_when_it_can,
+                 test_a_hold_does_not_survive_the_machine_being_off,
+                 test_more_accounts_than_slots_do_not_break_status,
+                 test_the_spacing_survives_a_randomized_beating,
                  test_two_pings_at_once_do_not_tread_on_each_other,
                  test_an_unusable_account_is_still_pinged,
                  test_a_corrupt_file_is_read_as_corrupt_and_not_as_a_crash,

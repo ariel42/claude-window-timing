@@ -83,13 +83,13 @@ claude-window which
 
 ```
 Use account 1 (personal)
-  the only account usable right now; its window ends 2026-08-13 03:52:35 IDT (in 4h00m00s)
+  the only account usable right now; its window ends 2026-08-13 03:30:00 IDT (in 3h41m12s)
   That is the window to spend; how you use the account is up to you.
   Point your own Claude Code at it:  claude-window switch 1
 
-  1 (personal)  usable — 71% left, window ends in 4h00m00s   <- use this
-  2 (work)      unusable until 2026-08-13 01:22:35 IDT — its 5-hour limit is spent
-  3 (spare)     unusable until 2026-08-14 23:52:35 IDT — its weekly limit is spent
+  1 (personal)  usable — 71% left, window ends in 3h41m12s   <- use this
+  2 (work)      unusable until 2026-08-13 01:00:00 IDT — its 5-hour limit is spent
+  3 (spare)     unusable until 2026-08-14 22:00:00 IDT — its weekly limit is spent
 
   Figures from a live reading, 0h00m02s ago.
 ```
@@ -153,7 +153,7 @@ There are three familiar ways to attack this, and this tool is none of them.
 
 What this one does instead:
 
-- **It aims at the window boundary.** Anthropic snaps every reset to a 30-minute grid, so the pings run on that same grid — `:00:30` and `:30:30` — and every one of them lands half a minute after a boundary rather than somewhere inside a window. A missed ping cannot drag the rest out of step, because nothing is measured from the last run. This is the part that makes it hold up over weeks instead of days. ([Staying on schedule](#staying-on-schedule).)
+- **It aims at the window boundary.** Anthropic snaps every reset to a 30-minute grid, so the pings run on that same grid — `:00:30` and `:30:30`, in UTC — and every one of them lands half a minute after a boundary rather than somewhere inside a window. A missed ping cannot drag the rest out of step, because nothing is measured from the last run. This is the part that makes it hold up over weeks instead of days. ([Staying on schedule](#staying-on-schedule).)
 - **The pings are engineered to be free.** Every ping replays one identical saved conversation from a directory whose contents never change, so Claude serves it from cache, and 30 minutes sits comfortably inside the ~1-hour cache lifetime while dividing 5 hours evenly. All three facts are load-bearing; none is a coincidence ([why 30 minutes](#why-30-minutes), [where the pings run](#where-the-pings-run)).
 - **It runs several subscriptions as one supply.** Windows spaced as evenly as Anthropic's grid allows, kept that way automatically, and a straight answer to "which account should I use right now" that skips any account that cannot serve a request. ([More than one subscription](#more-than-one-subscription).)
 - **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. Nothing that runs on a timer ever writes to `~/.claude` or `~/.claude.json`. The one thing that does is `claude-window switch`, only when you run it, to two files, after copying both somewhere safe — and a test names the single function allowed to write there and fails the day a second one appears.
@@ -214,13 +214,13 @@ Your Claude Code  : account 1 (personal)
 Account 1 (personal)
   Config dir    : /home/you/.claude-1
   Checkpoint    : 6f1c47a9-2d40-4e5b-9a7c-1b3e8d05f2aa
-  Last ping     : 2026-08-11 11:37:26 IDT (0h01m05s ago)
-  5-hour window : 82% used, resets 2026-08-11 15:30:00 IDT (in 3h51m29s)
-  Weekly limit  : 17% used, resets 2026-08-17 10:00:00 IDT (in 5d 22h21m29s)
-  Next start-of-window opportunity: 2026-08-11 15:30:00 IDT (in 3h51m29s)
+  Last ping     : 2026-08-11 11:30:43 IDT (0h01m05s ago)
+  5-hour window : 82% used, resets 2026-08-11 15:30:00 IDT (in 3h58m12s)
+  Weekly limit  : 17% used, resets 2026-08-17 10:00:00 IDT (in 5d 22h28m12s)
+  Next start-of-window opportunity: 2026-08-11 15:30:00 IDT (in 3h58m12s)
     set by the 5-hour window, as reported by the last ping
   Anchor        : none scheduled
-  Next ping     : Tue 2026-08-11 12:07:13 IDT
+  Next ping     : Tue 2026-08-11 12:00:30 IDT
 
 Account 2 (work)
   ... the same again
@@ -252,8 +252,8 @@ Three more are worth naming, because each one leaves an install that looks perfe
 Every run is logged, so the log doubles as a record of your usage through the day:
 
 ```
-[2026-08-11 11:37:26] Turn confirmed: cache_read=6864 cache_write=0 in=10 out=54
-[2026-08-11 11:37:26] Usage: 5-hour 82% (resets 2026-08-11 15:30:00 IDT, in 3h51m29s) · weekly 17% (resets 2026-08-17 10:00:00 IDT, in 5d 22h21m29s)
+[2026-08-11 11:30:43] Turn confirmed: cache_read=6864 cache_write=0 in=10 out=54
+[2026-08-11 11:30:43] Usage: 5-hour 82% (resets 2026-08-11 15:30:00 IDT, in 3h59m17s) · weekly 17% (resets 2026-08-17 10:00:00 IDT, in 5d 22h29m17s)
 ```
 
 ## Staying on schedule
@@ -264,7 +264,7 @@ A window lasts 5 hours and the pings are 30 minutes apart, so a ping lands exact
 
 **Sometimes a ping does not happen.** The laptop slept, the network dropped, or you used the window up yourself and Claude refused the ping until your limit reset. A window that should have started then starts at the next ping instead.
 
-**Why that does not compound.** The pings are on the clock, not on a stopwatch: `:00:30` and `:30:30`, five seconds apart per account so several do not spawn at once. Anthropic floors every reset to the same 30-minute grid, so every boundary is a moment the timer was going to fire at anyway. A missed ping costs one window a late start of at most half an hour and moves nothing after it — there is no drifting cadence to repair, because there is no cadence, only a clock.
+**Why that does not compound.** The pings are on the clock, not on a stopwatch: `:00:30` and `:30:30` UTC, five seconds apart per account so several do not spawn at once. Anthropic floors every reset to the same 30-minute grid, so every boundary is a moment the timer was going to fire at anyway. A missed ping costs one window a late start of at most half an hour and moves nothing after it — there is no drifting cadence to repair, because there is no cadence, only a clock.
 
 For the boundaries that somehow land off that grid, the tool still books one extra ping 30 seconds after the moment Claude reported — the mechanism that used to do all of this, now kept as the safety net for the grid rather than as the thing the schedule depends on.
 
@@ -276,7 +276,7 @@ A window starts on the first ping *after* the previous one ends, so the one thin
 
 Waiting is not a lockout, and that is what makes it safe to do unasked. A held account is fully usable: use it and its window opens there and then, with all of its quota, and the plan is worked out again from wherever things now stand. `which` tells you when the account it recommends is being held, and `switch` to a held account opens its window on the spot. Nothing is booked, nothing has to be confirmed, and there is no correction too large to make, because no correction takes anything away from you.
 
-It converges, and stays put. Every hold is a whole number of slots, so each one moves the arrangement strictly closer to the best one, and once there nothing is ever held again — so nothing you do with your accounts can move it. Only an outage, or an account joining or leaving the rotation, can. From any starting arrangement of two, three or four accounts it settles within one window plus the longest hold, eight hours at the very worst; every case was checked.
+It converges, and stays put. Every hold is a whole number of slots, so each one moves the arrangement strictly closer to the best one, and once there nothing is ever held again — so nothing you do with your accounts can move it. Only an outage, or an account joining or leaving the rotation, can. From every starting arrangement of two and three accounts, and several hundred of four, it settles within one window plus the longest hold — eight and a half hours at the very worst. A randomized run of outages, spent weekly limits and accounts used at random, in which the tool only learns what you did at its next ping, settles every time once things calm down.
 
 A fresh install is the realistic worst case: setting up each account sends it one message, so their windows all start within minutes of each other. For the first few hours some accounts will be held at the end of a window to spread them out. Use them anyway if you need them.
 
@@ -408,7 +408,7 @@ Two things decide the interval.
 
 **Landing on the boundary.** A window lasts 5 hours and a new one only starts on the first ping *after* the old one ends. 30 minutes divides 5 hours evenly, so a ping falls exactly on each boundary. An interval that does not divide evenly — 59 minutes, say — would leave nearly an hour with no window running at all.
 
-**Landing on Anthropic's grid.** This is the part that makes 30 the only sensible answer rather than one of several. Every reset is floored to a 30-minute boundary — a ping at 15:30:44 opens a window that reports resetting at 20:30:00 — so a window opened part-way through a grid cell is dated from the start of that cell and loses the difference. The pings therefore fire on the clock at `:00:30` and `:30:30`, which is always just past a boundary and never inside a cell. An interval that does not divide 30 walks across the grid: 25 minutes, say, would take six different positions in the cell and throw away an average of 12 minutes of any window it opened, while costing 20% more pings.
+**Landing on Anthropic's grid.** This is the part that makes 30 the only sensible answer rather than one of several. Every reset is floored to a 30-minute boundary — a ping at 15:30:44 opens a window that reports resetting at 20:30:00 — so a window opened part-way through a grid cell is dated from the start of that cell and loses the difference. The pings therefore fire on the clock at `:00:30` and `:30:30` — in UTC, because the grid is UTC: in a time zone whose offset ends in :45 a local-time clock would fire a quarter of an hour into every cell, and on the night the clocks go back it would skip two ticks. That is always just past a boundary and never inside a cell. An interval that does not divide 30 walks across the grid: 25 minutes, say, would take six different positions in the cell and throw away an average of 12 minutes of any window it opened, while costing 20% more pings.
 
 Because the ticks are wall-clock rather than measured from the last run, a missed ping cannot move the ones after it. The next attempt is half an hour away, still inside the cache lifetime, and still exactly on a boundary.
 
