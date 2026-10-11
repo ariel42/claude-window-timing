@@ -10159,6 +10159,59 @@ def test_a_login_never_moves_while_claude_code_is_refreshing_it():
         restore()
 
 
+def test_a_claude_code_kept_somewhere_else_is_not_switched():
+    """
+    With CLAUDE_CONFIG_DIR set, the Claude Code a shell starts keeps its
+    login in that directory -- and on macOS under a Keychain item named after
+    it -- and CLAUDE_SECURESTORAGE_CONFIG_DIR moves the credential alone. A
+    switch rewrites ~/.claude, which that Claude Code never reads: it would
+    report the new account and change nothing. So it refuses, says which
+    variable, and `doctor` says so too. An empty value is no value, as it is
+    to Claude Code.
+    """
+    section("A Claude Code kept somewhere else is not switched")
+    # Claude Code's own names for them, not the tool's list: a list the test
+    # borrowed would shrink with the code and still pass.
+    variables = ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    held = dict((var, os.environ.get(var)) for var in variables)
+    try:
+        for var in variables:
+            restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                                      parked=("2",))
+            try:
+                elsewhere = os.path.join(home, "elsewhere")
+                os.environ[var] = elsewhere
+                before = _snapshot_user_files()
+                out, err, code = _capture(lambda: ew.switch_account(
+                    accounts, "2", sign_in=False))
+                check("{} stops the switch".format(var), code, 1)
+                check_true("naming it and where it points",
+                           var in err and elsewhere in err)
+                check("with nothing changed", _snapshot_user_files(), before)
+                check_true("and doctor says the same", any(
+                    var in f.message and f.level == "error"
+                    for f in ew.switch_findings(accounts)))
+                # Before anything reassuring: "already signed in as it" is
+                # false comfort when this shell's Claude Code reads elsewhere.
+                out, err, code = _capture(lambda: ew.switch_account(
+                    accounts, "1", sign_in=False))
+                check("even to the account ~/.claude already holds", code, 1)
+                check("without calling it already signed in",
+                      "already signed in" in out, False)
+
+                os.environ[var] = ""
+                out, err, code = _capture(lambda: ew.switch_account(
+                    accounts, "2", sign_in=False))
+                check("set but empty, it is no setting at all", code, 0)
+            finally:
+                os.environ.pop(var, None)
+                restore()
+    finally:
+        for var, value in held.items():
+            if value is not None:
+                os.environ[var] = value
+
+
 def test_running_sessions_are_looked_for_without_counting_our_own_pings():
     """
     A ping runs the same binary every half hour, so counting them would make the
@@ -12038,6 +12091,7 @@ CREDENTIAL_TESTS = (
     test_doctor_on_a_switch_only_machine_reports_only_what_applies,
     test_setup_can_install_the_switcher_without_the_pings,
     test_a_login_never_moves_while_claude_code_is_refreshing_it,
+    test_a_claude_code_kept_somewhere_else_is_not_switched,
 )
 
 
@@ -12102,6 +12156,15 @@ def main():
         os.environ["FAKE_SECURITY_DB"] = fake_keychain()
         return real_security(*args, **kwargs)
     ew._security = security_in_this_home
+
+    # Nor may the developer's own Claude Code settings reach a test. Each of
+    # these stops a switch on purpose -- an API key outranks the login, and a
+    # CLAUDE_CONFIG_DIR keeps Claude Code's login somewhere a switch never
+    # writes -- so run from a shell that had one set, every switch test failed
+    # for a reason that had nothing to do with the code. Tests about them set
+    # them themselves.
+    for var in ew._ACCOUNT_OVERRIDE_VARS + ew._CONFIG_DIR_VARS:
+        os.environ.pop(var, None)
 
     # No test may reach the network. A live reading is a real request against a
     # real account, so a test that made one would spend the developer's quota
@@ -12288,6 +12351,7 @@ def main():
                  test_the_keychain_commands_it_gives_do_what_they_say,
                  test_the_suite_never_reaches_a_real_keychain,
                  test_a_login_never_moves_while_claude_code_is_refreshing_it,
+                 test_a_claude_code_kept_somewhere_else_is_not_switched,
                  test_a_machine_that_does_not_ping_is_never_told_to_ping,
                  test_a_machine_can_be_told_it_does_not_ping,
                  test_the_wizard_asks_for_each_sign_in_once_and_no_more,

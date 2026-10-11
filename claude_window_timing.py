@@ -6209,6 +6209,35 @@ _ACCOUNT_OVERRIDE_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
                           "CLAUDE_CODE_OAUTH_TOKEN")
 
 
+# Variables that move Claude Code off ~/.claude. Read from its source:
+# CLAUDE_CONFIG_DIR moves the whole of it -- credential, identity file and, on
+# macOS, the name of the Keychain item -- and CLAUDE_SECURESTORAGE_CONFIG_DIR
+# moves the credential alone. Claude Code treats an empty value as none.
+_CONFIG_DIR_VARS = ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR")
+
+
+def config_dir_overrides():
+    """
+    Settings that point the Claude Code started from here somewhere other
+    than ~/.claude, as (variable, value) pairs.
+
+    With one set, that Claude Code keeps its login where a switch never
+    writes: the switch would succeed, report the new account, and change
+    nothing the sessions started from this shell read.
+    """
+    return [(var, os.environ[var]) for var in _CONFIG_DIR_VARS
+            if os.environ.get(var)]
+
+
+def config_dir_finding(var, value):
+    return Finding(
+        "error",
+        "{} is set to {}".format(var, value),
+        "The Claude Code started from this shell keeps its login there, not "
+        "in {}, so switching would change nothing it reads. Run the switch "
+        "from a shell without it.".format(USER_CONFIG_DIR))
+
+
 def account_overrides():
     """
     Settings that would make a switch pointless, as (where, variable) pairs.
@@ -7235,11 +7264,16 @@ def switch_account(accounts, name=None, sign_in=True):
         return 1
 
     overrides = account_overrides()
-    if overrides:
+    elsewhere = config_dir_overrides()
+    if overrides or elsewhere:
         for where, var in overrides:
             sys.stderr.write(
                 "ERROR: {} is set in {}\n  -> It decides which account is "
                 "billed, whatever this command does.\n".format(var, where))
+        for var, value in elsewhere:
+            finding = config_dir_finding(var, value)
+            sys.stderr.write("ERROR: {}\n  -> {}\n".format(
+                finding.message, finding.hint))
         sys.stderr.write("\nNothing was changed.\n")
         return 1
 
@@ -7610,7 +7644,8 @@ def switch_findings(accounts):
     """
     if not switching_configured(accounts):
         return []
-    findings = []
+    findings = [config_dir_finding(var, value)
+                for var, value in config_dir_overrides()]
     # Before anything read from it is believed. A Keychain that will not answer
     # makes every login below look absent or empty, and the advice for that --
     # sign in again -- would be wrong for each of them.
