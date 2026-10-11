@@ -87,6 +87,21 @@ def _systemd_stdout(command):
     return "running\n" if "is-system-running" in words else ""
 
 
+def _reachable_manager(*args):
+    """
+    `_systemctl` as a machine with a reachable user manager answers it.
+
+    For tests that describe such a machine without needing anything from it.
+    Left to the real one, they asked whatever machine the suite ran on -- and
+    on a Mac, or in a container, the answer was "no manager", and the test
+    failed for a reason that had nothing to do with it.
+    """
+    class Answer(object):
+        returncode = 0
+        stdout = _systemd_stdout(args)
+    return Answer()
+
+
 def check(name, got, want):
     if got == want:
         print("  PASS  {}".format(name))
@@ -2858,6 +2873,11 @@ def test_one_usage_figure_reaches_every_surface_unchanged():
         # 7. the age travels with it everywhere it is shown. A figure with no
         # age is what let two machines disagree in public with nothing on
         # either screen to explain it.
+        #
+        # Measured from a moment taken here, not at the top: the sweep above
+        # runs every surface fourteen times, and on a slow machine it outlasts
+        # the second this check has to be exact to.
+        now = time.time()
         store(37, read_ago=900)
         said = _capture(lambda: ew.status([one, two]))[0]
         listing = _capture(lambda: ew.which([one, two]))[0]
@@ -4867,7 +4887,9 @@ def test_the_first_run_screen_says_the_things_that_stop_people():
     """
     section("The first-run screen, for an account not yet signed in")
     root = tempfile.mkdtemp()
-    saved = (ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE, ew.HOME, sys.stdin)
+    saved = (ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE, ew.HOME, sys.stdin,
+             ew._systemctl)
+    ew._systemctl = _reachable_manager
     ew.SCRIPT_DIR = root
     ew.STATE_ROOT = os.path.join(root, "state")
     ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
@@ -4898,7 +4920,8 @@ def test_the_first_run_screen_says_the_things_that_stop_people():
         check_true("it never suggests the user's own directory",
                    os.path.join(ew.HOME, ".claude") + " " not in said)
     finally:
-        ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE, ew.HOME, sys.stdin = saved
+        (ew.SCRIPT_DIR, ew.STATE_ROOT, ew.ACCOUNTS_FILE, ew.HOME, sys.stdin,
+         ew._systemctl) = saved
 
 
 def _launcher_sandbox():
@@ -6470,7 +6493,15 @@ def test_every_command_routes_to_the_thing_it_names():
         check("and succeeds once they are", code, 0)
         check_true("saying so plainly", "Everything checks out" in said)
 
-        code, said, _ = run(["install-command"])
+        # Whether it asks to put the command on PATH depends on the PATH this
+        # suite inherited: on a machine with an install of its own it finds
+        # that one and asks nothing, and anywhere else it offers. Declined,
+        # so the answer is the same on every machine and nothing is written.
+        held_stdin, sys.stdin = sys.stdin, io.StringIO("n\n")
+        try:
+            code, said, _ = run(["install-command"])
+        finally:
+            sys.stdin = held_stdin
         check("install-command succeeds", code, 0)
         check_true("and writes the launcher",
                    os.access(os.path.join(ew.BIN_DIR, ew.COMMAND), os.X_OK))
@@ -9542,8 +9573,9 @@ def test_a_machine_without_systemd_can_still_install_the_switcher():
     """
     section("A machine without systemd can still install the switcher")
 
-    real = ew._command_exists
+    real = (ew._command_exists, ew._systemctl)
     try:
+        ew._systemctl = _reachable_manager
         ew._command_exists = lambda name: name not in ("systemctl", "systemd-run")
 
         check("nothing stops a machine that will not ping",
@@ -9568,7 +9600,7 @@ def test_a_machine_without_systemd_can_still_install_the_switcher():
         check("a complete machine has nothing to report",
               ew.systemd_blockers(pings=True), [])
     finally:
-        ew._command_exists = real
+        ew._command_exists, ew._systemctl = real
 
     # End to end: the wizard stops before writing anything.
     root = tempfile.mkdtemp()
@@ -9810,10 +9842,11 @@ def test_setup_names_an_account_it_is_about_to_drop():
     section("Setup names an account it is about to drop")
 
     root = tempfile.mkdtemp()
-    saved = (ew.ACCOUNTS_FILE, ew._command_exists, sys.stdin)
+    saved = (ew.ACCOUNTS_FILE, ew._command_exists, sys.stdin, ew._systemctl)
     try:
         ew.ACCOUNTS_FILE = os.path.join(root, "accounts.json")
         ew._command_exists = lambda name: True
+        ew._systemctl = _reachable_manager
         with open(ew.ACCOUNTS_FILE, "w") as f:
             json.dump({"accounts": [
                 {"name": "1", "config_dir": "~/.claude-1", "label": "personal"},
@@ -9838,7 +9871,7 @@ def test_setup_names_an_account_it_is_about_to_drop():
         out, _, _ = _capture(lambda: ew.setup(argv_accounts=2, pings=True))
         check("no warning when no account is dropped", "Dropping" in out, False)
     finally:
-        (ew.ACCOUNTS_FILE, ew._command_exists, sys.stdin) = saved
+        (ew.ACCOUNTS_FILE, ew._command_exists, sys.stdin, ew._systemctl) = saved
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -9851,7 +9884,11 @@ def test_setup_says_the_pings_belong_on_one_machine():
 
     buf = io.StringIO()
     out, sys.stdout = sys.stdout, buf
-    held, sys.stdin = sys.stdin, io.StringIO("2\nn\ny\n\n")
+    # Enter for whatever else it asks. Whether setup offers to put the command
+    # on PATH depends on the PATH this suite inherited -- a machine with an
+    # install of its own is never asked -- and a fixed script ran out on every
+    # other machine. The offer writes into this test's own HOME.
+    held, sys.stdin = sys.stdin, _Answers("2\nn\ny\n")
     saved = (ew.HOME, ew.ACCOUNTS_FILE, ew.SWITCH_ROOT, ew.STATE_ROOT,
              ew.BIN_DIR, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON,
              ew.SCHEDULE_FILE, ew.UNIT_DIR, ew._systemctl)
@@ -11112,7 +11149,11 @@ def main():
     #
     # Defaulting everything to a sandbox means forgetting is safe. A test that
     # wants the real thing has to say so.
-    suite_root = tempfile.mkdtemp(prefix="window-timing-tests-")
+    # Resolved, because on macOS the temporary directory is reached through a
+    # symlink (/var -> /private/var). A child's getcwd() names the resolved
+    # path, so the stand-in CLI filed its transcripts under a directory name
+    # the tool, holding the unresolved one, never looked in.
+    suite_root = os.path.realpath(tempfile.mkdtemp(prefix="window-timing-tests-"))
     # Every mkdtemp() a test makes lands inside the suite's own directory from
     # here on, so the run cleans up after itself in one go. Individual tests
     # tidy up where they can, but around sixty directories a run were being
@@ -11134,6 +11175,15 @@ def main():
     ew.SWITCH_ROOT = os.path.join(home, ".claude-switch")
     os.makedirs(ew.UNIT_DIR)
     os.makedirs(ew.USER_CONFIG_DIR)
+    # The pings need Linux and systemd, and every test of them describes that
+    # machine: its systemd calls are recorded rather than run. Whether
+    # systemctl is *installed* was the one question left that read the real
+    # machine, so on a Mac every install test failed for a reason that had
+    # nothing to do with the code under test. A test about a machine without
+    # systemd says so itself, as those tests always have.
+    real_command_exists = ew._command_exists
+    ew._command_exists = lambda name: (name in ("systemctl", "systemd-run")
+                                       or real_command_exists(name))
 
     # No test may reach the network. A live reading is a real request against a
     # real account, so a test that made one would spend the developer's quota
