@@ -26,13 +26,11 @@ import email.utils
 import collections
 import contextlib
 import difflib
-import fcntl
 import hashlib
 import io
 import itertools
 import json
 import os
-import pty
 import re
 import shlex
 import shutil
@@ -46,6 +44,20 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
+
+# Unix only, and needed only where Unix is: pty by the pings, fcntl by the
+# locks around a ping and a switch. Imported so that the module still loads
+# where they do not exist -- Windows refuses `switch` and has no systemd to
+# ping from -- instead of failing on its first line with an ImportError that
+# says nothing about which commands could have worked.
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+try:
+    import pty
+except ImportError:
+    pty = None
 
 try:                                    # 3.9 and later
     from zoneinfo import ZoneInfo

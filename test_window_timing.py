@@ -10212,6 +10212,31 @@ def test_a_claude_code_kept_somewhere_else_is_not_switched():
                 os.environ[var] = value
 
 
+def test_the_module_loads_where_there_is_no_fcntl_or_pty():
+    """
+    fcntl and pty exist only on Unix, and only the pings and the locks around
+    them use them. Imported unconditionally, they made the module fail on its
+    first line anywhere else -- the first thing between Windows and even
+    `which` from a copied schedule.
+    """
+    section("The module loads where there is no fcntl or pty")
+    here = os.path.dirname(os.path.abspath(__file__))
+    probe = (
+        "import sys\n"
+        "sys.modules['fcntl'] = None\n"       # what a missing module looks like
+        "sys.modules['pty'] = None\n"
+        "sys.path.insert(0, {!r})\n"
+        "import claude_window_timing as ew\n"
+        "sys.platform = 'win32'\n"
+        "print(ew.platform_blocker().message)\n").format(here)
+    result = subprocess.run([sys.executable, "-c", probe],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            universal_newlines=True)
+    check("it imports", result.returncode, 0)
+    check_true("and refuses a switch there in words, not a traceback",
+               "Linux and macOS" in result.stdout)
+
+
 def test_running_sessions_are_looked_for_without_counting_our_own_pings():
     """
     A ping runs the same binary every half hour, so counting them would make the
@@ -12352,6 +12377,7 @@ def main():
                  test_the_suite_never_reaches_a_real_keychain,
                  test_a_login_never_moves_while_claude_code_is_refreshing_it,
                  test_a_claude_code_kept_somewhere_else_is_not_switched,
+                 test_the_module_loads_where_there_is_no_fcntl_or_pty,
                  test_a_machine_that_does_not_ping_is_never_told_to_ping,
                  test_a_machine_can_be_told_it_does_not_ping,
                  test_the_wizard_asks_for_each_sign_in_once_and_no_more,
