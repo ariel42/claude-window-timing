@@ -192,5 +192,6 @@ What this one does instead:
 
 - **Where Claude Code stores its sessions, and the reset times it reports.** Both are internal details a future release could change. The tests would notice, and `doctor` reports what it can verify.
 - **Where Claude Code keeps a login on macOS**: a login Keychain item named `Claude Code-credentials`, plus the first eight hex digits of the SHA-256 of `CLAUDE_CONFIG_DIR` when that is set. Read from Claude Code's source (2.1.238 and 2.1.296) and confirmed against the real binary with fake credentials; a release that changed it would leave `switch` writing an item Claude Code no longer reads.
+- **The locks Claude Code takes around a refresh**: `.oauth_refresh.lock` inside its directory and `.claude.lock` beside it, and `.storage-write.lock` around every save. `switch` holds them while a login moves, so it can never park a token a refresh is in the middle of spending. Read from Claude Code's source (2.1.238 to 2.1.296), and seen made by the real binary.
 - **The 30-minute grid**, checked on every ping as described above.
 - **systemd user timers** on the machine that pings, with lingering enabled so they keep running when you log out.

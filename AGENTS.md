@@ -17,7 +17,7 @@ A tool that keeps Claude Code's 5-hour usage windows running on a schedule — a
 | `install.sh`, `uninstall.sh` | Prerequisite checks, then `setup`; and the teardown. |
 | `docs/` | The design and the user guide. `README.md` is the landing page and stays short. |
 
-Key functions, by path through a ping: `decide_tick` (hold or ping, with its bookkeeping) → `run_interactive` → `turn_outcome` / `classify_turn` (what the run produced) → `record_ping` (what it writes into state) → `maybe_schedule_anchor`. The planner is `plan_slots`, `earliest_slot`, `spacing_plan` and `should_open_window`. A login's credential is reached only through `read_credential`, `write_credential`, `remove_credential` and `has_credential` — a file on Linux, a Keychain item (`keychain_service`) on macOS — and a switch is `switch_account` → `switch_blockers` → `_perform_switch` (`take_login`, `backup_user_login`, `install_login`, `park_login`).
+Key functions, by path through a ping: `decide_tick` (hold or ping, with its bookkeeping) → `run_interactive` → `turn_outcome` / `classify_turn` (what the run produced) → `record_ping` (what it writes into state) → `maybe_schedule_anchor`. The planner is `plan_slots`, `earliest_slot`, `spacing_plan` and `should_open_window`. A login's credential is reached only through `read_credential`, `write_credential`, `remove_credential` and `has_credential` — a file on Linux, a Keychain item (`keychain_service`) on macOS — and a switch is `switch_account` → `switch_blockers` → `_perform_switch`, which holds Claude Code's own refresh locks (`hold_claude_code_locks`) while `_move_logins` runs `take_login`, `backup_user_login`, `install_login` and `park_login`.
 
 ## Running the tests
 

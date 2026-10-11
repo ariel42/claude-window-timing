@@ -6614,6 +6614,91 @@ def acquire_switch_lock():
     return fd
 
 
+# How long a switch waits for Claude Code to finish refreshing the login it is
+# about to move. Claude Code's own refresh gives up on the same lock after five
+# tries one to two seconds apart, so this waits about as long as it would.
+CLAUDE_LOCK_WAIT_SEC = 10
+
+
+def claude_code_locks(login):
+    """
+    The locks Claude Code takes on this login's directory, as (path, seconds
+    after which an untouched one counts as abandoned), in the order it takes
+    them.
+
+    Read from its source (2.1.238, 2.1.295, 2.1.296) and seen made by the real
+    binary: a refresh holds `.oauth_refresh.lock` and, beside the directory,
+    the older `<dir>.lock` for the whole of read, refresh and save; every save
+    of a credential holds `.storage-write.lock`. All three are directories
+    made with mkdir -- proper-lockfile's scheme -- that a live holder touches
+    every few seconds.
+    """
+    directory = login.config_dir
+    return ((os.path.join(directory, ".oauth_refresh.lock"), 60),
+            (os.path.realpath(directory) + ".lock", 60),
+            (os.path.join(directory, ".storage-write.lock"), 15))
+
+
+def hold_claude_code_locks(login):
+    """
+    Take Claude Code's own locks on `login`'s directory. Returns a function
+    that lets them go, or None when Claude Code is holding one and does not
+    let go within CLAUDE_LOCK_WAIT_SEC.
+
+    A refresh reads the refresh token, spends it on a new one, and saves the
+    result. A switch that read the same login in the middle of that would park
+    a token the refresh had just spent, and Claude Code, finding a different
+    login in place when it came to save, would throw the new one away: the
+    outgoing account signed out with no copy of a working login anywhere.
+    Holding the locks Claude Code holds makes the two take turns -- and a
+    refresh that starts after a switch finds the other account's login under
+    the lock, and adopts it instead of refreshing.
+
+    A lock older than its limit belongs to a Claude Code that died: taken
+    over, by the same rule Claude Code applies. Held for well under a second,
+    so it is never touched to keep it fresh.
+    """
+    held = []
+
+    def release():
+        while held:
+            try:
+                os.rmdir(held.pop())
+            except OSError:
+                pass
+
+    # Nothing can be refreshing a login whose directory does not exist.
+    if not os.path.isdir(login.config_dir):
+        return release
+    deadline = time.time() + CLAUDE_LOCK_WAIT_SEC
+    for path, stale in claude_code_locks(login):
+        while True:
+            try:
+                os.mkdir(path)
+                held.append(path)
+                break
+            except FileExistsError:
+                pass
+            except OSError:
+                release()
+                raise
+            try:
+                untouched = time.time() - os.stat(path).st_mtime
+            except OSError:
+                continue                 # let go while we looked: try again
+            if untouched > stale:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+                continue
+            if time.time() >= deadline:
+                release()
+                return None
+            time.sleep(0.2)
+    return release
+
+
 def take_login():
     """
     Read the login now in ~/.claude, to be parked once it has been replaced.
@@ -7229,7 +7314,32 @@ def switch_account(accounts, name=None, sign_in=True):
 
 
 def _perform_switch(account, current, states):
-    """The half of `switch_account` that writes, run under the lock."""
+    """
+    The half of `switch_account` that writes, run under the lock -- and,
+    while a login is moving, under Claude Code's own locks on ~/.claude.
+    """
+    release = hold_claude_code_locks(user_login())
+    if release is None:
+        sys.stderr.write(
+            "Claude Code is refreshing the login in {} right now.\n"
+            "  Moving it in the middle of that could lose it, so this switch "
+            "stops.\n  Nothing was changed. Run it again in a few "
+            "seconds.\n".format(USER_CONFIG_DIR))
+        return 1
+    try:
+        return _move_logins(account, current, states, release)
+    finally:
+        release()
+
+
+def _move_logins(account, current, states, release):
+    """
+    Move the logins, let Claude Code's locks go, then say what happened.
+
+    `release` is called as soon as the outgoing login is parked: everything
+    after that -- opening a held window, a live reading -- can take seconds,
+    and a Claude Code waiting to refresh gives up after about ten.
+    """
     # Read before anything is overwritten: after install_login the outgoing
     # identity is gone from ~/.claude.json, and it is the only way to name the
     # login for someone whose Claude Code was signed in by hand.
@@ -7356,6 +7466,8 @@ def _perform_switch(account, current, states):
             "  {} before switching away again.\n".format(
                 account.display, e, where, restore_hint(current, backup)))
         return 1
+
+    release()                    # both logins are where they belong
 
     print("Switched your Claude Code to account {}.".format(account.display))
     if parked is not None:

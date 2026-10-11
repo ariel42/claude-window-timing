@@ -5738,6 +5738,19 @@ def claude_code_has(login):
     return claude_code_reads(login) is not None
 
 
+def claude_code_refresh_locks(login):
+    """
+    The lock directories Claude Code makes on a config directory, in the
+    order it makes them: for a refresh, `.oauth_refresh.lock` inside it and
+    the older `<dir>.lock` beside it -- both seen made by the real binary
+    (2.1.238) -- and for every save, `.storage-write.lock`.
+    """
+    directory = login.config_dir
+    return [os.path.join(directory, ".oauth_refresh.lock"),
+            os.path.realpath(directory) + ".lock",
+            os.path.join(directory, ".storage-write.lock")]
+
+
 def claude_code_forgets(login):
     """Leave this login with no credential at all, wherever it was kept."""
     if sys.platform == "darwin":
@@ -9381,7 +9394,7 @@ def test_only_one_function_writes_to_the_users_own_files():
               "replace", "remove", "unlink", "rmdir", "rmtree", "symlink",
               "rename", "makedirs", "chmod", "write_text",
               "write_credential", "remove_credential", "_keychain_write",
-              "_keychain_delete"}
+              "_keychain_delete", "hold_claude_code_locks"}
     writers = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
@@ -9398,12 +9411,15 @@ def test_only_one_function_writes_to_the_users_own_files():
             if "USER_CONFIG" in target or "user_login" in target:
                 writers.add(node.name)
 
-    # Two, now, and the second is the first one finishing: a switch killed
+    # The second is the first one finishing: a switch killed
     # between its two writes leaves the credential installed under the previous
     # account's name, and `repair_interrupted_switch` writes the name that was
     # missed. Both run only from `switch`, which is what the README promises.
+    # And the switch itself, for the moment a login moves: it takes Claude
+    # Code's own locks in ~/.claude, and lets them go again.
     check("only the switch and its repair write to the user's own files",
-          sorted(writers), ["install_login", "repair_interrupted_switch"])
+          sorted(writers), ["_perform_switch", "install_login",
+                            "repair_interrupted_switch"])
 
     # Static analysis stops at a variable, so the same claim is made again from
     # the outside: a switch may touch those two files and nothing else under
@@ -10036,6 +10052,111 @@ def test_the_suite_never_reaches_a_real_keychain():
                  if k != "FAKE_SECURITY_DB"))
     check("which refuses to run without a Keychain of its own",
           result.returncode, 1)
+
+
+def test_a_login_never_moves_while_claude_code_is_refreshing_it():
+    """
+    A refresh reads the refresh token, spends it on a new one and saves the
+    result, all under locks of its own. A switch that read the login in the
+    middle would park a token the refresh had just spent, and Claude Code,
+    finding another login in place when it came to save, would throw the new
+    one away -- the outgoing account signed out, no working copy anywhere. So
+    a switch holds the same locks while a login moves, waits for a refresh in
+    progress, and takes over only a lock its holder abandoned.
+    """
+    section("A login never moves while Claude Code is refreshing it")
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    saved = (ew.install_login, ew.CLAUDE_LOCK_WAIT_SEC)
+    try:
+        locks = claude_code_refresh_locks(ew.user_login())
+        real_install = ew.install_login
+        seen = []
+
+        def install_watching(store):
+            seen.append([os.path.isdir(path) for path in locks])
+            return real_install(store)
+
+        real_report = ew.report_live_usage
+        reporting = []
+
+        def report_watching(account):
+            reporting.append([os.path.isdir(path) for path in locks])
+            return real_report(account)
+
+        ew.install_login = install_watching
+        ew.report_live_usage = report_watching
+        try:
+            out, err, code = _capture(lambda: ew.switch_account(
+                accounts, "2", sign_in=False))
+        finally:
+            ew.install_login, ew.report_live_usage = real_install, real_report
+        check("the switch succeeds", code, 0)
+        check("holding every lock Claude Code takes while the login moved",
+              seen, [[True, True, True]])
+        # The reading afterwards can take seconds, and a Claude Code waiting
+        # to refresh gives up after about ten.
+        check("and letting them go before the slow part afterwards",
+              reporting, [[False, False, False]])
+        check("and none of them afterwards",
+              [os.path.isdir(path) for path in locks], [False, False, False])
+
+        # Claude Code refreshing right now: its lock is fresh.
+        ew.CLAUDE_LOCK_WAIT_SEC = 0.5
+        os.mkdir(locks[0])
+        before = _snapshot_user_files()
+        out, err, code = _capture(lambda: ew.switch_account(
+            accounts, "1", sign_in=False))
+        check("a refresh in progress stops the switch", code, 1)
+        check_true("saying why, and that nothing changed",
+                   "refreshing" in err and "Nothing was changed" in err)
+        check("nothing changed", _snapshot_user_files(), before)
+        check("Claude Code's lock is left alone", os.path.isdir(locks[0]), True)
+        check("and nothing of ours is left behind",
+              [os.path.isdir(path) for path in locks[1:]], [False, False])
+
+        # Untouched for twenty seconds is still a refresh in progress: its
+        # holder may be waiting on the network, and Claude Code allows sixty.
+        quiet = time.time() - 20
+        os.utime(locks[0], (quiet, quiet))
+        code = _capture(lambda: ew.switch_account(
+            accounts, "1", sign_in=False))[2]
+        check("a refresh lock quiet for twenty seconds is still respected",
+              code, 1)
+
+        # The same lock, untouched for longer than Claude Code allows: the
+        # Claude Code holding it died.
+        stale = time.time() - 61
+        os.utime(locks[0], (stale, stale))
+        out, err, code = _capture(lambda: ew.switch_account(
+            accounts, "1", sign_in=False))
+        check("a lock abandoned past Claude Code's own limit is taken over",
+              code, 0)
+        check("and gone afterwards", os.path.isdir(locks[0]), False)
+
+        # The save lock is abandoned sooner: fifteen seconds.
+        os.mkdir(locks[2])
+        recent = time.time() - 5
+        os.utime(locks[2], (recent, recent))
+        code = _capture(lambda: ew.switch_account(
+            accounts, "2", sign_in=False))[2]
+        check("a save in progress stops it too", code, 1)
+        stale = time.time() - 16
+        os.utime(locks[2], (stale, stale))
+        code = _capture(lambda: ew.switch_account(
+            accounts, "2", sign_in=False))[2]
+        check("but not one abandoned for longer than a save may take", code, 0)
+
+        # A switch that fails half way still lets go.
+        ew.install_login = lambda store: (_ for _ in ()).throw(
+            IOError("No space left on device"))
+        code = _capture(lambda: ew.switch_account(
+            accounts, "1", sign_in=False))[2]
+        check("a failed switch", code, 1)
+        check("lets every lock go",
+              [os.path.isdir(path) for path in locks], [False, False, False])
+    finally:
+        ew.install_login, ew.CLAUDE_LOCK_WAIT_SEC = saved
+        restore()
 
 
 def test_running_sessions_are_looked_for_without_counting_our_own_pings():
@@ -11916,6 +12037,7 @@ CREDENTIAL_TESTS = (
     test_a_switch_only_machine_knows_which_account_it_is_on,
     test_doctor_on_a_switch_only_machine_reports_only_what_applies,
     test_setup_can_install_the_switcher_without_the_pings,
+    test_a_login_never_moves_while_claude_code_is_refreshing_it,
 )
 
 
@@ -12165,6 +12287,7 @@ def main():
                  test_sessions_are_found_where_there_is_no_proc,
                  test_the_keychain_commands_it_gives_do_what_they_say,
                  test_the_suite_never_reaches_a_real_keychain,
+                 test_a_login_never_moves_while_claude_code_is_refreshing_it,
                  test_a_machine_that_does_not_ping_is_never_told_to_ping,
                  test_a_machine_can_be_told_it_does_not_ping,
                  test_the_wizard_asks_for_each_sign_in_once_and_no_more,
