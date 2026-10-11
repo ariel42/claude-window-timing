@@ -29,6 +29,9 @@ import sys
 import tempfile
 import time
 import traceback
+import hashlib
+import unicodedata
+from shlex import quote as shlex_quote
 import email.utils
 from datetime import datetime, timedelta
 
@@ -37,6 +40,10 @@ import claude_window_timing as ew
 
 
 FAILURES = []
+
+# Set while the credential tests run a second time playing the other platform,
+# so that a failure there says which pass it came from.
+PLAYING = ""
 
 
 def stamp_checkpoint(account):
@@ -107,7 +114,7 @@ def check(name, got, want):
         print("  PASS  {}".format(name))
     else:
         print("  FAIL  {}\n          got  {!r}\n          want {!r}".format(name, got, want))
-        FAILURES.append(name)
+        FAILURES.append(name + PLAYING)
 
 
 def check_true(name, cond):
@@ -2622,9 +2629,9 @@ def test_a_reading_taken_a_moment_ago_is_not_taken_again():
         # as a fault against an account whose pings were all fine. Claude Code
         # renews it on its first request; this tool must not refresh it itself.
         del taken[:]
-        with open(ew.credentials_path(account), "w") as f:
-            json.dump({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r",
-                                         "expiresAt": int((now - 3600) * 1000)}}, f)
+        claude_code_saves(account, json.dumps({"claudeAiOauth": {
+            "accessToken": "t", "refreshToken": "r",
+            "expiresAt": int((now - 3600) * 1000)}}))
         ew.write_state(account, {"last_run": now - 300, "available_at": now - 300,
                                  "rate_limits": {"five_hour": {
                                      "used_percentage": 3,
@@ -2637,9 +2644,9 @@ def test_a_reading_taken_a_moment_ago_is_not_taken_again():
               ew.read_state(account).get("live_problem"), None)
         check("the stored figures come back", got["five_hour"]["used_percentage"], 3)
 
-        with open(ew.credentials_path(account), "w") as f:
-            json.dump({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r",
-                                         "expiresAt": int((now + 3600) * 1000)}}, f)
+        claude_code_saves(account, json.dumps({"claudeAiOauth": {
+            "accessToken": "t", "refreshToken": "r",
+            "expiresAt": int((now + 3600) * 1000)}}))
         ew.take_reading(account, now=now)
         check("one still valid is asked with", taken, ["1"])
     finally:
@@ -4135,10 +4142,9 @@ def test_a_window_that_ended_early_is_believed_and_planned_from():
             os.makedirs(account.config_dir, 0o700)
             with open(account.config_json, "w") as f:
                 json.dump({"oauthAccount": {"accountUuid": "u" + account.name}}, f)
-            with open(ew.credentials_path(account), "w") as f:
-                json.dump({"claudeAiOauth": {"accessToken": "t",
-                                             "refreshToken": "r",
-                                             "subscriptionType": "pro"}}, f)
+            claude_code_saves(account, json.dumps({"claudeAiOauth": {
+                "accessToken": "t", "refreshToken": "r",
+                "subscriptionType": "pro"}}))
         now = time.time()
         slot = ew.slot_start(now)
         # B is three slots into a window it has spent.
@@ -5635,6 +5641,113 @@ def test_doctor_notices_a_deployment_going_wrong():
 FAKE_CLAUDE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "fake_claude.py")
 
+# And the Keychain's command-line tool, for the same reason and one more: on a
+# Mac the real one holds the developer's live login. main() points the tool at
+# this before any test runs.
+FAKE_SECURITY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "fake_security.py")
+
+
+# -- Claude Code's side of the credential ------------------------------------
+#
+# Where real Claude Code keeps a login, written out here on Claude's side of
+# the line, independently of the tool -- as _World plays Claude's servers. The
+# fixtures sign in through it and the invariant checks read through it, so a
+# tool that filed a login somewhere Claude Code does not look fails here
+# instead of agreeing with itself. The naming rule is pinned to an item
+# observed on a real Mac by test_the_keychain_item_is_the_one_claude_code_reads.
+
+def fake_keychain():
+    """
+    The stand-in Keychain of whichever home the tool is pointed at.
+
+    A login Keychain belongs to a home, like the ~/.claude beside it, and the
+    tests build many homes. One file for the whole suite let a login one test
+    installed answer for the next test's user.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(ew.USER_CONFIG_DIR)),
+                        "Library", "Keychains", "fake-login.json")
+
+
+def claude_code_service(config_dir, own=False):
+    """
+    The Keychain service Claude Code uses: the plain name when run without
+    CLAUDE_CONFIG_DIR (`own`), else that name, "-", and the first eight hex
+    digits of the SHA-256 of the variable's exact value, NFC-normalised.
+    """
+    if own:
+        return "Claude Code-credentials"
+    return "Claude Code-credentials-" + hashlib.sha256(
+        unicodedata.normalize("NFC", config_dir).encode("utf-8")
+    ).hexdigest()[:8]
+
+
+def _claude_code_security(*args, **kwargs):
+    return subprocess.run(
+        [FAKE_SECURITY] + list(args), input=kwargs.get("stdin", ""),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True,
+        env=dict(os.environ, FAKE_SECURITY_DB=fake_keychain()))
+
+
+def _own(login):
+    return os.path.abspath(login.config_dir) == os.path.abspath(
+        ew.USER_CONFIG_DIR)
+
+
+def claude_code_saves(login, text):
+    """
+    Save a credential the way Claude Code does on the platform being played:
+    a file on Linux; on macOS a Keychain item, written with `security -i` and
+    hex, exactly as its own source does it.
+    """
+    if sys.platform != "darwin":
+        os.makedirs(login.config_dir, 0o700, exist_ok=True)
+        with open(os.path.join(login.config_dir, ".credentials.json"), "w") as f:
+            f.write(text)
+        return
+    result = _claude_code_security("-i", stdin='add-generic-password -U -a '
+                                   '"{}" -s "{}" -X "{}"\n'.format(
+                                       os.environ.get("USER", ""),
+                                       claude_code_service(login.config_dir,
+                                                           _own(login)),
+                                       text.encode("utf-8").hex()))
+    assert result.returncode == 0, result.stderr
+
+
+def claude_code_reads(login):
+    """
+    The credential Claude Code would use for this login, or None: on macOS the
+    Keychain item, falling back to the file only when there is no item.
+    """
+    if sys.platform == "darwin":
+        # In Claude Code's own order: -w between the two names.
+        result = _claude_code_security(
+            "find-generic-password", "-a", os.environ.get("USER", ""), "-w",
+            "-s", claude_code_service(login.config_dir, _own(login)))
+        if result.returncode == 0:
+            return result.stdout[:-1]
+    path = os.path.join(login.config_dir, ".credentials.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return f.read()
+    return None
+
+
+def claude_code_has(login):
+    return claude_code_reads(login) is not None
+
+
+def claude_code_forgets(login):
+    """Leave this login with no credential at all, wherever it was kept."""
+    if sys.platform == "darwin":
+        _claude_code_security(
+            "delete-generic-password", "-a", os.environ.get("USER", ""),
+            "-s", claude_code_service(login.config_dir, _own(login)))
+    path = os.path.join(login.config_dir, ".credentials.json")
+    if os.path.exists(path):
+        os.remove(path)
+
 
 def _clean_install(answers, accounts=2, claude_control=None,
                    home=None, repo=None, after=None, setup_kwargs=None):
@@ -6889,9 +7002,18 @@ def _tree_snapshot(root):
     return out
 
 
+class _NotHere(Exception):
+    """Raised to skip the rest of a block that does not apply to this store."""
+
+
 def _snapshot_user_files():
-    """The two files a switch is allowed to rewrite, exactly as they are now."""
-    out = {}
+    """
+    The two things a switch is allowed to rewrite, exactly as they are now:
+    the live credential -- as Claude Code reads it, which on macOS is the
+    Keychain -- and ~/.claude.json. The credential file is kept as well, so
+    that one written beside a Keychain item still shows up.
+    """
+    out = {"credential Claude Code reads": claude_code_reads(ew.user_login())}
     for path in (ew.credentials_path(ew.user_login()), ew.USER_CONFIG_JSON):
         if os.path.exists(path):
             with open(path, "rb") as f:
@@ -6936,14 +7058,16 @@ def _switch_sandbox(names=("1", "2"), signed_in_as=None, parked=(), now=None,
                     refresh_expires=None, extra=None):
         if not os.path.isdir(directory):
             os.makedirs(directory, 0o700)
-        with open(os.path.join(directory, ".credentials.json"), "w") as f:
-            json.dump({"claudeAiOauth": {
-                "accessToken": "access-" + refresh,
-                "refreshToken": refresh,
-                "subscriptionType": "pro",
-                "refreshTokenExpiresAt": int(
-                    (refresh_expires if refresh_expires is not None
-                     else now + 30 * 86400) * 1000)}}, f)
+        # Signed in the way Claude Code signs in on the platform being played:
+        # a file on Linux, a Keychain item on macOS.
+        claude_code_saves(ew.Login("fixture", directory, config_json),
+                          json.dumps({"claudeAiOauth": {
+                              "accessToken": "access-" + refresh,
+                              "refreshToken": refresh,
+                              "subscriptionType": "pro",
+                              "refreshTokenExpiresAt": int(
+                                  (refresh_expires if refresh_expires is not None
+                                   else now + 30 * 86400) * 1000)}}))
         config = {"oauthAccount": {"accountUuid": uuid_, "emailAddress": email}}
         config.update(extra or {})
         directory_of = os.path.dirname(config_json)
@@ -6984,9 +7108,9 @@ def _switch_sandbox(names=("1", "2"), signed_in_as=None, parked=(), now=None,
     return restore, home, accounts
 
 
-def _creds(path):
-    with open(path) as f:
-        return json.load(f)["claudeAiOauth"]
+def _creds(login):
+    """The credential Claude Code would use for this login, parsed."""
+    return json.loads(claude_code_reads(login))["claudeAiOauth"]
 
 
 def test_a_login_is_never_in_two_places_at_once():
@@ -7003,14 +7127,14 @@ def test_a_login_is_never_in_two_places_at_once():
 
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
     try:
-        before = _creds(os.path.join(ew.USER_CONFIG_DIR, ".credentials.json"))
+        before = _creds(ew.user_login())
         code = ew.switch_account(accounts, "2")
         check("switching to a parked account succeeds", code, 0)
 
-        live = _creds(os.path.join(ew.USER_CONFIG_DIR, ".credentials.json"))
+        live = _creds(ew.user_login())
         store1 = ew.switch_store(accounts[0])
         store2 = ew.switch_store(accounts[1])
-        parked1 = _creds(ew.credentials_path(store1))
+        parked1 = _creds(store1)
 
         check("the incoming login is now live", live["refreshToken"],
               "parked-refresh-2")
@@ -7020,26 +7144,26 @@ def test_a_login_is_never_in_two_places_at_once():
               json.load(open(store1.config_json))["oauthAccount"]["accountUuid"],
               "uuid-1")
 
-        # The heart of it: no refresh token appears in two live places.
+        # The heart of it: no refresh token appears in two live places -- as
+        # Claude Code would find them, which on macOS means the Keychain.
         holders = {}
-        for label, path in (("live", ew.credentials_path(ew.user_login())),
-                            ("store 1", ew.credentials_path(store1)),
-                            ("store 2", ew.credentials_path(store2)),
-                            ("ping 1", ew.credentials_path(accounts[0])),
-                            ("ping 2", ew.credentials_path(accounts[1]))):
-            if os.path.exists(path):
-                holders.setdefault(_creds(path)["refreshToken"], []).append(label)
+        for label, login in (("live", ew.user_login()),
+                             ("store 1", store1), ("store 2", store2),
+                             ("ping 1", accounts[0]), ("ping 2", accounts[1])):
+            if claude_code_has(login):
+                holders.setdefault(_creds(login)["refreshToken"],
+                                   []).append(label)
         duplicated = {token: where for token, where in holders.items()
                       if len(where) > 1}
         check("no login is held in two places after a switch", duplicated, {})
 
         # Switching back must park the other one, symmetrically.
         ew.switch_account(accounts, "1")
-        live = _creds(ew.credentials_path(ew.user_login()))
+        live = _creds(ew.user_login())
         check("switching back restores the parked login",
               live["refreshToken"], before["refreshToken"])
         check("and parks the one that was live",
-              _creds(ew.credentials_path(store2))["refreshToken"],
+              _creds(store2)["refreshToken"],
               "parked-refresh-2")
     finally:
         restore()
@@ -7092,8 +7216,7 @@ def test_an_interrupted_switch_never_leaves_a_login_in_two_places():
     try:
         store = ew.switch_store(accounts[0])
         ew.secure_dir(store.config_dir)          # 0700, or the mode check fires too
-        shutil.copyfile(ew.credentials_path(ew.user_login()),
-                        ew.credentials_path(store))
+        claude_code_saves(store, claude_code_reads(ew.user_login()))
         findings = ew.switch_findings(accounts)
         errors = [f for f in findings if f.level == "error"]
         check("a store holding the live login is an error", len(errors), 1)
@@ -7111,7 +7234,7 @@ def test_an_interrupted_switch_never_leaves_a_login_in_two_places():
     try:
         first = ew.switch_store(accounts[0])
         second = ew.switch_store(accounts[1])
-        shutil.copyfile(ew.credentials_path(first), ew.credentials_path(second))
+        claude_code_saves(second, claude_code_reads(first))
         errors = [f for f in ew.switch_findings(accounts)
                   if f.level == "error" and "same login parked" in f.message]
         check("one login in two stores is an error", len(errors), 1)
@@ -7464,7 +7587,7 @@ def test_a_live_reading_beats_a_cached_one():
             ew.ACCOUNTS_FILE = saved_accounts
 
         # No token, no request: an unconfigured account must not be asked about.
-        os.remove(ew.credentials_path(accounts[1]))
+        claude_code_forgets(accounts[1])
         ew.urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("asked Claude about an account with no login"))
         limits, problem = ew.read_live_limits(accounts[1])
@@ -7809,8 +7932,7 @@ def test_the_refusals_fire_where_the_readme_says_to_switch():
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
     try:
         store = ew.switch_store(accounts[1])
-        shutil.copyfile(ew.credentials_path(ew.user_login()),
-                        ew.credentials_path(store))
+        claude_code_saves(store, claude_code_reads(ew.user_login()))
         out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
                                                             sign_in=False))
         check("a copy of the live login is refused by switch, not just doctor",
@@ -7822,25 +7944,39 @@ def test_the_refusals_fire_where_the_readme_says_to_switch():
 
 def test_switching_refuses_where_it_cannot_work():
     """
-    macOS keeps the credential in the Keychain, so a switch there writes a file
-    Claude Code does not read -- and takes the store's only copy of that login
-    on the way, leaving the user on the account they started with and one
-    browser sign-in worse off. The README always said unsupported; nothing
-    enforced it, and --no-pings installs cleanly there because it needs neither
-    systemd nor a timer.
+    A switch that does not know where Claude Code keeps its login moves
+    something Claude Code never reads -- and takes the store's only copy of
+    that login on the way, leaving the user on the account they started with
+    and one browser sign-in worse off. Linux keeps it in a file and macOS in
+    the Keychain, and both are handled; anywhere else is refused, and so is a
+    Mac without the tool every Keychain operation goes through. --no-pings
+    installs cleanly everywhere, so this has to be enforced.
     """
     section("Switching refuses where it cannot work")
 
-    check("nothing blocks it on Linux", ew.platform_blocker(), None)
-
-    saved = sys.platform
+    saved = (sys.platform, ew.SECURITY_PATH)
     try:
+        sys.platform = "linux"
+        check("nothing blocks it on Linux", ew.platform_blocker(), None)
         sys.platform = "darwin"
+        check("nor on macOS, with `security` to reach the Keychain",
+              ew.platform_blocker(), None)
+
+        ew.SECURITY_PATH = os.path.join(tempfile.mkdtemp(), "no-security")
         blocker = ew.platform_blocker()
-        check_true("but macOS is refused", blocker is not None)
-        check_true("naming the platform", "darwin" in blocker.message)
-        check_true("and saying why the file would not be read",
-                   "Keychain" in blocker.hint)
+        check_true("but a Mac without it is refused", blocker is not None)
+        check_true("naming what is missing",
+                   ew.SECURITY_PATH in blocker.message)
+        ew.SECURITY_PATH = saved[1]
+
+        sys.platform = "win32"
+        blocker = ew.platform_blocker()
+        check_true("and so is Windows", blocker is not None)
+        check_true("naming the platform", "win32" in blocker.message)
+        check_true("and the two that do work",
+                   "Linux" in blocker.message and "macOS" in blocker.message)
+        check_true("and saying what refusing saves",
+                   "consume the parked login" in blocker.hint)
 
         restore, home, accounts = _switch_sandbox(signed_in_as="1",
                                                   parked=("2",))
@@ -7851,12 +7987,11 @@ def test_switching_refuses_where_it_cannot_work():
             check("the switch refuses rather than consuming the login", code, 1)
             check("nothing was written", _snapshot_user_files(), before)
             check("and the parked login is still parked",
-                  os.path.exists(ew.credentials_path(
-                      ew.switch_store(accounts[1]))), True)
+                  claude_code_has(ew.switch_store(accounts[1])), True)
         finally:
             restore()
     finally:
-        sys.platform = saved
+        sys.platform, ew.SECURITY_PATH = saved
 
 
 def test_an_override_is_reported_before_anything_reassuring():
@@ -8022,7 +8157,7 @@ def test_the_mutation_path_is_hardened():
     # -- every refusal precedes every write ---------------------------------
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
     try:
-        before = open(ew.credentials_path(ew.user_login())).read()
+        before = claude_code_reads(ew.user_login())
         with open(ew.USER_CONFIG_JSON, "w") as f:
             f.write('{"projects": {"broken')
         raised = None
@@ -8032,9 +8167,9 @@ def test_the_mutation_path_is_hardened():
             raised = str(exc)
         check_true("install_login refuses an unreadable config", raised)
         check("and the credential was NOT swapped first",
-              open(ew.credentials_path(ew.user_login())).read(), before)
+              claude_code_reads(ew.user_login()), before)
         check("the parked login is still in its store",
-              os.path.exists(ew.credentials_path(ew.switch_store(accounts[1]))),
+              claude_code_has(ew.switch_store(accounts[1])),
               True)
     finally:
         restore()
@@ -8065,7 +8200,7 @@ def test_the_mutation_path_is_hardened():
                                   "emailAddress": "who@example.com"}
         with open(ew.USER_CONFIG_JSON, "w") as f:
             json.dump(config, f)
-        stranded = open(ew.credentials_path(ew.user_login())).read()
+        stranded = claude_code_reads(ew.user_login())
 
         out, _, code = _capture(lambda: ew.switch_account(accounts, "2",
                                                           sign_in=False))
@@ -8154,8 +8289,12 @@ def test_a_failure_mid_switch_is_a_sentence_not_a_traceback():
         check_true("saying the switch did happen", "Switched to account" in err)
         check_true("that the old login is only in the backup",
                    "only in the backup" in err)
+        # Where Claude Code will look for it: the store's directory, or on
+        # macOS the Keychain item named after it.
+        store = ew.switch_store(accounts[0])
         check_true("and where to put it back",
-                   ew.switch_store(accounts[0]).config_dir in err)
+                   (claude_code_service(store.config_dir)
+                    if sys.platform == "darwin" else store.config_dir) in err)
         check("the switch really did land",
               ew.account_identity(ew.user_login())["email"], "a2@example.com")
     finally:
@@ -8223,11 +8362,10 @@ def test_switching_refuses_what_cannot_possibly_work():
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
     try:
         store = ew.switch_store(accounts[1])
-        creds = json.load(open(ew.credentials_path(store)))
+        creds = json.loads(claude_code_reads(store))
         creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
             (time.time() - 86400) * 1000)
-        with open(ew.credentials_path(store), "w") as f:
-            json.dump(creds, f)
+        claude_code_saves(store, json.dumps(creds))
         before = _snapshot_user_files()
         out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
         check("an expired parked login is refused", code, 1)
@@ -8241,8 +8379,7 @@ def test_switching_refuses_what_cannot_possibly_work():
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
     try:
         store = ew.switch_store(accounts[1])
-        shutil.copyfile(ew.credentials_path(accounts[1]),
-                        ew.credentials_path(store))
+        claude_code_saves(store, claude_code_reads(accounts[1]))
         before = _snapshot_user_files()
         out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
         check("a parked login copied from the ping directory is refused", code, 1)
@@ -8286,7 +8423,7 @@ def test_switching_refuses_what_cannot_possibly_work():
               open(ew.USER_CONFIG_JSON).read(), damaged)
         check("the credential was not swapped either",
               ew.account_identity(ew.user_login())["has_token"] and
-              json.load(open(ew.credentials_path(ew.user_login())))
+              json.loads(claude_code_reads(ew.user_login()))
               ["claudeAiOauth"]["refreshToken"], "live-refresh-1")
 
         # And the write itself refuses, so no other caller can reach it.
@@ -8372,9 +8509,13 @@ def test_switching_says_what_it_will_and_will_not_fix():
         restore()
 
     # A symlink at the credentials path is replaced, and the user is told why
-    # that is not this tool's doing.
+    # that is not this tool's doing. Only where the credential is a file: on
+    # macOS it is the Keychain item that is replaced, and what happens to a
+    # file beside one is test_a_plaintext_login_beside_the_keychain_is_never_lost.
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
     try:
+        if sys.platform == "darwin":
+            raise _NotHere()
         target = ew.credentials_path(ew.user_login())
         elsewhere = os.path.join(home, "elsewhere.json")
         shutil.move(target, elsewhere)
@@ -8387,6 +8528,8 @@ def test_switching_says_what_it_will_and_will_not_fix():
               os.path.islink(target), False)
         check("and the file it pointed at is untouched",
               open(elsewhere).read(), keep)
+    except _NotHere:
+        pass
     finally:
         restore()
 
@@ -8508,12 +8651,10 @@ def test_a_dead_login_in_the_way_is_set_aside_not_refused():
                                               parked=("1", "2"))
     try:
         store = ew.switch_store(accounts[0])
-        with open(ew.credentials_path(store)) as f:
-            creds = json.load(f)
+        creds = json.loads(claude_code_reads(store))
         creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
             (time.time() - 86400) * 1000)
-        with open(ew.credentials_path(store), "w") as f:
-            json.dump(creds, f)
+        claude_code_saves(store, json.dumps(creds))
         dead = ew.login_fingerprint(store)
         mine = ew.login_fingerprint(ew.user_login())
         check_true("the fixture: a different, expired login in the way",
@@ -8623,7 +8764,7 @@ def test_parking_never_writes_over_a_login_that_is_already_there():
         # And parking the *same* login back where it came from is not a
         # conflict -- that is an ordinary repeat, and refusing it would break
         # re-running a switch that half happened.
-        again = (open(ew.credentials_path(store)).read(),
+        again = (claude_code_reads(store),
                  {"accountUuid": "uuid-1"})
         ew.park_login(accounts[0], again)
         check("re-parking the same login is allowed",
@@ -8648,7 +8789,7 @@ def test_a_switch_says_what_the_account_it_moved_to_actually_has_left():
         asked = []
         ew.probe_is_safe = lambda state, when: True
         ew.read_live_limits = lambda login: (
-            asked.append(ew.credentials_path(login))
+            asked.append(login.config_dir)
             or ({"five_hour": {"used_percentage": 30, "resets_at": now + 3600},
                  "seven_day": {"used_percentage": 45,
                                "resets_at": now + 4 * 86400}}, None))
@@ -8661,7 +8802,7 @@ def test_a_switch_says_what_the_account_it_moved_to_actually_has_left():
         check_true("and the weekly limit beside it",
                    "Weekly limit: 45% used." in out)
         check("read with the login it just installed, not a ping directory",
-              asked, [ew.credentials_path(ew.user_login())])
+              asked, [ew.USER_CONFIG_DIR])
         check("and the reading is kept as that account's own",
               ew.read_state(accounts[1]).get("limits_source"), "live")
 
@@ -8792,14 +8933,20 @@ def test_a_switch_killed_between_its_two_writes_is_finished_not_believed():
     # The marker must not then claim a repair is needed.
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
     try:
-        def fail_on_the_credential(path, body, mode=0o600):
-            if path == ew.credentials_path(ew.user_login()):
-                raise IOError("No space left on device")
-            return real_write(path, body, mode)
+        # The credential is the first write, on either platform: a file on
+        # Linux, the Keychain item on macOS.
+        real_write_credential = ew.write_credential
 
-        ew._write_atomically = fail_on_the_credential
-        _capture(lambda: ew.switch_account(accounts, "2", sign_in=False))
-        ew._write_atomically = real_write
+        def fail_on_the_credential(login, text):
+            if login.config_dir == ew.USER_CONFIG_DIR:
+                raise IOError("No space left on device")
+            return real_write_credential(login, text)
+
+        ew.write_credential = fail_on_the_credential
+        try:
+            _capture(lambda: ew.switch_account(accounts, "2", sign_in=False))
+        finally:
+            ew.write_credential = real_write_credential
 
         check_true("a marker is left either way", os.path.exists(ew.switch_marker()))
         out, err, code = _capture(lambda: ew.switch_account(accounts, "2",
@@ -8942,7 +9089,7 @@ def test_a_switch_backs_up_what_it_replaces():
 
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
     try:
-        before_creds = open(ew.credentials_path(ew.user_login())).read()
+        before_creds = claude_code_reads(ew.user_login())
         before_config = open(ew.USER_CONFIG_JSON).read()
         ew.switch_account(accounts, "2")
 
@@ -8985,9 +9132,9 @@ def test_nothing_after_the_swap_turns_a_switch_into_a_traceback():
     try:
         # Signed in as somebody this tool does not configure.
         os.makedirs(ew.USER_CONFIG_DIR, 0o700)
-        with open(ew.credentials_path(ew.user_login()), "w") as f:
-            json.dump({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r",
-                                         "subscriptionType": "pro"}}, f)
+        claude_code_saves(ew.user_login(), json.dumps({"claudeAiOauth": {
+            "accessToken": "a", "refreshToken": "r",
+            "subscriptionType": "pro"}}))
         with open(ew.USER_CONFIG_JSON, "w") as f:
             json.dump({"oauthAccount": {"accountUuid": "uuid-stranger",
                                         "emailAddress": "who@example.com"}}, f)
@@ -9026,7 +9173,7 @@ def test_an_unknown_login_is_backed_up_rather_than_lost():
                                   "emailAddress": "who@example.com"}
         with open(ew.USER_CONFIG_JSON, "w") as f:
             json.dump(config, f)
-        keep = open(ew.credentials_path(ew.user_login())).read()
+        keep = claude_code_reads(ew.user_login())
 
         out, err, code = _capture(lambda: ew.switch_account(accounts, "2"))
         check("the switch still happens", code, 0)
@@ -9038,7 +9185,7 @@ def test_an_unknown_login_is_backed_up_rather_than_lost():
         check("the stranded login is in the backup",
               open(os.path.join(backups, stamp, "credentials.json")).read(), keep)
         check("and was not filed under an account it does not belong to",
-              os.path.exists(ew.credentials_path(ew.switch_store(accounts[0]))),
+              claude_code_has(ew.switch_store(accounts[0])),
               False)
     finally:
         restore()
@@ -9089,7 +9236,7 @@ def test_being_asked_to_log_in_is_not_always_a_login_problem():
 
         # And with no login at all, being asked for one is the right answer.
         with_flag(False)
-        os.remove(ew.credentials_path(ew.user_login()))
+        claude_code_forgets(ew.user_login())
         check("with no credential, nothing here second-guesses the prompt",
               ew.onboarding_pending(), False)
 
@@ -9153,11 +9300,10 @@ def test_doctor_notices_a_store_going_stale():
         shutil.rmtree(ew.switch_store(accounts[0]).config_dir)
 
         store = ew.switch_store(accounts[1])
-        creds = json.load(open(ew.credentials_path(store)))
+        creds = json.loads(claude_code_reads(store))
         creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
             (time.time() - 3600) * 1000)
-        with open(ew.credentials_path(store), "w") as f:
-            json.dump(creds, f)
+        claude_code_saves(store, json.dumps(creds))
         findings = ew.switch_findings(accounts)
         check("an expired parked login is an error",
               [f.level for f in findings], ["error"])
@@ -9165,8 +9311,7 @@ def test_doctor_notices_a_store_going_stale():
 
         creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
             (time.time() + 2 * 86400) * 1000)
-        with open(ew.credentials_path(store), "w") as f:
-            json.dump(creds, f)
+        claude_code_saves(store, json.dumps(creds))
         findings = ew.switch_findings(accounts)
         check("one about to expire is a warning", [f.level for f in findings],
               ["warning"])
@@ -9178,13 +9323,11 @@ def test_doctor_notices_a_store_going_stale():
         creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
             (time.time() + 30 * 86400) * 1000)
         creds["claudeAiOauth"]["scopes"] = list(ew.FULL_LOGIN_SCOPES)
-        with open(ew.credentials_path(store), "w") as f:
-            json.dump(creds, f)
+        claude_code_saves(store, json.dumps(creds))
         check("a full-scope login is not a finding", ew.switch_findings(accounts), [])
 
         creds["claudeAiOauth"]["scopes"] = ["user:inference"]
-        with open(ew.credentials_path(store), "w") as f:
-            json.dump(creds, f)
+        claude_code_saves(store, json.dumps(creds))
         findings = ew.switch_findings(accounts)
         check("a narrowed one is a warning", [f.level for f in findings],
               ["warning"])
@@ -9196,16 +9339,13 @@ def test_doctor_notices_a_store_going_stale():
         # Older credential files record no scopes at all; silence beats a
         # warning invented from missing data.
         del creds["claudeAiOauth"]["scopes"]
-        with open(ew.credentials_path(store), "w") as f:
-            json.dump(creds, f)
+        claude_code_saves(store, json.dumps(creds))
         check("a file that records no scopes says nothing",
               ew.switch_findings(accounts), [])
         creds["claudeAiOauth"]["scopes"] = list(ew.FULL_LOGIN_SCOPES)
-        with open(ew.credentials_path(store), "w") as f:
-            json.dump(creds, f)
+        claude_code_saves(store, json.dumps(creds))
 
-        shutil.copyfile(ew.credentials_path(accounts[1]),
-                        ew.credentials_path(store))
+        claude_code_saves(store, claude_code_reads(accounts[1]))
         levels = [f.level for f in ew.switch_findings(accounts)]
         check("a copied login is an error", levels, ["error"])
     finally:
@@ -9235,9 +9375,13 @@ def test_only_one_function_writes_to_the_users_own_files():
     source = open(os.path.join(here, "claude_window_timing.py")).read()
     tree = ast.parse(source)
 
+    # The credential's own writers too: on macOS install_login writes the
+    # user's Keychain item rather than a file.
     writes = {"_write_atomically", "copyfile", "copy", "copy2", "copytree",
               "replace", "remove", "unlink", "rmdir", "rmtree", "symlink",
-              "rename", "makedirs", "chmod", "write_text"}
+              "rename", "makedirs", "chmod", "write_text",
+              "write_credential", "remove_credential", "_keychain_write",
+              "_keychain_delete"}
     writers = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
@@ -9279,8 +9423,12 @@ def test_only_one_function_writes_to_the_users_own_files():
 
         changed = sorted(k for k in set(before) | set(after)
                          if before.get(k) != after.get(k))
-        check("a switch changes exactly one file inside ~/.claude",
-              changed, [os.path.join(ew.USER_CONFIG_DIR, ".credentials.json")])
+        # On macOS not even that one: the credential is in the Keychain.
+        check("a switch changes at most the credential inside ~/.claude",
+              changed, [] if sys.platform == "darwin" else
+              [os.path.join(ew.USER_CONFIG_DIR, ".credentials.json")])
+        check("and the login Claude Code reads is the one switched to",
+              _creds(ew.user_login())["refreshToken"], "parked-refresh-2")
         check("the user's conversation is untouched",
               after[os.path.join(ew.USER_CONFIG_DIR, "projects", "mine",
                                  "a.jsonl")], b'{"type":"user"}\n')
@@ -9288,11 +9436,606 @@ def test_only_one_function_writes_to_the_users_own_files():
               json.loads(after[os.path.join(ew.USER_CONFIG_DIR,
                                             "settings.json")].decode()),
               {"theme": "dark"})
-        check("the installed credential is not world-readable",
-              oct(stat.S_IMODE(os.stat(
-                  ew.credentials_path(ew.user_login())).st_mode)), "0o600")
+        if sys.platform != "darwin":
+            check("the installed credential is not world-readable",
+                  oct(stat.S_IMODE(os.stat(
+                      ew.credentials_path(ew.user_login())).st_mode)), "0o600")
     finally:
         restore()
+
+
+def _keychain_log():
+    """What has been asked of this home's stand-in Keychain, oldest first."""
+    try:
+        with open(fake_keychain()) as f:
+            return json.load(f).get("log", [])
+    except (IOError, OSError, ValueError):
+        return []
+
+
+def _keychain_items():
+    """Every item in this home's stand-in Keychain, as {service: data}."""
+    try:
+        with open(fake_keychain()) as f:
+            items = json.load(f).get("items", {})
+    except (IOError, OSError, ValueError):
+        return {}
+    return {key.split("\t", 1)[1]: data for key, data in items.items()}
+
+
+def _keychain_misbehaves(**how):
+    """Make this home's stand-in Keychain fail, or stop failing, on purpose."""
+    path = fake_keychain()
+    with open(path) as f:
+        db = json.load(f)
+    for key, value in how.items():
+        if value is None:
+            db.pop(key, None)
+        else:
+            db[key] = value
+    with open(path, "w") as f:
+        json.dump(db, f)
+
+
+def _plaintext_credentials(*roots):
+    """Every .credentials.json under these directories, outside .backups and
+    .orphaned -- the places a login is kept on purpose, as a file."""
+    found = []
+    for root in roots:
+        for directory, subdirs, files in os.walk(root):
+            subdirs[:] = [d for d in subdirs if d not in (".backups", ".orphaned")]
+            if ".credentials.json" in files:
+                found.append(os.path.join(directory, ".credentials.json"))
+    return sorted(found)
+
+
+def test_the_keychain_item_is_the_one_claude_code_reads():
+    """
+    On macOS a login is a Keychain item found by name, and a name one character
+    off is a login Claude Code never reads: a switch that wrote there would
+    report success and change nothing, having consumed the parked login on the
+    way. The rule is Claude Code's own, read from its source; the pair pinned
+    here was then observed with the real binary (2.1.238, macOS 26.5), by
+    writing a fake credential under the computed name and asking `claude auth
+    status` which login it saw.
+    """
+    section("The Keychain item is the one Claude Code reads")
+
+    # Observed: with CLAUDE_CONFIG_DIR=/tmp/claude-window-probe, Claude Code
+    # read this item; with a trailing slash it did not read it at all.
+    probe, observed = "/tmp/claude-window-probe", "Claude Code-credentials-cf2bd579"
+    check("the model of Claude Code's rule matches what it was seen to read",
+          claude_code_service(probe), observed)
+    check("and so does the tool",
+          ew.keychain_service(ew.Login("probe", probe,
+                                       probe + "/.claude.json")), observed)
+    check_true("a trailing slash is a different item, as it was seen to be",
+               ew.keychain_service(ew.Login("probe", probe + "/",
+                                            probe + "/.claude.json")) != observed)
+    # And Claude Code run without CLAUDE_CONFIG_DIR: seen on the same Mac as
+    # the item holding the live login, filed under the user's name.
+    check("your own Claude Code uses the plain name",
+          ew.keychain_service(ew.user_login()), "Claude Code-credentials")
+
+    # The tool hashes exactly the string it hands Claude Code, wherever it
+    # hands one over: the sign-in it prints, and every ping it runs.
+    store = ew.switch_store(ew.Account("2", "/nowhere/.claude-2", 1))
+    printed = ew.sign_in_command(store).split()[0].split("=", 1)[1]
+    check("a store's item is named from the directory its sign-in names",
+          ew.keychain_service(store), claude_code_service(printed))
+    account = ew.Account("1", os.path.join(ew.HOME, ".claude-1"), 0)
+    handed = ew.build_claude_env(account)["CLAUDE_CONFIG_DIR"]
+    check("and a ping directory's from the one its pings are given",
+          ew.keychain_service(account), claude_code_service(handed))
+
+    # Normalised the way Claude Code normalises: a name typed one way and
+    # stored another is still one directory to it.
+    composed = "/Users/zoé/.claude-switch/2"
+    decomposed = unicodedata.normalize("NFD", composed)
+    check_true("the two spellings really do differ", composed != decomposed)
+    check("and name the same item", ew.keychain_service(
+        ew.Login("x", decomposed, "")), ew.keychain_service(
+        ew.Login("x", composed, "")))
+    check("the one Claude Code would use", ew.keychain_service(
+        ew.Login("x", composed, "")), claude_code_service(composed))
+
+    # Filed under $USER, unless that is something Claude Code will not use.
+    held = os.environ.get("USER")
+    try:
+        os.environ["USER"] = "ariel"
+        check("the account is the user name", ew.keychain_account(), "ariel")
+        os.environ["USER"] = "two words"
+        check("unless Claude Code would not use it",
+              ew.keychain_account(), "claude-code-user")
+        del os.environ["USER"]
+        check_true("and with no $USER, the login name still answers",
+                   ew.keychain_account() not in ("", None))
+    finally:
+        if held is None:
+            os.environ.pop("USER", None)
+        else:
+            os.environ["USER"] = held
+
+
+def test_a_login_is_read_and_written_where_claude_code_keeps_it():
+    """
+    The tool and Claude Code have to agree about every login without either
+    one being told: what Claude Code saved, the tool must read; what the tool
+    writes, Claude Code must find. Checked against the model of Claude Code's
+    side, never against the tool's own idea of it.
+    """
+    section("A login is read and written where Claude Code keeps it")
+    saved = (sys.platform, ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON,
+             ew.SWITCH_ROOT)
+    root = tempfile.mkdtemp()
+    try:
+        sys.platform = "darwin"
+        ew.HOME = root
+        ew.USER_CONFIG_DIR = os.path.join(root, ".claude")
+        ew.USER_CONFIG_JSON = os.path.join(root, ".claude.json")
+        ew.SWITCH_ROOT = os.path.join(root, ".claude-switch")
+        store = ew.Login("store", os.path.join(root, "store"),
+                         os.path.join(root, "store", ".claude.json"))
+        os.makedirs(store.config_dir, 0o700)
+
+        def login(refresh, access="a"):
+            return json.dumps({"claudeAiOauth": {"accessToken": access,
+                                                 "refreshToken": refresh}})
+
+        check("no login reads as none", ew.read_credential(store), None)
+        check("and is not there", ew.has_credential(store), False)
+
+        claude_code_saves(store, login("r1"))
+        check("a login Claude Code saved is the one read",
+              ew.read_credential(store), login("r1"))
+        check("and is there", ew.has_credential(store), True)
+
+        ew.write_credential(store, login("r2"))
+        check("one written here is the one Claude Code reads",
+              json.loads(claude_code_reads(store)), json.loads(login("r2")))
+        adds = [entry for entry in _keychain_log()
+                if entry[0] == "add-generic-password"]
+        check_true("written through stdin, as Claude Code writes, so the "
+                   "credential never appears in `ps`",
+                   adds and all(entry[-1] == "stdin" for entry in adds))
+        check("and to no file at all", _plaintext_credentials(root), [])
+
+        before = len(_keychain_log())
+        ew.has_credential(store)
+        check("looking for a login reads no secret",
+              ["-w" in entry for entry in _keychain_log()[before:]], [False])
+
+        # Data `security` prints as hex -- anything outside printable ASCII.
+        accented = json.dumps({"claudeAiOauth": {"accessToken": "é",
+                                                 "refreshToken": "r3"}},
+                              ensure_ascii=False)
+        claude_code_saves(store, accented)
+        check("an item `security` prints as hex reads as what was stored",
+              ew.read_credential(store), accented)
+
+        # Too long for `security -i`: Claude Code falls back to argv, and so
+        # does this, rather than failing.
+        big = login("r4", access="x" * ew.KEYCHAIN_STDIN_LIMIT)
+        ew.write_credential(store, big)
+        check("a credential too long for stdin still lands",
+              json.loads(claude_code_reads(store)), json.loads(big))
+        check("by the fallback Claude Code itself uses",
+              [entry[-1] for entry in _keychain_log()
+               if entry[0] == "add-generic-password"][-1], "argv")
+
+        # Moved in from a file that ends in a newline, or was laid out by
+        # hand: `security` would print that back as hex, which Claude Code
+        # cannot parse -- so it is stored compact, the way Claude Code
+        # stores its own.
+        laid_out = json.dumps(json.loads(login("r7")), indent=2) + "\n"
+        ew.write_credential(store, laid_out)
+        check("a credential laid out by hand is stored so Claude Code can "
+              "read it", json.loads(claude_code_reads(store)),
+              json.loads(laid_out))
+
+        ew.remove_credential(store)
+        check("removing takes it out of the Keychain",
+              claude_code_has(store), False)
+        check("and removing what is not there is not an error",
+              ew.remove_credential(store), None)
+
+        # Claude Code's own fallback: no item, so it reads the file.
+        with open(ew.credentials_path(store), "w") as f:
+            f.write(login("r5"))
+        check("with no item, the file is read, as Claude Code reads it",
+              ew.read_credential(store), claude_code_reads(store))
+        claude_code_saves(store, login("r6"))
+        check("and an item wins over the file, as it does for Claude Code",
+              ew.read_credential(store), claude_code_reads(store))
+        check("the item's login, that is", json.loads(ew.read_credential(
+            store))["claudeAiOauth"]["refreshToken"], "r6")
+    finally:
+        (sys.platform, ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON,
+         ew.SWITCH_ROOT) = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_switch_on_a_mac_keeps_every_login_in_the_keychain():
+    """
+    On macOS Claude Code keeps every login in the Keychain, so a switch moves
+    logins between Keychain items and writes no credential file anywhere
+    Claude Code would read one. A stray file is not harmless there: it is a
+    second copy of a grant, and the login Claude Code falls back to the day
+    the item goes.
+    """
+    section("A switch on a Mac keeps every login in the Keychain")
+    saved = sys.platform
+    sys.platform = "darwin"
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        store1, store2 = (ew.switch_store(a) for a in accounts)
+        out, err, code = _capture(lambda: ew.switch_account(
+            accounts, "2", sign_in=False))
+        check("the switch succeeds", code, 0)
+        check("leaving no credential in a file anywhere Claude Code reads one",
+              _plaintext_credentials(ew.USER_CONFIG_DIR, ew.SWITCH_ROOT), [])
+        check("your Claude Code's item holds the login switched to",
+              _creds(ew.user_login())["refreshToken"], "parked-refresh-2")
+        check("the one it replaced is parked in account 1's item",
+              _creds(store1)["refreshToken"], "live-refresh-1")
+        check("and account 2's item is empty: its login is live now",
+              claude_code_has(store2), False)
+
+        backups = os.path.join(ew.SWITCH_ROOT, ".backups")
+        stamp = sorted(os.listdir(backups))[-1]
+        copy = os.path.join(backups, stamp, "credentials.json")
+        check("the replaced login is backed up, as a file to read",
+              json.load(open(copy))["claudeAiOauth"]["refreshToken"],
+              "live-refresh-1")
+        check("that nobody else can read",
+              stat.S_IMODE(os.stat(copy).st_mode), 0o600)
+
+        out, err, code = _capture(lambda: ew.switch_account(
+            accounts, "1", sign_in=False))
+        check("and back again", code, 0)
+        check("puts the first login back where Claude Code reads it",
+              _creds(ew.user_login())["refreshToken"], "live-refresh-1")
+        check("and parks the second in account 2's item",
+              _creds(store2)["refreshToken"], "parked-refresh-2")
+        check("with account 1's item empty again", claude_code_has(store1),
+              False)
+        names = set(claude_code_service(login.config_dir, own)
+                    for login, own in ((ew.user_login(), True),
+                                       (store1, False), (store2, False),
+                                       (accounts[0], False),
+                                       (accounts[1], False)))
+        check("and nothing written to an item Claude Code would not read",
+              sorted(set(_keychain_items()) - names), [])
+    finally:
+        restore()
+        sys.platform = saved
+
+
+def test_a_plaintext_login_beside_the_keychain_is_never_lost():
+    """
+    Claude Code writes a plaintext credential only when the Keychain refused
+    it, and reads it only while no item exists. A switch replaces the item, so
+    whatever sits in that file is either a copy of a login this switch has
+    accounted for -- removed, or it would be one grant in two places -- or a
+    login nothing reads, which goes to .orphaned like every login with nowhere
+    to be. Nothing in that file is ever simply deleted.
+    """
+    section("A plaintext login beside the Keychain is never lost")
+    saved = sys.platform
+    sys.platform = "darwin"
+    try:
+        # A stale file beside a live item, holding some other login.
+        restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                                  parked=("2",))
+        try:
+            stray = json.dumps({"claudeAiOauth": {"accessToken": "x",
+                                                  "refreshToken": "stray"}})
+            with open(ew.credentials_path(ew.user_login()), "w") as f:
+                f.write(stray)
+            out, err, code = _capture(lambda: ew.switch_account(
+                accounts, "2", sign_in=False))
+            check("the switch succeeds", code, 0)
+            check("the file Claude Code no longer reads is gone from ~/.claude",
+                  os.path.exists(ew.credentials_path(ew.user_login())), False)
+            orphans = os.path.join(ew.SWITCH_ROOT, ".orphaned")
+            kept = [open(os.path.join(orphans, d, ".credentials.json")).read()
+                    for d in (os.listdir(orphans) if os.path.isdir(orphans)
+                              else [])]
+            check("the login in it is kept, never deleted", kept, [stray])
+            check_true("and the switch says where it went",
+                       "Claude Code was not reading" in out
+                       and ".orphaned" in out)
+            check("and the switch itself went as it should",
+                  (_creds(ew.user_login())["refreshToken"],
+                   _creds(ew.switch_store(accounts[0]))["refreshToken"]),
+                  ("parked-refresh-2", "live-refresh-1"))
+        finally:
+            restore()
+
+        # No item at all: Claude Code fell back to the file, so the file is
+        # the live login, and parking it accounts for it.
+        restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                                  parked=("2",))
+        try:
+            live = claude_code_reads(ew.user_login())
+            claude_code_forgets(ew.user_login())
+            with open(ew.credentials_path(ew.user_login()), "w") as f:
+                f.write(live)
+            out, err, code = _capture(lambda: ew.switch_account(
+                accounts, "2", sign_in=False))
+            check("a login Claude Code kept in a file is switched away from",
+                  code, 0)
+            check("leaving no copy of it in ~/.claude",
+                  os.path.exists(ew.credentials_path(ew.user_login())), False)
+            check("because it is parked, once",
+                  _creds(ew.switch_store(accounts[0]))["refreshToken"],
+                  "live-refresh-1")
+            check("and not orphaned as well -- that would be a second copy",
+                  os.path.exists(os.path.join(ew.SWITCH_ROOT, ".orphaned")),
+                  False)
+        finally:
+            restore()
+
+        # A store whose item has a plaintext copy of itself beside it.
+        restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                                  parked=("2",))
+        try:
+            store = ew.switch_store(accounts[1])
+            with open(ew.credentials_path(store), "w") as f:
+                f.write(claude_code_reads(store))
+            out, err, code = _capture(lambda: ew.switch_account(
+                accounts, "2", sign_in=False))
+            check("installing a login takes its copy with it", code, 0)
+            check("leaving the store with neither",
+                  (claude_code_has(store),
+                   os.path.exists(ew.credentials_path(store))), (False, False))
+            check("and nothing orphaned, since nothing was lost",
+                  os.path.exists(os.path.join(ew.SWITCH_ROOT, ".orphaned")),
+                  False)
+        finally:
+            restore()
+    finally:
+        sys.platform = saved
+
+
+def test_two_logins_set_aside_in_one_second_are_both_kept():
+    """
+    .orphaned is the one place a login with nowhere else to go is kept, and it
+    promises never to lose one. Its directories were named by the second, so
+    two logins set aside in the same second -- one switch on a Mac can set
+    aside two -- went into one directory, and the second was written over the
+    first.
+    """
+    section("Two logins set aside in one second are both kept")
+    root = tempfile.mkdtemp()
+    saved = (ew.SWITCH_ROOT, ew.datetime)
+
+    class OneSecond(ew.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return ew.datetime(2026, 10, 11, 12, 0, 0)
+
+    try:
+        ew.SWITCH_ROOT = os.path.join(root, ".claude-switch")
+        ew.datetime = OneSecond
+        first = ew.orphan_login(('{"claudeAiOauth": {"refreshToken": "one"}}',
+                                 None))
+        second = ew.orphan_login(('{"claudeAiOauth": {"refreshToken": "two"}}',
+                                  {"emailAddress": "two@example.com"}))
+        check_true("each gets a directory of its own", first != second)
+        check_true("the first still holds its login", '"one"' in open(
+            os.path.join(first, ".credentials.json")).read())
+        check_true("and the second its own", '"two"' in open(
+            os.path.join(second, ".credentials.json")).read())
+        check("both private", [stat.S_IMODE(os.stat(d).st_mode)
+                               for d in (first, second)], [0o700, 0o700])
+    finally:
+        ew.SWITCH_ROOT, ew.datetime = saved
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_keychain_that_will_not_answer_stops_a_switch_before_anything_moves():
+    """
+    Over ssh the login Keychain is usually locked, and `security` answers
+    every question with a refusal. Read as "no login here", that would offer a
+    browser sign-in for a login sitting right there; ignored on a write, it
+    would take a login out of its store with nowhere for it to land. A
+    refusal stops the switch, says what to do, and leaves everything where it
+    was.
+    """
+    section("A Keychain that will not answer stops a switch before anything moves")
+    saved = sys.platform
+    sys.platform = "darwin"
+    try:
+        # Locked for everything.
+        restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                                  parked=("2",))
+        try:
+            items = _keychain_items()
+            _keychain_misbehaves(fail={"find": 36, "add": 36, "delete": 36})
+            out, err, code = _capture(lambda: ew.switch_account(
+                accounts, "2", sign_in=False))
+            check("a locked Keychain stops the switch", code, 1)
+            check_true("saying it is locked, and how to unlock it",
+                       "locked" in err and "unlock-keychain" in err)
+            check_true("rather than calling the login missing",
+                       "No login is parked" not in err)
+            check("nothing in the Keychain changed", _keychain_items(), items)
+            check("and no backup was even begun",
+                  os.path.exists(os.path.join(ew.SWITCH_ROOT, ".backups")),
+                  False)
+            check("a login that cannot be read is not called absent",
+                  ew.has_credential(ew.switch_store(accounts[1])), True)
+            check("and describes as empty rather than crashing",
+                  ew.credential_json(ew.switch_store(accounts[1])), {})
+            errors = [f for f in ew.switch_findings(accounts)
+                      if f.level == "error"]
+            check("doctor says so once, instead of once per login",
+                  len(errors), 1)
+            check_true("naming the Keychain", "Keychain" in errors[0].message)
+        finally:
+            restore()
+
+        # Readable, but refusing writes: the first write fails.
+        restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                                  parked=("2",))
+        try:
+            _keychain_misbehaves(fail={"add": 36})
+            out, err, code = _capture(lambda: ew.switch_account(
+                accounts, "2", sign_in=False))
+            check("a Keychain refusing writes stops the switch", code, 1)
+            check_true("saying so", "locked" in err)
+            check("your Claude Code is still on the login it had",
+                  _creds(ew.user_login())["refreshToken"], "live-refresh-1")
+            check("and the login it was going to install never left its store",
+                  _creds(ew.switch_store(accounts[1]))["refreshToken"],
+                  "parked-refresh-2")
+            _keychain_misbehaves(fail=None)
+            out, err, code = _capture(lambda: ew.switch_account(
+                accounts, "2", sign_in=False))
+            check_true("unlocked, the next switch sees nothing landed",
+                       "stopped before it changed anything" in out)
+            check("and goes ahead", code, 0)
+        finally:
+            restore()
+
+        # The same refusal where the credential is a file: one that cannot be
+        # read is not a missing one, and the advice is about the file.
+        sys.platform = "linux"
+        restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                                  parked=("2",))
+        try:
+            path = ew.credentials_path(ew.switch_store(accounts[1]))
+            os.chmod(path, 0)
+            if os.geteuid() != 0:          # root reads it regardless
+                findings = ew.switch_blockers(accounts[1])
+                check("an unreadable parked file blocks the switch",
+                      [f.level for f in findings][:1], ["error"])
+                check_true("as unreadable, not as missing, with the file "
+                           "named", "cannot be read" in findings[0].message
+                           and path in findings[0].hint
+                           and "Keychain" not in findings[0].hint)
+            os.chmod(path, 0o600)
+        finally:
+            restore()
+        sys.platform = "darwin"
+
+        # A write `security` reports as done that the Keychain did not keep.
+        restore, home, accounts = _switch_sandbox(signed_in_as="1",
+                                                  parked=("2",))
+        try:
+            _keychain_misbehaves(drop_writes=True)
+            out, err, code = _capture(lambda: ew.switch_account(
+                accounts, "2", sign_in=False))
+            check("a write the Keychain did not keep stops the switch", code, 1)
+            check_true("saying what it found", "did not keep" in err)
+            check("and the login it was installing is still in its store",
+                  _creds(ew.switch_store(accounts[1]))["refreshToken"],
+                  "parked-refresh-2")
+        finally:
+            restore()
+    finally:
+        sys.platform = saved
+
+
+def test_sessions_are_found_where_there_is_no_proc():
+    """
+    macOS has no /proc, so the sessions a switch is about to move were never
+    looked for there. `ps` answers instead; this is its output from a real
+    Mac, with the processes that matter and the ones that must not count.
+    """
+    section("Running sessions are found where there is no /proc")
+    # Captured on macOS 26.5 with `ps -axo pid=,uid=,comm=`, trimmed, plus the
+    # native install's real path and a process belonging to somebody else.
+    listing = (
+        "    1     0 /sbin/launchd\n"
+        "  567   501 /Applications/Claude.app/Contents/MacOS/Claude\n"
+        "  739   501 /Applications/Claude.app/Contents/Frameworks/Claude "
+        "Helper.app/Contents/MacOS/Claude Helper\n"
+        "30483   501 /Users/ariel/.vscode/extensions/anthropic.claude-code-"
+        "2.1.296-darwin-arm64/resources/native-binary/claude\n"
+        "31787   501 /Users/ariel/.vscode/extensions/anthropic.claude-code-"
+        "2.1.296-darwin-arm64/resources/native-binary/claude\n"
+        "41000   501 /Users/ariel/.local/share/claude/versions/2.1.238\n"
+        "41001   502 /Users/someone/.local/bin/claude\n"
+        "garbage that is not a process line\n")
+    check("the editor's sessions and the native install's are found, and "
+          "only this user's",
+          ew.claude_sessions_in_ps(listing, 501), [30483, 31787, 41000])
+    check("the desktop app is not a Claude Code session",
+          567 in ew.claude_sessions_in_ps(listing, 501), False)
+    check("nothing is found for a user with none",
+          ew.claude_sessions_in_ps(listing, 503), [])
+
+
+def test_the_keychain_commands_it_gives_do_what_they_say():
+    """
+    Where a switch has to stop and hand something to a person -- a store
+    already holding another login, a copy to remove, a login to put back from
+    its backup -- the instruction on a Mac is a `security` command, and a
+    command that does not do what it says loses a login. So each one is run,
+    against the stand-in Keychain, exactly as printed.
+    """
+    section("The Keychain commands it gives do what they say")
+    saved = sys.platform
+    sys.platform = "darwin"
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+    try:
+        store = ew.switch_store(accounts[1])
+        parked = claude_code_reads(store)
+
+        def follow(hint):
+            commands = re.findall(r"`([^`]+)`", hint)
+            script = "security() {{ {} \"$@\"; }}\n{}\n".format(
+                shlex_quote(FAKE_SECURITY), "\n".join(commands))
+            result = subprocess.run(
+                ["bash", "-c", script], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, universal_newlines=True,
+                env=dict(os.environ, HOME=ew.HOME,
+                         FAKE_SECURITY_DB=fake_keychain()))
+            return commands, result.returncode
+
+        commands, code = follow(ew.move_aside_hint(store, "re-run"))
+        check("moving a login aside is two commands", len(commands), 2)
+        check("that run", code, 0)
+        check("leaving the store empty", claude_code_has(store), False)
+        aside = os.path.join(ew.SWITCH_ROOT, "set-aside-2.json")
+        check("with the login saved, exactly", open(aside).read().rstrip("\n"),
+              parked)
+
+        backup = tempfile.mkdtemp()
+        with open(os.path.join(backup, "credentials.json"), "w") as f:
+            f.write(parked)
+        commands, code = follow(ew.restore_hint(accounts[1], backup))
+        check("putting one back from its backup runs", code, 0)
+        check("and puts it back where Claude Code reads it",
+              claude_code_reads(store), parked)
+
+        commands, code = follow(ew.delete_hint(store))
+        check("removing a copy runs", code, 0)
+        check("and removes it", claude_code_has(store), False)
+    finally:
+        restore()
+        sys.platform = saved
+
+
+def test_the_suite_never_reaches_a_real_keychain():
+    """
+    On a Mac the real Keychain holds the login of whoever runs this, and a
+    test that wrote to it would sign them out. The tool's only way in is
+    SECURITY_PATH, and the stand-in there refuses to run without a Keychain
+    of its own to use.
+    """
+    section("The suite never reaches a real Keychain")
+    check("the tool reaches the Keychain through the stand-in",
+          ew.SECURITY_PATH, FAKE_SECURITY)
+    result = subprocess.run(
+        [FAKE_SECURITY, "find-generic-password", "-a", "x", "-s", "y"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=dict((k, v) for k, v in os.environ.items()
+                 if k != "FAKE_SECURITY_DB"))
+    check("which refuses to run without a Keychain of its own",
+          result.returncode, 1)
 
 
 def test_running_sessions_are_looked_for_without_counting_our_own_pings():
@@ -9459,8 +10202,7 @@ def test_the_wizard_asks_for_each_sign_in_once_and_no_more():
         # Now park it, as a completed sign-in would.
         store = ew.switch_store(accounts[1])
         os.makedirs(store.config_dir, exist_ok=True)
-        with open(ew.credentials_path(store), "w") as f:
-            json.dump({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r"}}, f)
+        claude_code_saves(store, json.dumps({"claudeAiOauth": {"accessToken": "t", "refreshToken": "r"}}))
         check("re-running then asks for nothing",
               ew.sign_ins_needed(accounts, pings=True), [])
     finally:
@@ -9644,7 +10386,7 @@ def test_the_first_switch_on_a_machine_that_has_never_run_claude_code():
         check("which is recognised from then on",
               ew.current_account(accounts).name, "2")
         check("and the store is empty, as after any switch",
-              os.path.exists(ew.credentials_path(ew.switch_store(accounts[1]))),
+              claude_code_has(ew.switch_store(accounts[1])),
               False)
         check("nothing claims to have parked a login that was never there",
               "Parked" in out, False)
@@ -10059,30 +10801,32 @@ def test_a_figure_from_another_program_is_rendered_not_raised_on():
 
 def test_a_machine_that_cannot_switch_never_reports_itself_healthy():
     """
-    A switch-only machine has exactly one command that matters. On macOS that
-    command hard-refuses -- the credential lives in the Keychain, not in a
-    file -- and `doctor` and `check` both said "Everything checks out"
-    anyway. A diagnostic being wrong about the only thing it was asked is
+    A switch-only machine has exactly one command that matters. Where that
+    command hard-refuses, `doctor` and `check` both said "Everything checks
+    out" anyway. A diagnostic being wrong about the only thing it was asked is
     worse than no diagnostic.
     """
     section("A machine that cannot switch is not called healthy")
     original = ew.sys.platform
     try:
-        ew.sys.platform = "darwin"
+        ew.sys.platform = "win32"
         blocker = ew.platform_blocker()
-        check_true("switching is refused off Linux", blocker is not None)
+        check_true("switching is refused off Linux and macOS",
+                   blocker is not None)
         check("and refusing is an error", blocker.level, "error")
 
         findings = ew.switch_only_findings([])
         errors = [f for f in findings if f.level == "error"]
         check_true("a switch-only machine reports it as a finding too",
-                   any("only supported on Linux" in f.message for f in errors))
+                   any("works on Linux and macOS" in f.message
+                       for f in errors))
 
-        ew.sys.platform = "linux"
-        findings = ew.switch_only_findings([])
-        check_true("and says nothing about the platform on Linux",
-                   not any("only supported on Linux" in f.message
-                           for f in findings))
+        for supported in ("linux", "darwin"):
+            ew.sys.platform = supported
+            findings = ew.switch_only_findings([])
+            check_true("and says nothing about the platform on {}".format(
+                supported), not any("works on Linux and macOS" in f.message
+                                    for f in findings))
     finally:
         ew.sys.platform = original
 
@@ -10640,31 +11384,32 @@ def test_an_anchor_that_could_not_be_booked_is_not_silent():
 
 def test_setup_says_up_front_what_it_cannot_do_here():
     """
-    Off Linux, `switch` refuses -- the credential is in the Keychain, not in a
-    file -- and on a machine that does not ping, `switch` is the entire point.
-    Setup ran to the end anyway, had the user spend a browser sign-in per
-    account, and finished by recommending the one command that was going to
-    turn them down.
+    Where `switch` refuses, on a machine that does not ping, `switch` is the
+    entire point. Setup ran to the end anyway, had the user spend a browser
+    sign-in per account, and finished by recommending the one command that was
+    going to turn them down.
     """
     section("Setup says up front what it cannot do here")
     original = ew.sys.platform
     try:
-        ew.sys.platform = "linux"
-        check("on Linux there is nothing to warn about",
-              len(ew.platform_warning()), 0)
+        for supported in ("linux", "darwin"):
+            ew.sys.platform = supported
+            check("on {} there is nothing to warn about".format(supported),
+                  len(ew.platform_warning()), 0)
 
-        for elsewhere in ("darwin", "win32"):
-            ew.sys.platform = elsewhere
-            warnings = ew.platform_warning()
-            check("{} gets a warning".format(elsewhere), len(warnings), 1)
-            # A warning, not an error: reading the figures still works here,
-            # and that is a reason to install.
-            check("and only a warning", warnings[0].level, "warning")
-            check_true("naming the command that will refuse",
-                       "switch" in warnings[0].hint)
-            check_true("and what does still work",
-                       "which" in warnings[0].hint
-                       and "schedule.json" in warnings[0].hint)
+        ew.sys.platform = "win32"
+        warnings = ew.platform_warning()
+        check("win32 gets a warning", len(warnings), 1)
+        # A warning, not an error: reading the figures still works here,
+        # and that is a reason to install.
+        check("and only a warning", warnings[0].level, "warning")
+        check_true("naming where it does work",
+                   "Linux and macOS" in warnings[0].message)
+        check_true("naming the command that will refuse",
+                   "switch" in warnings[0].hint)
+        check_true("and what does still work",
+                   "which" in warnings[0].hint
+                   and "schedule.json" in warnings[0].hint)
     finally:
         ew.sys.platform = original
 
@@ -10802,15 +11547,14 @@ def test_the_sign_in_a_switch_offers_is_the_one_place_a_login_is_made():
         check_true("and it explained why a copy is the wrong answer",
                    "eight hours" in said and "own sign-in" in said)
         check_true("and nothing was started",
-                   not os.path.exists(ew.credentials_path(store)))
+                   not claude_code_has(store))
 
         # -- agreeing runs Claude Code in the store, and only there ---------
         seen = {}
 
         def fake_call(argv, env=None, cwd=None):
             seen["argv"], seen["env"], seen["cwd"] = argv, env, cwd
-            with open(ew.credentials_path(store), "w") as f:
-                json.dump({"claudeAiOauth": {"accessToken": "t"}}, f)
+            claude_code_saves(store, json.dumps({"claudeAiOauth": {"accessToken": "t"}}))
             with open(store.config_json, "w") as f:
                 json.dump({"oauthAccount": {"accountUuid": "u9"}}, f)
             return 0
@@ -10834,7 +11578,7 @@ def test_the_sign_in_a_switch_offers_is_the_one_place_a_login_is_made():
                        var not in seen["env"])
 
         # A run that made no login is not reported as one.
-        os.remove(ew.credentials_path(store))
+        claude_code_forgets(store)
         ew.subprocess.call = lambda *a, **k: 0
         sys.stdin = _Answers("y\n")
         buf = io.StringIO()
@@ -10896,11 +11640,10 @@ def test_every_condition_on_offering_a_sign_in_is_load_bearing():
         check("--no-sign-in means never ask",
               ew.should_offer_sign_in(False, store, [missing]), False)
 
-        with open(ew.credentials_path(store), "w") as f:
-            f.write("{}")
+        claude_code_saves(store, "{}")
         check("a login already parked leaves nothing to offer",
               ew.should_offer_sign_in(True, store, [missing]), False)
-        os.remove(ew.credentials_path(store))
+        claude_code_forgets(store)
 
         other = ew.Finding("error", "Account 1's window is spent", "…")
         check("something else already wrong means the round trip is wasted",
@@ -10948,12 +11691,11 @@ def test_the_verdict_the_schedule_publishes_is_the_one_it_holds():
                 json.dump({"oauthAccount": {
                     "accountUuid": "u" + account.name,
                     "emailAddress": account.name + "@x"}}, f)
-            with open(ew.credentials_path(account), "w") as f:
-                json.dump({"claudeAiOauth": {
-                    "accessToken": "t", "subscriptionType": "max",
-                    "rateLimitTier": "default_claude_ai",
-                    "refreshTokenExpiresAt":
-                        int((time.time() + 90 * 86400) * 1000)}}, f)
+            claude_code_saves(account, json.dumps({"claudeAiOauth": {
+                "accessToken": "t", "subscriptionType": "max",
+                "rateLimitTier": "default_claude_ai",
+                "refreshTokenExpiresAt":
+                    int((time.time() + 90 * 86400) * 1000)}}))
 
         # One usable, one plainly spent.
         ew.write_state(accounts[0], {"rate_limits": {"five_hour": {
@@ -11009,8 +11751,7 @@ def test_the_backup_that_makes_a_switch_survivable():
         ew.USER_CONFIG_DIR = os.path.join(root, ".claude")
         ew.USER_CONFIG_JSON = os.path.join(root, ".claude.json")
         os.makedirs(ew.USER_CONFIG_DIR, 0o700)
-        with open(ew.credentials_path(ew.user_login()), "w") as f:
-            f.write('{"claudeAiOauth": {"accessToken": "first"}}')
+        claude_code_saves(ew.user_login(), '{"claudeAiOauth": {"accessToken": "first"}}')
         with open(ew.USER_CONFIG_JSON, "w") as f:
             f.write('{"oauthAccount": {"accountUuid": "u1"}}')
 
@@ -11029,8 +11770,7 @@ def test_the_backup_that_makes_a_switch_survivable():
 
         # Two switches in the same second. This is the one that used to lose a
         # login: same name, second copy over the first.
-        with open(ew.credentials_path(ew.user_login()), "w") as f:
-            f.write('{"claudeAiOauth": {"accessToken": "second"}}')
+        claude_code_saves(ew.user_login(), '{"claudeAiOauth": {"accessToken": "second"}}')
         second = ew.backup_user_login()
         check_true("a second backup in the same second gets its own place",
                    second != first)
@@ -11048,7 +11788,7 @@ def test_the_backup_that_makes_a_switch_survivable():
               [os.path.basename(first), os.path.basename(second)])
 
         # Nothing to copy: no empty directory left behind, and it says so.
-        os.remove(ew.credentials_path(ew.user_login()))
+        claude_code_forgets(ew.user_login())
         os.remove(ew.USER_CONFIG_JSON)
         before = len(os.listdir(os.path.join(ew.SWITCH_ROOT, ".backups")))
         check("with nothing to save there is no backup", ew.backup_user_login(),
@@ -11106,8 +11846,7 @@ def test_nothing_the_switch_path_creates_is_readable_by_anyone_else():
         ew.USER_CONFIG_JSON = os.path.join(root, ".claude.json")
         ew.STATE_ROOT = os.path.join(root, "state")
         os.makedirs(ew.USER_CONFIG_DIR, 0o700)
-        with open(ew.credentials_path(ew.user_login()), "w") as f:
-            f.write("{}")
+        claude_code_saves(ew.user_login(), "{}")
 
         account = ew.Account("1", os.path.join(root, "cfg1"), 0)
         store = ew.switch_store(account)
@@ -11133,6 +11872,51 @@ def test_nothing_the_switch_path_creates_is_readable_by_anyone_else():
         (ew.SWITCH_ROOT, ew.HOME, ew.USER_CONFIG_DIR, ew.USER_CONFIG_JSON,
          ew.STATE_ROOT) = saved
         shutil.rmtree(root, ignore_errors=True)
+
+
+# The tests main() runs a second time playing the other platform: everything
+# that reads a login, moves one, or says something about one. A new test of
+# that kind belongs here as well as in main()'s own list.
+CREDENTIAL_TESTS = (
+    test_validation_catches_the_expensive_mistakes,
+    test_an_unusable_login_is_never_recommended,
+    test_a_login_that_stopped_working_is_reported,
+    test_a_reading_taken_a_moment_ago_is_not_taken_again,
+    test_a_live_reading_beats_a_cached_one,
+    test_doctor_notices_a_deployment_going_wrong,
+    test_the_sign_in_a_switch_offers_is_the_one_place_a_login_is_made,
+    test_every_condition_on_offering_a_sign_in_is_load_bearing,
+    test_the_backup_that_makes_a_switch_survivable,
+    test_nothing_the_switch_path_creates_is_readable_by_anyone_else,
+    test_a_login_is_never_in_two_places_at_once,
+    test_an_interrupted_switch_never_leaves_a_login_in_two_places,
+    test_the_refusals_fire_where_the_readme_says_to_switch,
+    test_an_override_is_reported_before_anything_reassuring,
+    test_a_credential_directory_is_never_left_wide,
+    test_the_mutation_path_is_hardened,
+    test_a_failure_mid_switch_is_a_sentence_not_a_traceback,
+    test_the_token_and_the_identity_move_together,
+    test_switching_refuses_what_cannot_possibly_work,
+    test_switching_says_what_it_will_and_will_not_fix,
+    test_what_a_switch_says_reads_in_order_when_it_is_redirected,
+    test_parking_never_writes_over_a_login_that_is_already_there,
+    test_a_dead_login_in_the_way_is_set_aside_not_refused,
+    test_a_switch_says_what_the_account_it_moved_to_actually_has_left,
+    test_a_switch_killed_between_its_two_writes_is_finished_not_believed,
+    test_switching_with_no_account_named_follows_which,
+    test_the_user_is_told_which_account_they_are_on,
+    test_a_switch_backs_up_what_it_replaces,
+    test_an_unknown_login_is_backed_up_rather_than_lost,
+    test_nothing_after_the_swap_turns_a_switch_into_a_traceback,
+    test_being_asked_to_log_in_is_not_always_a_login_problem,
+    test_doctor_notices_a_store_going_stale,
+    test_only_one_function_writes_to_the_users_own_files,
+    test_the_wizard_asks_for_each_sign_in_once_and_no_more,
+    test_the_first_switch_on_a_machine_that_has_never_run_claude_code,
+    test_a_switch_only_machine_knows_which_account_it_is_on,
+    test_doctor_on_a_switch_only_machine_reports_only_what_applies,
+    test_setup_can_install_the_switcher_without_the_pings,
+)
 
 
 def main():
@@ -11175,6 +11959,11 @@ def main():
     ew.SWITCH_ROOT = os.path.join(home, ".claude-switch")
     os.makedirs(ew.UNIT_DIR)
     os.makedirs(ew.USER_CONFIG_DIR)
+    # No test may reach a real Keychain either. On macOS the credential lives
+    # there, so every read and write of a login goes through `security` -- and
+    # the real one holds the login of whoever is running this. The stand-in
+    # keeps its items in a file inside the sandbox, on every platform, so the
+    # Keychain half of the switch is exercised on Linux too.
     # The pings need Linux and systemd, and every test of them describes that
     # machine: its systemd calls are recorded rather than run. Whether
     # systemctl is *installed* was the one question left that read the real
@@ -11184,6 +11973,13 @@ def main():
     real_command_exists = ew._command_exists
     ew._command_exists = lambda name: (name in ("systemctl", "systemd-run")
                                        or real_command_exists(name))
+    ew.SECURITY_PATH = FAKE_SECURITY
+    real_security = ew._security
+
+    def security_in_this_home(*args, **kwargs):
+        os.environ["FAKE_SECURITY_DB"] = fake_keychain()
+        return real_security(*args, **kwargs)
+    ew._security = security_in_this_home
 
     # No test may reach the network. A live reading is a real request against a
     # real account, so a test that made one would spend the developer's quota
@@ -11191,6 +11987,35 @@ def main():
     # exercise the live path replaces this locally.
     ew.urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
         ew.urllib.error.URLError("the test suite does not have a network"))
+
+    def run(test):
+        # A test that raises is a failure, not the end of the run. This was a
+        # bare `test()`, so one unexpected exception -- a machine without
+        # `systemctl`, a tool this suite assumes is installed -- aborted
+        # everything after it. On a minimal PATH that happened a third of the
+        # way in, and 38 test functions never ran, including every one about
+        # credentials. The run then looked like a crash in the tool rather than
+        # a missing prerequisite, and the checks that never executed were
+        # indistinguishable from checks that passed.
+        try:
+            test()
+        except SystemExit as exc:
+            # SystemExit is not an Exception, so it walked straight out of the
+            # handler below and took the whole run with it -- which is exactly
+            # the abort this block exists to prevent. The tool exits
+            # deliberately in a few places (a misused command, a question with
+            # nobody there to answer it), and a test that reaches one of them
+            # is a failing test, not a reason to stop.
+            FAILURES.append("{} exited with code {}{}".format(
+                test.__name__, exc.code, PLAYING))
+            print("  ERROR  {} exited with code {}".format(
+                test.__name__, exc.code))
+        except Exception as exc:                              # noqa: BLE001
+            FAILURES.append("{} raised {}: {}{}".format(
+                test.__name__, type(exc).__name__, exc, PLAYING))
+            print("  ERROR  {} raised {}: {}".format(
+                test.__name__, type(exc).__name__, exc))
+            traceback.print_exc()
 
     for test in (test_refusal_text, test_next_window_start, test_guard_rails,
                  test_anchor_scheduling,
@@ -11331,6 +12156,15 @@ def main():
                  test_doctor_notices_a_store_going_stale,
                  test_only_one_function_writes_to_the_users_own_files,
                  test_running_sessions_are_looked_for_without_counting_our_own_pings,
+                 test_the_keychain_item_is_the_one_claude_code_reads,
+                 test_a_login_is_read_and_written_where_claude_code_keeps_it,
+                 test_a_switch_on_a_mac_keeps_every_login_in_the_keychain,
+                 test_a_plaintext_login_beside_the_keychain_is_never_lost,
+                 test_two_logins_set_aside_in_one_second_are_both_kept,
+                 test_a_keychain_that_will_not_answer_stops_a_switch_before_anything_moves,
+                 test_sessions_are_found_where_there_is_no_proc,
+                 test_the_keychain_commands_it_gives_do_what_they_say,
+                 test_the_suite_never_reaches_a_real_keychain,
                  test_a_machine_that_does_not_ping_is_never_told_to_ping,
                  test_a_machine_can_be_told_it_does_not_ping,
                  test_the_wizard_asks_for_each_sign_in_once_and_no_more,
@@ -11344,33 +12178,24 @@ def main():
                  test_doctor_catches_a_machine_pinging_when_it_says_it_does_not,
                  test_setup_names_an_account_it_is_about_to_drop,
                  test_setup_says_the_pings_belong_on_one_machine):
-        # A test that raises is a failure, not the end of the run. This was a
-        # bare `test()`, so one unexpected exception -- a machine without
-        # `systemctl`, a tool this suite assumes is installed -- aborted
-        # everything after it. On a minimal PATH that happened a third of the
-        # way in, and 38 test functions never ran, including every one about
-        # credentials. The run then looked like a crash in the tool rather than
-        # a missing prerequisite, and the checks that never executed were
-        # indistinguishable from checks that passed.
-        try:
-            test()
-        except SystemExit as exc:
-            # SystemExit is not an Exception, so it walked straight out of the
-            # handler below and took the whole run with it -- which is exactly
-            # the abort this block exists to prevent. The tool exits
-            # deliberately in a few places (a misused command, a question with
-            # nobody there to answer it), and a test that reaches one of them
-            # is a failing test, not a reason to stop.
-            FAILURES.append("{} exited with code {}".format(
-                test.__name__, exc.code))
-            print("  ERROR  {} exited with code {}".format(
-                test.__name__, exc.code))
-        except Exception as exc:                              # noqa: BLE001
-            FAILURES.append("{} raised {}: {}".format(
-                test.__name__, type(exc).__name__, exc))
-            print("  ERROR  {} raised {}: {}".format(
-                test.__name__, type(exc).__name__, exc))
-            traceback.print_exc()
+        run(test)
+
+    # Every test that reads or moves a login runs again, playing the other
+    # platform: on Linux as a Mac, with each login in the stand-in Keychain;
+    # on a Mac as Linux, with each login in a file. Each machine thereby checks
+    # both halves of the switch, and a change to one cannot pass unnoticed on
+    # a developer's machine that only ever runs the other.
+    global PLAYING
+    native, other = sys.platform, ("linux" if sys.platform == "darwin"
+                                   else "darwin")
+    print("\n\n=== The credential tests again, playing {} ===".format(other))
+    sys.platform, PLAYING = other, " [as {}]".format(other)
+    try:
+        for test in CREDENTIAL_TESTS:
+            run(test)
+    finally:
+        sys.platform, PLAYING = native, ""
+
     # Nothing armed on the way out, whatever a test did or failed to do.
     for name in (TEST_PREFIX, TEST_PREFIX + "-a", TEST_PREFIX + "-b"):
         ew.cancel_anchor(ew.Account(name, "/tmp/nonexistent", 0))

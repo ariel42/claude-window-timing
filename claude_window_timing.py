@@ -1,8 +1,9 @@
 """
 Claude Code Window Timing
 Keeps a Claude Code usage window rolling in the background so that you start work
-inside a fresh, almost-untouched window. Requires Python 3.6+, Linux, and the
-Claude Code CLI.
+inside a fresh, almost-untouched window. Requires Python 3.6+ and the Claude Code
+CLI. The pings need Linux with systemd; switching accounts works on Linux and
+macOS.
 
 Supports several Claude subscriptions at once. Accounts are configured in
 accounts.json (see accounts.example.json); with no such file the tool runs a
@@ -40,6 +41,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
@@ -1814,6 +1816,423 @@ def spacing_lines(accounts, states, now):
 
 
 # ---------------------------------------------------------------------------
+# Where Claude Code keeps a login
+# ---------------------------------------------------------------------------
+#
+# A login is two things: the credential -- the OAuth tokens, which decide who
+# is billed -- and the identity block, `oauthAccount` in .claude.json, which
+# decides who Claude Code says you are. The identity is a file everywhere. The
+# credential is not:
+#
+#   * Linux: <config dir>/.credentials.json.
+#
+#   * macOS: a generic password in the login Keychain, which Claude Code reads
+#     and writes with the `security` command-line tool. Read from Claude
+#     Code's own source (2.1.238 and 2.1.296), then checked against the real
+#     binary with a throwaway directory and fake tokens:
+#       - Claude Code run without CLAUDE_CONFIG_DIR uses the service "Claude
+#         Code-credentials" and the account $USER;
+#       - with CLAUDE_CONFIG_DIR set, the service gains "-" and the first eight
+#         hex digits of the SHA-256 of that exact string, NFC-normalised. It is
+#         not resolved first, so ~/x and ~/x/ are two different items;
+#       - the payload is the same JSON the Linux file holds;
+#       - with no item, Claude Code reads <config dir>/.credentials.json
+#         instead, and the item wins when both exist.
+#
+# Everything in this section mirrors those rules, so that what this tool reads
+# is what Claude Code reads, and what it writes is where Claude Code looks.
+
+# The Keychain's own command-line tool, and what Claude Code itself runs. A
+# variable so that the tests can put a stand-in here: the suite must never
+# touch a real Keychain.
+SECURITY_PATH = "/usr/bin/security"
+
+# Long enough for a person to answer a Keychain prompt, should one appear. None
+# did in the measurements: an item created through `security` -- which is how
+# Claude Code creates its own -- is readable through `security` without asking.
+KEYCHAIN_TIMEOUT_SEC = 30
+
+# `security -i` reads commands from a fixed-size line buffer. Claude Code moves
+# to argv past this length, and so does this; a credential is a few hundred
+# bytes, so it never comes close, and stdin keeps it out of `ps` meanwhile.
+KEYCHAIN_STDIN_LIMIT = 4032
+
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+# `security` exits with the low byte of the Keychain's status code; a command
+# run through `security -i` passes its own through. Measured: -25300 (no such
+# item) exits 44, -25299 (already exists) 45.
+_KEYCHAIN_NOT_FOUND = 44
+_KEYCHAIN_PROBLEMS = {
+    36: "the login Keychain is locked. Unlock it with `security "
+        "unlock-keychain`, then try again",     # errSecInteractionNotAllowed
+    51: "the Keychain refused access to it",    # errSecAuthFailed
+    128: "access to it was cancelled",          # userCanceledErr
+}
+
+# Claude Code files its items under this account name only when it looks like
+# one; anything else becomes "claude-code-user".
+_KEYCHAIN_ACCOUNT_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
+class CredentialStoreError(OSError):
+    """
+    A credential could not be read or written where Claude Code keeps it.
+
+    An OSError, because that is what it is -- the environment refusing -- and
+    because every place that writes a login already stops on one and says
+    which half happened.
+    """
+
+
+def credential_store():
+    """
+    Where Claude Code keeps a login's credential here: "keychain" on macOS,
+    "file" everywhere else.
+
+    Asked at the moment of use rather than fixed at import, so that one run of
+    the tests can exercise both.
+    """
+    return "keychain" if sys.platform == "darwin" else "file"
+
+
+def credentials_path(login):
+    """
+    The credential file: the credential itself on Linux, and on macOS the
+    fallback Claude Code reads only when the Keychain holds no item.
+    """
+    return os.path.join(login.config_dir, ".credentials.json")
+
+
+def keychain_service(login):
+    """
+    The Keychain service Claude Code uses for this login's directory.
+
+    The user's own Claude Code is the one run without CLAUDE_CONFIG_DIR, and
+    gets the plain name. Every other directory is reached by setting the
+    variable to exactly `login.config_dir` -- the sign-in command printed here,
+    the one `switch` runs, and every ping all pass that same string -- so that
+    string, unresolved, is what is hashed.
+    """
+    if os.path.abspath(login.config_dir) == os.path.abspath(USER_CONFIG_DIR):
+        return KEYCHAIN_SERVICE
+    digest = hashlib.sha256(unicodedata.normalize(
+        "NFC", login.config_dir).encode("utf-8")).hexdigest()
+    return "{}-{}".format(KEYCHAIN_SERVICE, digest[:8])
+
+
+def keychain_account():
+    """The account name Claude Code files its Keychain items under."""
+    name = os.environ.get("USER")
+    if not name:
+        try:
+            import pwd
+            name = pwd.getpwuid(os.getuid()).pw_name
+        except (ImportError, KeyError, AttributeError):
+            name = ""
+    return name if name and _KEYCHAIN_ACCOUNT_RE.match(name) \
+        else "claude-code-user"
+
+
+def _security(*args, **kwargs):
+    """Run the Keychain's command-line tool. Returns (code, stdout, stderr)."""
+    stdin = kwargs.get("stdin")
+    # Never the caller's stdin: nothing here reads a terminal, and a
+    # `security` that did would hang a command nobody is typing into.
+    feed = {"input": stdin} if stdin is not None \
+        else {"stdin": subprocess.DEVNULL}
+    try:
+        result = subprocess.run(
+            [SECURITY_PATH] + list(args), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, universal_newlines=True,
+            timeout=KEYCHAIN_TIMEOUT_SEC, **feed)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise CredentialStoreError("could not run {}: {}".format(
+            SECURITY_PATH, e))
+    return result.returncode, result.stdout or "", (result.stderr or "").strip()
+
+
+def _keychain_problem(action, login, code, detail):
+    said = [line for line in detail.splitlines() if line.strip()]
+    reason = (_KEYCHAIN_PROBLEMS.get(code) or (said[0] if said else "")
+              or "`security` exited {}".format(code))
+    return CredentialStoreError('could not {} the Keychain item "{}": {}'.format(
+        action, keychain_service(login), reason))
+
+
+def _keychain_text(output):
+    """
+    The stored text, from what `security find-generic-password -w` printed.
+
+    It prints the data and a newline -- or, measured, the data as lowercase
+    hex when it holds anything outside printable ASCII. Claude Code writes
+    compact ASCII JSON and so never meets the second form; an item made by
+    hand could.
+    """
+    text = output[:-1] if output.endswith("\n") else output
+    try:
+        json.loads(text)
+        return text
+    except ValueError:
+        pass
+    if text and len(text) % 2 == 0 and re.match(r"^[0-9a-f]+$", text):
+        try:
+            return bytes.fromhex(text).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            pass
+    return text
+
+
+def _keychain_read(login):
+    """This login's Keychain item, as text, or None when there is none."""
+    code, out, err = _security(
+        "find-generic-password", "-a", keychain_account(),
+        "-s", keychain_service(login), "-w")
+    if code == _KEYCHAIN_NOT_FOUND:
+        return None
+    if code != 0:
+        raise _keychain_problem("read", login, code, err)
+    return _keychain_text(out)
+
+
+def _keychain_has(login):
+    """Whether this login has a Keychain item. Reads no secret."""
+    code, _, err = _security(
+        "find-generic-password", "-a", keychain_account(),
+        "-s", keychain_service(login))
+    if code == _KEYCHAIN_NOT_FOUND:
+        return False
+    if code != 0:
+        raise _keychain_problem("look for", login, code, err)
+    return True
+
+
+def keychain_form(text):
+    """
+    A credential as Claude Code itself stores one in the Keychain: compact,
+    ASCII-only JSON.
+
+    Not a nicety. `security -w` prints anything holding a newline or a byte
+    outside printable ASCII as hex, and Claude Code parses what it prints as
+    JSON -- so a credential moved in from a file that ends in a newline, or
+    was pretty-printed by hand, would land in an item Claude Code reads as no
+    login at all. Text that is not JSON is left exactly as it is.
+    """
+    try:
+        return json.dumps(json.loads(text), separators=(",", ":"))
+    except ValueError:
+        return text
+
+
+def _keychain_write(login, text):
+    """
+    Store `text` as this login's Keychain item, exactly as Claude Code does,
+    and read it back.
+
+    The read-back is what makes it safe to remove the copy this came from:
+    `security` reporting success is not the same thing as the item holding
+    these bytes, and the next step of a move deletes the only other copy.
+    """
+    account, service = keychain_account(), keychain_service(login)
+    text = keychain_form(text)
+    data = text.encode("utf-8").hex()
+    command = 'add-generic-password -U -a "{}" -s "{}" -X "{}"\n'.format(
+        account, service, data)
+    if len(command) <= KEYCHAIN_STDIN_LIMIT:
+        code, _, err = _security("-i", stdin=command)
+    else:
+        code, _, err = _security("add-generic-password", "-U", "-a", account,
+                                 "-s", service, "-X", data)
+    if code != 0:
+        raise _keychain_problem("write", login, code, err)
+    if _keychain_read(login) != text:
+        raise CredentialStoreError(
+            'the Keychain item "{}" did not keep what was written to it'.format(
+                service))
+
+
+def _keychain_delete(login):
+    code, _, err = _security(
+        "delete-generic-password", "-a", keychain_account(),
+        "-s", keychain_service(login))
+    if code not in (0, _KEYCHAIN_NOT_FOUND):
+        raise _keychain_problem("remove", login, code, err)
+
+
+def read_credential(login):
+    """
+    The credential Claude Code would use for this login, as text, or None.
+
+    Raises CredentialStoreError -- an OSError -- when it cannot be read at
+    all: a locked Keychain, an unreadable file. That is a different answer
+    from "there is none", and a switch must stop on it rather than treat a
+    login it could not read as absent.
+    """
+    if credential_store() == "keychain":
+        text = _keychain_read(login)
+        if text is not None:
+            return text
+    path = credentials_path(login)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return f.read()
+
+
+def credential_json(login):
+    """
+    The parsed credential, or {} when there is none or it cannot be read.
+
+    For everything that only describes a login -- who it is, when it expires,
+    whether it is the same grant as another. Missing and unreadable read alike
+    here, as they always have from a file; the switch asks read_credential and
+    stops on the difference.
+    """
+    try:
+        text = read_credential(login)
+        data = json.loads(text) if text else {}
+    except (IOError, OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def has_credential(login):
+    """
+    Whether Claude Code would find a credential for this login.
+
+    Reads no secret. A Keychain that cannot be asked counts as yes: the read
+    that follows says what is really wrong, where "no login here" would send
+    somebody to sign in again for nothing.
+    """
+    if credential_store() == "keychain":
+        try:
+            if _keychain_has(login):
+                return True
+        except CredentialStoreError:
+            return True
+    return os.path.exists(credentials_path(login))
+
+
+def write_credential(login, text):
+    """
+    Make `text` this login's credential, where Claude Code will read it.
+
+    It replaces whatever credential the login had, as writing the file always
+    has on Linux: a caller takes what was there first, and parks it or sets it
+    aside. On macOS the credential is the Keychain item. A plaintext file beside it is cleared
+    on the way, because once the item exists Claude Code stops reading it: it
+    would be left as a second copy of a login that lives elsewhere, or as a
+    login nothing reads (see _clear_plaintext).
+    """
+    if credential_store() != "keychain":
+        _write_atomically(credentials_path(login), text)
+        return
+    before = read_credential(login)
+    _keychain_write(login, text)
+    _clear_plaintext(login, (text, before))
+
+
+def remove_credential(login):
+    """
+    Take this login's credential away from wherever Claude Code reads it.
+
+    Only ever the second half of a move: called once the credential has been
+    installed somewhere else, or set aside, never as a way to delete a login.
+    """
+    if credential_store() != "keychain":
+        os.remove(credentials_path(login))
+        return
+    before = read_credential(login)
+    _keychain_delete(login)
+    _clear_plaintext(login, (before,))
+
+
+def _clear_plaintext(login, accounted):
+    """
+    Remove the plaintext credential beside a Keychain item, losing no login.
+
+    Claude Code writes one only when the Keychain refused it, and reads it only
+    while no item exists. Whatever is in it is either a copy of a credential
+    this move has accounted for -- the one just written, or the one it
+    replaced and is parking -- and is removed, or it is some other login, and
+    goes to .orphaned like every login that has nowhere else to be.
+    """
+    path = credentials_path(login)
+    if not os.path.exists(path):
+        return None
+    text = _read_text(path)
+    known = set(grant_fingerprint(t) for t in accounted if t)
+    kept = None
+    if grant_fingerprint(text) not in known:
+        kept = orphan_login((text, None))
+        # Said, because a login that moves without a word is one somebody
+        # goes looking for later -- and this one may have been put there by
+        # hand.
+        print("  {} held a login Claude Code was not reading; it is kept in "
+              "{}.".format(_tilde(path), _tilde(kept)))
+    os.remove(path)
+    return kept
+
+
+def credential_where(login):
+    """Where this login's credential is kept, in words somebody can act on."""
+    if credential_store() == "keychain":
+        try:
+            in_file = (not _keychain_has(login)
+                       and os.path.exists(credentials_path(login)))
+        except CredentialStoreError:
+            in_file = False
+        if not in_file:
+            return 'the Keychain item "{}"'.format(keychain_service(login))
+    return credentials_path(login)
+
+
+def _keychain_by_hand(login):
+    """The `security` arguments that name this login's item, for a person."""
+    return '-a {} -s "{}"'.format(keychain_account(), keychain_service(login))
+
+
+def move_aside_hint(login, then):
+    """How to move this login's credential out of the way by hand, keeping it."""
+    if credential_store() == "keychain" and \
+            credential_where(login) != credentials_path(login):
+        # Saved beside the stores, not inside one: under a name Claude Code
+        # never reads, in a directory that is already private.
+        return ("Save it — `security find-generic-password {0} -w > "
+                "{1}` — then remove it with `security delete-generic-password "
+                "{0}`, and {2}.".format(
+                    _keychain_by_hand(login),
+                    _tilde(os.path.join(SWITCH_ROOT, "set-aside-{}.json".format(
+                        os.path.basename(login.config_dir)))),
+                    then))
+    return "Move {} aside, then {}.".format(credentials_path(login), then)
+
+
+def restore_hint(account, backup):
+    """How to put a login that could not be parked back where it belongs."""
+    if account is None:
+        return "Copy it back into its store"
+    store = switch_store(account)
+    if credential_store() == "keychain":
+        return ("Put it back with `security add-generic-password -U {} -w "
+                "\"$(cat {})\"`".format(
+                    _keychain_by_hand(store),
+                    os.path.join(backup or os.path.join(SWITCH_ROOT, ".backups",
+                                                        "<latest>"),
+                                 "credentials.json")))
+    return "Copy it back into {}".format(store.config_dir)
+
+
+def delete_hint(login):
+    """How to remove a credential that is a copy of one kept elsewhere."""
+    if credential_store() == "keychain" and \
+            credential_where(login) != credentials_path(login):
+        return "Remove it with `security delete-generic-password {}`.".format(
+            _keychain_by_hand(login))
+    return "Delete {}.".format(credentials_path(login))
+
+
+# ---------------------------------------------------------------------------
 # Checking a multi-account setup makes sense
 # ---------------------------------------------------------------------------
 #
@@ -1847,13 +2266,12 @@ def account_identity(account):
     """
     Who an account is, from Claude Code's own files. Empty when never logged in.
 
-    Two files are involved: the identity lives in .claude.json's oauthAccount,
-    while the token and plan live in .credentials.json inside the config
-    directory. On macOS the latter is in Keychain instead, so a missing file
-    means "cannot tell", never "not logged in".
+    Two places are involved: the identity lives in .claude.json's
+    oauthAccount, while the token and plan live in the credential -- a file
+    inside the config directory on Linux, a Keychain item on macOS.
     """
     oauth = (_read_json(account.config_json).get("oauthAccount") or {})
-    creds = _read_json(os.path.join(account.config_dir, ".credentials.json"))
+    creds = credential_json(account)
     claude_ai = creds.get("claudeAiOauth") or {}
     return {
         "account_uuid": oauth.get("accountUuid"),
@@ -2512,7 +2930,7 @@ def read_live_limits(account):
     downstream is unchanged, and is {} when nothing could be read; `problem` is
     a sentence saying why, or "".
     """
-    creds = (_read_json(credentials_path(account)).get("claudeAiOauth") or {})
+    creds = (credential_json(account).get("claudeAiOauth") or {})
     token = creds.get("accessToken")
     if not token:
         return {}, "there is no login in {}".format(account.config_dir)
@@ -2652,8 +3070,7 @@ def take_reading(account, login=None, now=None):
     # and Claude Code renews it on its first request. So it is not asked with,
     # and not recorded as a fault: `doctor` reported it as one, against an
     # account whose pings were all fine.
-    creds = _read_json(credentials_path(login or account)).get(
-        "claudeAiOauth") or {}
+    creds = credential_json(login or account).get("claudeAiOauth") or {}
     expires = _epoch_seconds(creds.get("expiresAt"))
     if expires and expires <= now + 60:
         return stored, ("its access token has expired; Claude Code renews it "
@@ -4855,7 +5272,7 @@ def account_auth_ok(account):
     """
     # No credentials at all is answerable without spawning anything, and the
     # answer is not in doubt.
-    if not os.path.exists(os.path.join(account.config_dir, ".credentials.json")):
+    if not has_credential(account):
         return False, "not signed in"
     try:
         result = subprocess.run(
@@ -4895,7 +5312,7 @@ def onboarding_pending():
     flag would skip a first run that is Claude Code's to give and the user's
     to see.
     """
-    if not os.path.exists(credentials_path(user_login())):
+    if not has_credential(user_login()):
         return False                  # no login: being asked for one is right
     # Explicitly false, not merely absent. Claude Code writes the flag itself,
     # and reading its absence as "not done" would put a warning on every
@@ -5589,10 +6006,6 @@ def user_login():
     return Login("your own Claude Code", USER_CONFIG_DIR, USER_CONFIG_JSON)
 
 
-def credentials_path(login):
-    return os.path.join(login.config_dir, ".credentials.json")
-
-
 def readable_json(path):
     """
     True when `path` is absent, or present and parseable.
@@ -5624,7 +6037,10 @@ def login_fingerprint(login):
     out. Two separate logins to one account have different grants and coexist
     indefinitely.
     """
-    return grant_fingerprint(_read_text(credentials_path(login)))
+    try:
+        return grant_fingerprint(read_credential(login) or "")
+    except (IOError, OSError, ValueError):
+        return ""
 
 
 def grant_fingerprint(credential):
@@ -5636,7 +6052,7 @@ def grant_fingerprint(credential):
     """
     try:
         creds = (json.loads(credential).get("claudeAiOauth") or {})
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         return ""
     token = creds.get("refreshToken") or ""
     return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
@@ -5652,7 +6068,7 @@ FULL_LOGIN_SCOPES = ("user:file_upload", "user:inference", "user:mcp_servers",
 
 def login_scopes(login):
     """What this stored login is allowed to do, as recorded beside it."""
-    creds = (_read_json(credentials_path(login)).get("claudeAiOauth") or {})
+    creds = (credential_json(login).get("claudeAiOauth") or {})
     scopes = creds.get("scopes")
     return tuple(sorted(scopes)) if isinstance(scopes, list) else ()
 
@@ -5660,7 +6076,7 @@ def login_scopes(login):
 def parked_logins(accounts):
     """{account name: Login} for every account with a login parked."""
     return {a.name: switch_store(a) for a in accounts
-            if os.path.exists(credentials_path(switch_store(a)))}
+            if has_credential(switch_store(a))}
 
 
 def switching_configured(accounts):
@@ -5726,7 +6142,7 @@ def running_claude_sessions():
     try:
         entries = os.listdir("/proc")
     except (IOError, OSError):
-        return []                        # not Linux, or no /proc: say nothing
+        return _sessions_from_ps()       # macOS: no /proc
     mine, found = os.getuid(), []
     for entry in entries:
         if not entry.isdigit():
@@ -5736,9 +6152,7 @@ def running_claude_sessions():
             if os.stat(base).st_uid != mine:
                 continue
             exe = os.path.realpath(os.path.join(base, "exe"))
-            # Two shapes in the wild: the editor extension ships a binary called
-            # `claude`, the native install a versioned one under .../versions/.
-            if os.path.basename(exe) != "claude" and "/claude/versions/" not in exe:
+            if not is_claude_executable(exe):
                 continue
             with open(os.path.join(base, "environ"), "rb") as f:
                 if PING_MARKER_ENV.encode("utf-8") in f.read():
@@ -5746,6 +6160,48 @@ def running_claude_sessions():
         except (IOError, OSError):
             continue                     # exited while we looked, or not ours
         found.append(int(entry))
+    return sorted(found)
+
+
+def is_claude_executable(path):
+    """
+    Whether an executable is Claude Code. Two shapes in the wild: the editor
+    extension ships a binary called `claude`, the native install a versioned
+    one under .../versions/.
+    """
+    return os.path.basename(path) == "claude" or "/claude/versions/" in path
+
+
+def _sessions_from_ps():
+    """
+    Running Claude Code sessions where there is no /proc to read: macOS.
+
+    Pings are not told apart here. `ps` does not reliably show another
+    process's environment on macOS, where the marker lives -- and none run on
+    a Mac anyway, because the pings need systemd.
+    """
+    try:
+        listing = subprocess.run(
+            ["ps", "-axo", "pid=,uid=,comm="], stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, universal_newlines=True,
+            timeout=10).stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return claude_sessions_in_ps(listing, os.getuid())
+
+
+def claude_sessions_in_ps(listing, uid):
+    """
+    The PIDs of `uid`'s Claude Code processes in `ps -axo pid=,uid=,comm=`
+    output. On macOS `comm` is the whole executable path, spaces and all.
+    """
+    found = []
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        if int(parts[1]) == uid and is_claude_executable(parts[2].strip()):
+            found.append(int(parts[0]))
     return sorted(found)
 
 
@@ -6002,12 +6458,18 @@ def _clear_switch_marker():
 
 def backup_user_login():
     """
-    Copy ~/.claude/.credentials.json and ~/.claude.json somewhere safe.
+    Copy the live credential and ~/.claude.json somewhere safe.
 
-    Taken before every switch. These two files are the difference between a
+    Taken before every switch. These two are the difference between a
     signed-in Claude Code and a browser login, and this is the only command here
-    that rewrites them.
+    that rewrites them. The credential is copied from wherever Claude Code
+    reads it -- the file on Linux, the Keychain item on macOS -- into a file
+    either way: a backup is something to read, not something to sign in with.
     """
+    # Read before anything is created, so a Keychain that will not answer
+    # leaves no empty backup directory behind it.
+    credential = read_credential(user_login())
+    config = _read_bytes(USER_CONFIG_JSON)
     secure_dir(SWITCH_ROOT)
     secure_dir(os.path.join(SWITCH_ROOT, ".backups"))
     # One second is not a name. Two switches inside the same second landed in
@@ -6023,9 +6485,10 @@ def backup_user_login():
         directory = "{}-{}".format(base, nth)
     directory = secure_dir(directory)
     saved = []
-    for source, name in ((credentials_path(user_login()), "credentials.json"),
-                         (USER_CONFIG_JSON, "claude.json")):
-        if os.path.exists(source):
+    for body, name in ((credential.encode("utf-8") if credential is not None
+                        else None, "credentials.json"),
+                       (config, "claude.json")):
+        if body is not None:
             target = os.path.join(directory, name)
             # 0600 from the first byte, and O_EXCL so a copy can never land on
             # top of one. `copyfile` creates at the umask's mode and a chmod
@@ -6033,8 +6496,8 @@ def backup_user_login():
             # anyone -- the exact pattern `_write_atomically` documents as not
             # good enough, in the one function handling the last copy.
             handle = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(handle, "wb") as out, open(source, "rb") as incoming:
-                shutil.copyfileobj(incoming, out)
+            with os.fdopen(handle, "wb") as out:
+                out.write(body)
                 out.flush()
                 os.fsync(out.fileno())
             saved.append(target)
@@ -6043,6 +6506,14 @@ def backup_user_login():
         return None
     _prune_backups()
     return directory
+
+
+def _read_bytes(path):
+    """A file's exact bytes, or None when there is no such file."""
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return f.read()
 
 
 def orphan_login(taken):
@@ -6061,8 +6532,23 @@ def orphan_login(taken):
         return None
     secure_dir(SWITCH_ROOT)
     secure_dir(os.path.join(SWITCH_ROOT, ".orphaned"))
-    directory = secure_dir(os.path.join(
-        SWITCH_ROOT, ".orphaned", datetime.now().strftime("%Y%m%d-%H%M%S")))
+    # A second is not a name here either. One switch can orphan twice -- a
+    # dead parked login set aside, then a plaintext copy nothing reads -- and
+    # the second wrote its credential over the first: a login this function
+    # promises never to lose, lost in the instant it was kept. Suffixed the way
+    # backup_user_login suffixes, and claimed with mkdir so two processes
+    # cannot both take one name.
+    base = os.path.join(SWITCH_ROOT, ".orphaned",
+                        datetime.now().strftime("%Y%m%d-%H%M%S"))
+    directory, nth = base, 1
+    while True:
+        try:
+            os.mkdir(directory, 0o700)
+            break
+        except FileExistsError:
+            nth += 1
+            directory = "{}-{}".format(base, nth)
+    directory = secure_dir(directory)
     _write_atomically(os.path.join(directory, ".credentials.json"), credential)
     if identity:
         _write_atomically(os.path.join(directory, ".claude.json"),
@@ -6141,12 +6627,8 @@ def take_login():
     landed removes the moment; the backup taken beforehand covers a crash in
     what is left.
     """
-    path = credentials_path(user_login())
-    credential = None
-    if os.path.exists(path):
-        with open(path) as f:
-            credential = f.read()
-    return credential, (_read_json(USER_CONFIG_JSON).get("oauthAccount") or {})
+    return (read_credential(user_login()),
+            _read_json(USER_CONFIG_JSON).get("oauthAccount") or {})
 
 
 def parked_login_is_dead(store):
@@ -6159,7 +6641,7 @@ def parked_login_is_dead(store):
     move out of the way -- and the kind that accumulates on its own, because a
     store nobody switches to is a login nobody refreshes.
     """
-    creds = _read_json(credentials_path(store)).get("claudeAiOauth") or {}
+    creds = credential_json(store).get("claudeAiOauth") or {}
     if not creds.get("refreshToken"):
         return True
     expires = _epoch_seconds(creds.get("refreshTokenExpiresAt"))
@@ -6174,9 +6656,9 @@ def set_aside_dead_login(store):
     it is dead by every test this tool can apply, and those tests could still
     be wrong.
     """
-    taken = (_read_text(credentials_path(store)), None)
+    taken = (read_credential(store), None)
     directory = orphan_login(taken)
-    os.remove(credentials_path(store))
+    remove_credential(store)
     return directory
 
 
@@ -6205,10 +6687,9 @@ def park_login(account, taken):
         if held and held != grant_fingerprint(credential):
             raise ConfigError(
                 "account {}'s store already holds a different login. Parking "
-                "here would overwrite it, so nothing was parked. Move "
-                "{} aside and re-run.".format(
-                    account.display, credentials_path(store)))
-        _write_atomically(credentials_path(store), credential)
+                "here would overwrite it, so nothing was parked. {}".format(
+                    account.display, move_aside_hint(store, "re-run")))
+        write_credential(store, credential)
     if identity:
         if not readable_json(store.config_json):
             raise ConfigError(
@@ -6252,8 +6733,10 @@ def install_login(store):
         raise ConfigError(
             "{} cannot be parsed; refusing to overwrite it".format(
                 USER_CONFIG_JSON))
-    with open(credentials_path(store)) as f:
-        incoming = f.read()
+    incoming = read_credential(store)
+    if incoming is None:
+        raise CredentialStoreError("no login is parked in {}".format(
+            store.config_dir))
 
     config = _read_json(USER_CONFIG_JSON)
     identity = (_read_json(store.config_json).get("oauthAccount") or {})
@@ -6272,11 +6755,11 @@ def install_login(store):
     body = json.dumps(config, indent=2, sort_keys=True)
     mode = _existing_mode(USER_CONFIG_JSON)
 
-    _write_atomically(credentials_path(user_login()), incoming)
+    write_credential(user_login(), incoming)
     _write_atomically(USER_CONFIG_JSON, body, mode)
 
     try:
-        os.remove(credentials_path(store))
+        remove_credential(store)
     except OSError:
         pass
     return dropped
@@ -6332,7 +6815,7 @@ def should_offer_sign_in(sign_in, store, findings):
     Its own function because as an inline condition nothing could reach it:
     every clause survived being inverted with the suite still green.
     """
-    if not sign_in or os.path.exists(credentials_path(store)):
+    if not sign_in or has_credential(store):
         return False
     blocking = [f for f in findings if f.level == "error"
                 and "No login is parked" not in f.message]
@@ -6418,7 +6901,25 @@ def switch_blockers(account, usable=None):
                else " — and it bills a pay-as-you-go account rather than a "
                     "subscription.")))
 
-    if not os.path.exists(credentials_path(store)):
+    # Read, not merely looked for. A Keychain that will not answer is not the
+    # same as an empty store, and calling it one would offer a browser
+    # sign-in for a login that is sitting right there.
+    try:
+        parked = read_credential(store)
+    except (IOError, OSError) as e:
+        findings.append(Finding(
+            "error",
+            "Account {}'s parked login cannot be read: {}".format(
+                account.display, e),
+            "Nothing can be switched to it until it can. {}".format(
+                "If the Keychain is locked — typical over ssh — unlock it "
+                "with `security unlock-keychain` and switch again."
+                if credential_store() == "keychain" else
+                "Make {} readable by you and switch again.".format(
+                    credentials_path(store)))))
+        return findings
+
+    if parked is None:
         findings.append(Finding(
             "error",
             "No login is parked for account {}".format(account.display),
@@ -6522,8 +7023,10 @@ def switch_blockers(account, usable=None):
             "almost nothing. Repair or move it first — Claude Code will "
             "rebuild what it needs."))
 
+    # Only where the credential is a file. On macOS the Keychain item is what
+    # gets replaced, and a link in ~/.claude is a fallback nobody reads.
     target = credentials_path(user_login())
-    if os.path.islink(target):
+    if credential_store() == "file" and os.path.islink(target):
         findings.append(Finding(
             "warning",
             "{} is a symlink; switching replaces it with a real file".format(target),
@@ -6564,24 +7067,35 @@ def switch_blockers(account, usable=None):
 
 def platform_blocker():
     """
-    Why this cannot work here, or None.
+    Why switching cannot work here, or None.
 
-    On macOS the credential lives in the Keychain, not in a file. A switch
-    would write a file Claude Code ignores, and take the store's only copy of
-    that login on the way -- leaving the user on the account they started with
-    and one browser sign-in worse off. The README has always said macOS is
-    unsupported; nothing enforced it, and `--no-pings` installs cleanly there
-    because it needs neither systemd nor a timer.
+    Linux keeps the credential in a file and macOS in the Keychain, and a
+    switch knows how to move both. Anywhere else this tool does not know where
+    Claude Code keeps it, and a switch that guessed would move something Claude
+    Code never reads -- taking the store's only copy of that login on the way,
+    and leaving the user on the account they started with and one browser
+    sign-in worse off. `--no-pings` installs cleanly everywhere, because it
+    needs neither systemd nor a timer, so this has to be enforced rather than
+    merely said.
     """
     if sys.platform.startswith("linux"):
         return None
+    if sys.platform == "darwin":
+        if os.access(SECURITY_PATH, os.X_OK):
+            return None
+        return Finding(
+            "error",
+            "Switching accounts needs {}, which is missing".format(
+                SECURITY_PATH),
+            "It is how Claude Code reads and writes its login in the Keychain, "
+            "and it ships with macOS; without it nothing can be moved.")
     return Finding(
         "error",
-        "Switching accounts is only supported on Linux (this is {})".format(
+        "Switching accounts works on Linux and macOS, not here ({})".format(
             sys.platform),
-        "Claude Code keeps its credential in the Keychain here, not in a file, "
-        "so a switch would move a file it does not read — and consume the "
-        "parked login doing it.")
+        "This tool does not yet know where Claude Code keeps its login on this "
+        "system, so a switch would move something Claude Code does not read "
+        "— and consume the parked login doing it.")
 
 
 def switch_account(accounts, name=None, sign_in=True):
@@ -6749,9 +7263,10 @@ def _perform_switch(account, current, states):
             sys.stderr.write(
                 "Account {}'s store already holds a different login.\n"
                 "  Parking the one you are using now would overwrite it, and "
-                "nothing else has a copy.\n  Move {} aside, then switch "
-                "again.\n\nNothing was changed.\n".format(
-                    current.display, credentials_path(switch_store(current))))
+                "nothing else has a copy.\n  {}\n\nNothing was "
+                "changed.\n".format(
+                    current.display,
+                    move_aside_hint(switch_store(current), "switch again")))
             return 1
 
     try:
@@ -6812,12 +7327,12 @@ def _perform_switch(account, current, states):
     # one login and one of them is signed out a few hours later. `doctor`
     # catches it eventually; the person who just ran the switch should not have
     # to wait for that.
-    if os.path.exists(credentials_path(switch_store(account))):
+    if has_credential(switch_store(account)):
         sys.stderr.write(
             "WARNING: account {}'s store still holds a copy of the login just "
             "installed.\n  Two directories refreshing one login will sign one "
-            "of them out. Delete {}.\n".format(
-                account.display, credentials_path(switch_store(account))))
+            "of them out. {}\n".format(
+                account.display, delete_hint(switch_store(account))))
     try:
         parked = park_login(current, taken) if current is not None else None
     except ConfigError as e:
@@ -6838,9 +7353,8 @@ def _perform_switch(account, current, states):
             "Switched to account {}, but could not park the login it "
             "replaced: {}\n"
             "  That login now exists only in the backup.{}\n"
-            "  Copy it back into {} before switching away again.\n".format(
-                account.display, e, where,
-                switch_store(current).config_dir if current else "its store"))
+            "  {} before switching away again.\n".format(
+                account.display, e, where, restore_hint(current, backup)))
         return 1
 
     print("Switched your Claude Code to account {}.".format(account.display))
@@ -6985,6 +7499,20 @@ def switch_findings(accounts):
     if not switching_configured(accounts):
         return []
     findings = []
+    # Before anything read from it is believed. A Keychain that will not answer
+    # makes every login below look absent or empty, and the advice for that --
+    # sign in again -- would be wrong for each of them.
+    if credential_store() == "keychain":
+        try:
+            _keychain_has(user_login())
+        except CredentialStoreError as e:
+            findings.append(Finding(
+                "error",
+                "The Keychain cannot be read, so nothing here can be switched: "
+                "{}".format(e),
+                "Unlock it with `security unlock-keychain` — typical over "
+                "ssh — and run `{} doctor` again.".format(COMMAND)))
+            return findings
     # A switch that never finished is the first thing to say, because until it
     # is finished every other answer here -- and in `status`, and in `which` --
     # is computed from an identity that may not match the credential beside it.
@@ -7019,7 +7547,7 @@ def switch_findings(accounts):
     subscriptions = {}
     for account in accounts:
         store = switch_store(account)
-        if not os.path.exists(credentials_path(store)):
+        if not has_credential(store):
             continue
         uuid_ = account_identity(store)["account_uuid"]
         if uuid_:
@@ -7060,7 +7588,7 @@ def switch_findings(accounts):
         store = switch_store(account)
         if not os.path.isdir(store.config_dir):
             continue
-        if not os.path.exists(credentials_path(store)):
+        if not has_credential(store):
             if live is None or live.name != account.name:
                 findings.append(Finding(
                     "warning",
@@ -7130,9 +7658,9 @@ def switch_findings(accounts):
                 "Two directories are refreshing one login, and in about eight "
                 "hours whichever refreshes second is signed out. Nothing here "
                 "creates this state, so it is either a switch that was "
-                "interrupted or a credentials file copied by hand: delete "
-                "{} and sign in again there.".format(
-                    credentials_path(store))))
+                "interrupted or a credential copied by hand. {} Then sign in "
+                "again there: {}".format(
+                    delete_hint(store), sign_in_command(store))))
         if parked_grant and parked_grant == login_fingerprint(account):
             findings.append(Finding(
                 "error",
@@ -7214,8 +7742,9 @@ def platform_warning():
     """
     Say up front what this install will not be able to do here.
 
-    Off Linux, `switch` refuses — the credential lives in the Keychain, not in
-    a file — and on a machine that does not ping, `switch` is the entire point.
+    Off Linux and macOS, `switch` refuses -- nothing here knows where Claude
+    Code keeps its login there -- and on a machine that does not ping, `switch`
+    is the entire point.
     Setup used to run to the end anyway, have the user spend a browser sign-in
     per account, and finish by recommending the one command that was going to
     turn them down. Said here, before anything is spent.
@@ -7225,8 +7754,8 @@ def platform_warning():
         return []
     return [Finding(
         "warning",
-        "Switching accounts does not work on {} — only on Linux".format(
-            sys.platform),
+        "Switching accounts does not work on {} — only on Linux and "
+        "macOS".format(sys.platform),
         "The rest still works: `status`, `which` and `doctor` read a "
         "schedule.json copied from the machine that pings, which is what a "
         "second machine is normally for. What you will not be able to do "

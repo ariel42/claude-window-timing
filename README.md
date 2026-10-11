@@ -4,7 +4,7 @@
 
 Claude Code's 5-hour usage window starts with your first message. Sit down at 9:00 and your next fresh window is five hours away; run out at 11:30 and you wait until 14:00. **claude-window-timing** starts your windows before you need them, keeps them on schedule around the clock, and — with more than one subscription — spaces them so a fresh window is never far away.
 
-It runs quietly in the background on Linux, needs nothing beyond Python and systemd, and never sits between you and Claude.
+The pings run quietly in the background on one Linux machine and need nothing beyond Python and systemd; switching accounts works there and on macOS. It never sits between you and Claude.
 
 [Quick start](#quick-start) · [How it works](docs/how-it-works.md) · [User guide](docs/guide.md)
 
@@ -57,7 +57,7 @@ Use account 1 (personal)
 
 ## Quick start
 
-You need Linux with systemd, [Claude Code](https://github.com/anthropics/claude-code) installed, Python 3, and one or more Claude Pro or Max subscriptions. There is nothing to `pip install`.
+You need Linux with systemd, [Claude Code](https://github.com/anthropics/claude-code) installed, Python 3, and one or more Claude Pro or Max subscriptions. There is nothing to `pip install`. A Mac, or any other machine you only switch accounts on, installs with `./install.sh --no-pings` — see [several machines](docs/guide.md#several-machines).
 
 ```bash
 git clone https://github.com/ariel42/claude-window-timing
@@ -89,7 +89,7 @@ claude-window-timing sends a small automated request to each of your subscriptio
 ## Built to be trusted
 
 - **Small and readable.** One Python file, standard library only, no daemon — just systemd timers. Every design decision is explained where it is made.
-- **Thoroughly tested.** Over 1,700 automated checks, run against a stand-in CLI with no account and no network — including exhaustive and randomized simulations of the scheduling.
+- **Thoroughly tested.** Over 2,200 automated checks, run against stand-ins for the CLI and the macOS Keychain with no account and no network — including exhaustive and randomized simulations of the scheduling.
 - **Measured, not assumed.** Anthropic's 30-minute grid was confirmed on over 150 real window resets, and the cost of the pings was measured on a real account over most of a week. [How it works](docs/how-it-works.md) explains every mechanism and what it rests on.
 
 ## Documentation

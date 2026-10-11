@@ -183,7 +183,7 @@ What this one does instead:
 - **It aims at the window boundary**, on the same UTC grid Anthropic uses, so a missed ping cannot drag the rest out of step.
 - **The pings are engineered to be free**: one identical saved conversation, replayed from a directory whose contents never change, inside the cache lifetime.
 - **It runs several subscriptions as one supply**: windows spaced as evenly as the grid allows, kept that way automatically, and a straight answer to which account to use.
-- **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. Nothing that runs on a timer ever writes to `~/.claude` or `~/.claude.json`; `switch` does, only when you run it, to two files, after copying both somewhere safe — and a test names the single function allowed to write there and fails the day a second one appears.
+- **It stays out of your Claude Code.** Its own directories, its own logins, its own conversations. Nothing that runs on a timer ever writes to `~/.claude`, `~/.claude.json` or the Keychain; `switch` does, only when you run it — to the login and `~/.claude.json`, after copying both somewhere safe — and a test names the single function allowed to write there and fails the day a second one appears.
 - **It refuses to bill you by surprise.** Pings run in interactive mode rather than `--print`, and `ANTHROPIC_API_KEY` is stripped from their environment so a ping can never land on a pay-as-you-go account.
 - **It says when it is broken.** Most failures here are silent — a timer that will never fire again, a login that expired, two accounts that are secretly the same account. `claude-window doctor` names them.
 - **It is small enough to read.** Standard library only, one file, no service to trust and nothing running unless a timer fires. Every design decision that could fail quietly is written down at the point in the source where it applies.
@@ -191,5 +191,6 @@ What this one does instead:
 ## What it relies on
 
 - **Where Claude Code stores its sessions, and the reset times it reports.** Both are internal details a future release could change. The tests would notice, and `doctor` reports what it can verify.
+- **Where Claude Code keeps a login on macOS**: a login Keychain item named `Claude Code-credentials`, plus the first eight hex digits of the SHA-256 of `CLAUDE_CONFIG_DIR` when that is set. Read from Claude Code's source (2.1.238 and 2.1.296) and confirmed against the real binary with fake credentials; a release that changed it would leave `switch` writing an item Claude Code no longer reads.
 - **The 30-minute grid**, checked on every ping as described above.
 - **systemd user timers** on the machine that pings, with lingering enabled so they keep running when you log out.

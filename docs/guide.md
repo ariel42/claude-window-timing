@@ -28,7 +28,7 @@ Two things to decide before you run anything, because both are easier to weigh n
 
 **Requirements**
 
-- **Linux.** Running the pings needs systemd with a user session; a machine that only switches does not.
+- **Linux** to run the pings: systemd with a user session. **Linux or macOS** to switch accounts — a machine that only switches needs no systemd. Windows is not supported yet.
 - **Claude Code**, installed on every machine — including the ones that only switch, and including when you only ever use it through an editor extension. The installer stops and says so if it is missing.
 - **Python 3.** Standard library only; there is nothing to `pip install`.
 - **One or more Claude Pro or Max subscriptions.** You do *not* need to be signed in to anything first.
@@ -157,13 +157,15 @@ CLAUDE_CONFIG_DIR=~/.claude-switch/2 claude    # then /login
 
 The account you are signed in as right now needs no sign-in of its own: the first switch away from it parks the login you already have.
 
+**On macOS** Claude Code keeps its login in the login Keychain rather than in a file, and `switch` moves it there: your own Claude Code's login is the item `Claude Code-credentials`, and each parked login is the item Claude Code itself uses for that store's directory — the one the sign-in above creates. Type that sign-in exactly as printed. Claude Code names the item after the exact text of `CLAUDE_CONFIG_DIR`, so `~/.claude-switch/2/` with a trailing slash is a different item, and a login signed in there is one `switch` never finds. Backups under `~/.claude-switch/.backups` are still files, readable only by you. Over ssh the Keychain is usually locked; `switch` says so and stops, and `security unlock-keychain` is the fix.
+
 **Give each one its own sign-in rather than a copy of an existing login.** Claude Code rotates refresh tokens strictly: the moment one holder refreshes, the token it replaced is rejected outright. A copy therefore keeps working until its own access token runs out — about eight hours — and is then signed out, far enough from the copy that nothing connects the two. Two *separate* logins to one account coexist for as long as they both live, which is why the ping directories each get their own too.
 
 That is also why a switch **moves** a login rather than copying one: the store is a parking place and the copy in `~/.claude` is the only live one. The outgoing login is read into memory, the incoming one installed, and only then is the outgoing one written to its store — so there is no moment when one grant sits in two directories, not even if the machine dies in the middle. `doctor` says so if it ever finds one login in two places. A parked login that has already expired, found in the way of the one being parked, is moved to `~/.claude-switch/.orphaned/` rather than blocking the switch; one that is still live stops it.
 
 Three things worth knowing before you rely on it:
 
-- **It is one dial for the whole machine.** Credentials are re-read per request, so every session already open moves to the new account on its next turn — including the one you ran the command from. `/status` and `/usage` in those sessions report the new account too, so nothing is left disagreeing. That is convenient when you meant it and surprising when you did not: there is no per-session version of this that does not put software in the path of every request, which is a much worse trade.
+- **It is one dial for the whole machine.** Credentials are re-read per request, so every session already open moves to the new account on its next turn — including the one you ran the command from. On macOS Claude Code keeps what it read from the Keychain for up to 30 seconds (read from its source, versions 2.1.238 and 2.1.296), so there an open session can take up to half a minute to follow. `/status` and `/usage` in those sessions report the new account too, so nothing is left disagreeing. That is convenient when you meant it and surprising when you did not: there is no per-session version of this that does not put software in the path of every request, which is a much worse trade.
 - **The first request on the new account re-sends whatever you resume**, because the prompt cache belongs to the account you left. That is the same cost as signing out and back in by hand: roughly a percentage point of the new window per 27,000 tokens of conversation. Switch at a break, and start a fresh session where you can — a new conversation pays almost nothing, a resumed one pays for its whole history.
 - **It refuses when it would not work.** No parked login, one that expired, one signed in as the wrong account, one that is a copy of a login something else is already refreshing, or an `ANTHROPIC_API_KEY`-style override that outranks the saved login entirely — each stops the switch and says which it was. There is no `--force`, because nothing it refuses would have worked.
 
@@ -191,7 +193,7 @@ A ping that fails also exits non-zero, so the account's unit shows as failed in 
 
 A usage window belongs to the **account**, server-side, not to a directory or a computer. A window started by a ping on your home server is the same window you get on your laptop. So run the service on **one** always-on machine and every other machine benefits for free; a second copy would only double the consumption for no gain.
 
-On every other machine, install it without the pings:
+On every other machine — Linux or a Mac — install it without the pings:
 
 ```bash
 ./install.sh --no-pings
@@ -246,13 +248,14 @@ To stop pinging an account but keep the others, remove it from `accounts.json` a
 |---|---|
 | `claude_window_timing.py` | The whole tool. |
 | `install.sh` / `uninstall.sh` | Prerequisite checks, then the wizard; and the teardown. |
-| `test_window_timing.py` | Over 1,700 checks. `python3 test_window_timing.py`. |
+| `test_window_timing.py` | Over 2,200 checks. `python3 test_window_timing.py`. |
 | `fake_claude.py` | A stand-in CLI, so the tests never contact Claude or spend usage. |
+| `fake_security.py` | A stand-in for macOS's `security`, so the tests never touch a real Keychain. |
 | `accounts.example.json` | A starting point for `accounts.json`. |
 
-Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`, and — if you accept the offer — a `claude-window` symlink to `~/.local/bin`, or failing that one marked line in your shell's startup file. Both are removed by `uninstall --purge`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool, including the empty `pingcwd` inside each that its pings run from. `~/.claude-switch/<name>` holds a parked login per account; it appears as soon as you run the sign-in the wizard prints, alongside `.backups/` and `.orphaned/`. `switch` is the only thing that ever writes to `~/.claude` or `~/.claude.json`.
+Created while running (all gitignored): `accounts.json`, `state/<account>/`, `schedule.json`, `bin/claude-window`. Systemd units go to `~/.config/systemd/user/`, and — if you accept the offer — a `claude-window` symlink to `~/.local/bin`, or failing that one marked line in your shell's startup file. Both are removed by `uninstall --purge`. The account directories `~/.claude-1`, `~/.claude-2` … belong to the tool, including the empty `pingcwd` inside each that its pings run from. `~/.claude-switch/<name>` holds a parked login per account — on macOS the login itself is the Keychain item named after that directory; it appears as soon as you run the sign-in the wizard prints, alongside `.backups/` and `.orphaned/`. `switch` is the only thing that ever writes to `~/.claude` or `~/.claude.json`.
 
-The tests cover the decisions that fail silently — which reset time to believe, how to space windows for the least dead time, whether a ping can start a window at the wrong moment, which accounts are safe to recommend, and whether anything writes where it should not — along with the words each command prints in each state it can be in, because a recommendation nobody can act on is a bug too. After a switch, no login may exist in two places at once; that is checked by counting refresh tokens across every directory involved. A full install, uninstall, purge and re-install runs end to end in a sandboxed home directory. They spend no usage: a stand-in CLI plays Claude, so all of that runs with no account and no network, and nothing they do touches a running install.
+The tests cover the decisions that fail silently — which reset time to believe, how to space windows for the least dead time, whether a ping can start a window at the wrong moment, which accounts are safe to recommend, and whether anything writes where it should not — along with the words each command prints in each state it can be in, because a recommendation nobody can act on is a bug too. After a switch, no login may exist in two places at once; that is checked by counting refresh tokens across every directory involved. A full install, uninstall, purge and re-install runs end to end in a sandboxed home directory. They spend no usage: a stand-in CLI plays Claude and a stand-in `security` plays the macOS Keychain, so all of that runs with no account and no network, and nothing they do touches a running install or a real Keychain. Every test that moves a login runs twice, once with the login in a file and once in the Keychain, on whichever system runs them.
 
 ## Billing: subscription vs. API
 
@@ -272,7 +275,7 @@ Whether usage counts against your subscription or a pay-as-you-go API account is
 
 ## Limitations and caveats
 
-- **Linux only, and enforced rather than merely stated.** Running the pings needs systemd; `--no-pings` does not, but switching reads the credentials file Claude Code keeps on Linux, which macOS replaces with the Keychain — so `switch` refuses there rather than consuming a parked login to no effect. Setup on macOS or Windows warns up front that `switch` will not work, `doctor` reports it instead of saying "Everything checks out", and what does still work there — `status`, `which` and `doctor` reading a copied `schedule.json` — carries on working. Switching on macOS and Windows is wanted and not yet built.
+- **The pings need Linux; switching works on Linux and macOS — and that is enforced rather than merely stated.** Running the pings needs systemd; `--no-pings` does not. Switching moves Claude Code's login where Claude Code keeps it — a file on Linux, the login Keychain on macOS — and nowhere else is supported yet, Windows included. There `switch` refuses rather than consume a parked login to no effect, setup warns up front that it will not work, `doctor` reports it instead of saying "Everything checks out", and `status`, `which` and `doctor` reading a copied `schedule.json` carry on working.
 - **Having `systemctl` is not the same as having a systemd user session.** WSL without `systemd=true`, `docker exec`, `su -` and `ssh host ./install.sh` on some distributions all ship the binary and reach no user bus. Setup checks for the manager itself and refuses rather than reporting timers it did not start.
 - **Best on an always-on machine.** The pings do not catch up after downtime: a machine that slept pings at the next half hour and is immediately back in step, but windows due while it slept started late or not at all, and with several subscriptions the first boundaries afterwards are spent re-spacing them.
 - **Accounts must be genuinely different Claude accounts.** Signing in twice as the same one looks like it works and buys nothing; setup checks for it.
