@@ -13,10 +13,10 @@ The pings run quietly in the background on one Linux machine and need nothing be
 - **Half the wait for a fresh window.** You arrive to a window that is already running, so the next fresh one is on average 2½ hours away instead of a fixed 5.
 - **More subscriptions, one steady supply.** Two Pro or Max accounts give you a fresh window every 2½ hours; three, every 1h40m on average; four, every 1h15m — and so on. The windows are held apart automatically, and fall back into place on their own after an outage or a busy day.
 - **A straight answer to "which account now?"** `claude-window which` names the window to spend first, and skips any account that can't serve you: a spent weekly limit, a lapsed plan, an expired sign-in.
-- **Switch in one command.** `claude-window switch` moves your Claude Code to that account. No logging out, no browser — and the sessions you already have open follow it.
+- **Switch in one command.** `claude-window switch` moves your Claude Code to that account, on Linux and on macOS. No logging out, no browser — and the sessions you already have open follow it.
 - **Practically free.** The pings are answered from Claude's prompt cache. Measured on an otherwise idle Pro account: under 1% of its weekly limit after almost a week of pings.
 - **Out of your way.** No wrapper, no proxy, nothing in the path of your requests. Nothing that runs on a timer ever touches your `~/.claude`.
-- **Honest about problems.** `claude-window doctor` catches the failures that are otherwise silent — an expired sign-in, a lapsed subscription, a timer that stopped.
+- **Honest about problems.** `claude-window doctor` catches the failures that are otherwise silent — an expired sign-in, a lapsed subscription, a timer that stopped. Sign-ins last about four weeks; setup shows when each one ends, and `doctor` warns a week before.
 - **Not built on `claude -p`.** The pings drive Claude Code interactively, so they stay on your subscription even if Anthropic revives its paused plan to bill headless use separately ([details](docs/guide.md#billing-subscription-vs-api)).
 
 ## The same morning
