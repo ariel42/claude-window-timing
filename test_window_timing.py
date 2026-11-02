@@ -10674,6 +10674,152 @@ def test_doctor_on_a_switch_only_machine_reports_only_what_applies():
         restore()
 
 
+def test_setup_says_when_each_login_ends():
+    """
+    A sign-in's end date is fixed the moment it is made, so setup can say it
+    then. Two cases matter. A login made today gets the full four weeks. A
+    login that was already there -- setup skips anything signed in, so it is
+    reused -- keeps its own date, which may be days away, and that is the one
+    a user is most likely to be caught out by. Both must print with the command
+    to run. A login with no date must print nothing rather than a made-up one.
+    """
+    section("Setup says when each login ends")
+
+    root = tempfile.mkdtemp()
+    home = os.path.join(root, "home")
+    os.makedirs(home)
+    near = int(time.time()) + 3 * 86400       # an old login, three days from its end
+    stores = {"1": os.path.join(home, ".claude-switch", "1"),
+              "2": os.path.join(home, ".claude-switch", "2")}
+    # Account 1's store holds a reused login with a near date. Account 2's
+    # holds a login whose credential carries no date at all.
+    for name, claude_ai in (
+            ("1", {"accessToken": "t", "subscriptionType": "pro",
+                   "refreshTokenExpiresAt": near * 1000}),
+            ("2", {"accessToken": "t", "subscriptionType": "pro"})):
+        directory = stores[name]
+        os.makedirs(directory, 0o700)
+        with open(os.path.join(directory, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": claude_ai}, f)
+        with open(os.path.join(directory, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": "parked-" + name,
+                                        "emailAddress": "p%s@example.com" % name}}, f)
+
+    out, _, result = _capture(lambda: _clean_install(
+        "", home=home, setup_kwargs={"argv_accounts": 2, "pings": True,
+                                     "assume_yes": True}))
+    check("setup succeeds", result[0], 0)
+    lines = out.splitlines()
+
+    # setup names an account as "Account 1 (a0)", so match the number and the
+    # rest of the line, not the whole name.
+    parked_1 = [l for l in lines if "Account 1 " in l and "'s parked login ends " in l]
+    check("the reused login gets exactly one line", len(parked_1), 1)
+    if parked_1:
+        check_true("it gives the login's own near date", ew.fmt_time(near) in parked_1[0])
+        check_true("and how far off that is", "(in 3 days)" in parked_1[0])
+        check_true("and the command that signs in to its store",
+                   "CLAUDE_CONFIG_DIR={} claude".format(stores["1"]) in parked_1[0])
+        check_true("and then /login", "then /login" in parked_1[0])
+    check("the login with no date gets no line",
+          [l for l in lines if "Account 2 " in l and "'s parked login" in l], [])
+
+    for name in ("1", "2"):
+        ping = os.path.join(home, ".claude-" + name)
+        with open(os.path.join(ping, ".credentials.json")) as f:
+            ping_end = json.load(f)["claudeAiOauth"]["refreshTokenExpiresAt"] / 1000.0
+        found = [l for l in lines
+                 if "Account {} ".format(name) in l and "'s ping login ends " in l]
+        check("account {} gets one line for its ping login".format(name),
+              len(found), 1)
+        if found:
+            check_true("with that ping login's own date",
+                       ew.fmt_time(ping_end) in found[0])
+            check_true("and the command that signs in to its ping directory",
+                       "CLAUDE_CONFIG_DIR={} claude".format(ping) in found[0])
+
+
+def test_status_says_when_each_login_ends():
+    """
+    `status` is where somebody goes to check on an install, so the end date
+    belongs there too, beside the directory each login lives in: the ping
+    directory on a machine that pings, and the parked store wherever it holds
+    a login.
+    """
+    section("Status says when each login ends")
+
+    now = float(int(time.time()))
+    restore, home, accounts = _switch_sandbox(parked=("1",), now=now)
+    saved = ew._systemctl
+    ew._systemctl = _reachable_manager
+    try:
+        said = _capture(lambda: ew.status(accounts))[0]
+    finally:
+        ew._systemctl = saved
+        restore()
+
+    # Every login in the sandbox was made with the default four weeks.
+    when = ew.fmt_time(now + 30 * 86400)
+    ends = [l for l in said.splitlines() if "Login ends" in l]
+    check("each account's ping directory has a Login ends line", len(ends), 2)
+    check_true("and it gives the date, and how far off that is",
+               ends and all(when in l and "(in 30 days)" in l for l in ends))
+    parked = [l for l in said.splitlines() if "Parked ends" in l]
+    check("the parked login has one Parked ends line, and only it does",
+          len(parked), 1)
+    check_true("which gives its date", parked and when in parked[0])
+
+
+def test_a_login_with_no_end_date_says_nothing():
+    """
+    A credential with no end date, or one that is not a number a clock can
+    use, must print no date at all. A made-up date is worse than none, and
+    NaN and infinity pass through the epoch conversion, so they must not
+    crash the formatting either.
+    """
+    section("A login with no end date says nothing")
+
+    now = float(int(time.time()))
+    restore, home, accounts = _switch_sandbox(parked=("1",), now=now)
+    saved = ew._systemctl
+    ew._systemctl = _reachable_manager
+    try:
+        ping, store = accounts[0], ew.switch_store(accounts[0])
+        for login, value in ((ping, None), (store, float("nan"))):
+            with open(ew.credentials_path(login)) as f:
+                document = json.load(f)
+            if value is None:
+                del document["claudeAiOauth"]["refreshTokenExpiresAt"]
+            else:
+                document["claudeAiOauth"]["refreshTokenExpiresAt"] = value
+            with open(ew.credentials_path(login), "w") as f:
+                json.dump(document, f)
+        # Infinity on the second account's ping directory, which is still
+        # perfectly well signed in.
+        with open(ew.credentials_path(accounts[1])) as f:
+            document = json.load(f)
+        document["claudeAiOauth"]["refreshTokenExpiresAt"] = float("inf")
+        with open(ew.credentials_path(accounts[1]), "w") as f:
+            json.dump(document, f)
+
+        check("no note for a missing date", ew.login_end_note(ping), "")
+        check("no note for a date that is not a number",
+              ew.login_end_note(store, "The login"), "")
+        check("no note for an infinite date",
+              ew.login_end_note(accounts[1], "The login"), "")
+
+        result = _capture(lambda: ew.status(accounts))
+        said = result[0]
+        check("status answers rather than raising", result[2], 0)
+        check("no Login ends line for the account with no date",
+              [l for l in said.splitlines() if "Login ends" in l], [])
+        check("no Parked ends line for the store with no date",
+              [l for l in said.splitlines() if "Parked ends" in l], [])
+    finally:
+        ew._systemctl = saved
+        restore()
+
+
 def test_setup_can_install_the_switcher_without_the_pings():
     """
     The whole point of the second machine: no timers, no checkpoints, and no
@@ -12381,6 +12527,9 @@ def main():
                  test_a_machine_that_does_not_ping_is_never_told_to_ping,
                  test_a_machine_can_be_told_it_does_not_ping,
                  test_the_wizard_asks_for_each_sign_in_once_and_no_more,
+                 test_setup_says_when_each_login_ends,
+                 test_status_says_when_each_login_ends,
+                 test_a_login_with_no_end_date_says_nothing,
                  test_the_installer_insists_on_claude_code_in_both_modes,
                  test_a_machine_without_systemd_can_still_install_the_switcher,
                  test_the_first_switch_on_a_machine_that_has_never_run_claude_code,

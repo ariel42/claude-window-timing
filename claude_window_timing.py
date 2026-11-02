@@ -2303,6 +2303,48 @@ def sign_in_command(account):
     return "CLAUDE_CONFIG_DIR={} claude".format(account.config_dir)
 
 
+def login_end_note(login, name=None):
+    """
+    When this login stops working, and what to do about it. "" when not known.
+
+    Every sign-in gets a fixed end date about four weeks out, in
+    refreshTokenExpiresAt, and using the login does not move it. So the date is
+    known the moment a sign-in finishes -- and reusing an old login shows that
+    login's own, usually near, date. Saying it at sign-in is the only time the
+    user can still act on it cheaply; the alternative is finding out from an
+    account that has quietly stopped, which looks exactly like the tool broken.
+
+    With a name, one sentence for setup, with the command to run beside it.
+    Without one, just the date and how far off it is, for a column in `status`.
+    Both come from here so that the two cannot disagree about the date.
+
+    "" when the credential has no date, because a date made up for a login
+    that has none would be worse than saying nothing.
+    """
+    epoch = account_identity(login)["refresh_expires_at"]
+    if not epoch:
+        return ""
+    seconds = epoch - time.time()
+    try:
+        days = round(abs(seconds) / 86400.0)
+    except (ValueError, OverflowError):
+        # NaN and infinity pass _epoch_seconds, and round() refuses both.
+        return ""
+    # Rounded, so "in 3 days" holds when the login was made a few seconds
+    # ago and the arithmetic has already slipped to 2.9999 days.
+    span = ("less than a day" if days == 0
+            else "{} day{}".format(days, "" if days == 1 else "s"))
+    when = fmt_time(epoch)
+    if name is None:
+        return "{} (in {})".format(when, span) if seconds >= 0 \
+            else "{} ({} ago)".format(when, span)
+    if seconds >= 0:
+        return ("Pay attention: {} ends {} (in {}). Run {}, then /login, "
+                "before then.".format(name, when, span, sign_in_command(login)))
+    return ("Pay attention: {} ended {} ({} ago). Sign in again now: {}, then "
+            "/login.".format(name, when, span, sign_in_command(login)))
+
+
 def _sync_marker(path):
     """The first file-sync marker found at or above path, or ''."""
     seen = set()
@@ -4702,6 +4744,16 @@ def status(accounts):
         print("  {:<14}: {}".format(
             "Config dir" if pings else "Parked login",
             account.config_dir if pings else switch_store(account).config_dir))
+        # When each login stops working, beside the directory it lives in. A
+        # login without a date prints nothing rather than a guess; see
+        # login_end_note for why the date is worth showing at all.
+        if pings:
+            ends = login_end_note(account)
+            if ends:
+                print("  {:<14}: {}".format("Login ends", ends))
+        parked_ends = login_end_note(switch_store(account))
+        if parked_ends:
+            print("  {:<14}: {}".format("Parked ends", parked_ends))
 
         installed = (os.path.exists(account.session_id_file)
                      and os.path.exists(account.checkpoint_backup))
@@ -8232,6 +8284,23 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
 
     for directory in tighten_login_dirs(accounts, pings):
         print("Tightened {} to 700 — it holds a login.".format(_tilde(directory)))
+
+    # The end date of every login just signed in to, or reused -- said here
+    # rather than only when a sign-in is still needed, because a reused login is
+    # the one most likely to be close to its end. Printed after the sign-ins, so
+    # the date shown is the one the new login actually has.
+    end_lines = []
+    for account in accounts:
+        if pings:
+            end_lines.append(login_end_note(
+                account, "Account {}'s ping login".format(account.display)))
+        end_lines.append(login_end_note(
+            switch_store(account), "Account {}'s parked login".format(account.display)))
+    end_lines = [line for line in end_lines if line]
+    if end_lines:
+        print()
+        for line in end_lines:
+            print(line)
 
     # ── Checking ────────────────────────────────────────────────────────────
     print()
