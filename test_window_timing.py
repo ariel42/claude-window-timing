@@ -5763,7 +5763,8 @@ def claude_code_forgets(login):
 
 
 def _clean_install(answers, accounts=2, claude_control=None,
-                   home=None, repo=None, after=None, setup_kwargs=None):
+                   home=None, repo=None, after=None, setup_kwargs=None,
+                   expires_at=None):
     """
     Run the wizard in a fresh home directory. Returns (exit code, home, repo,
     recorded systemd calls).
@@ -5771,6 +5772,11 @@ def _clean_install(answers, accounts=2, claude_control=None,
     `after` runs once setup is finished but before the sandbox is taken down, so
     a test can drive a second command — uninstall, say — against the same
     redirected paths the install just used.
+
+    `expires_at` maps an account number to the epoch second its ping login
+    ends. The sign-in written here overwrites whatever is in the ping
+    directories, so a test that needs a particular date must pass it here;
+    writing it into `home` beforehand is lost.
 
     The stand-in Claude is steered by a control file rather than environment
     variables, because build_claude_env() strips anything it does not
@@ -5837,11 +5843,12 @@ def _clean_install(answers, accounts=2, claude_control=None,
         config = os.path.join(home, ".claude-{}".format(index + 1))
         if not os.path.isdir(config):
             os.makedirs(config, 0o700)
+        end = (expires_at or {}).get(index + 1, time.time() + 90 * 86400)
         with open(os.path.join(config, ".credentials.json"), "w") as f:
             json.dump({"claudeAiOauth": {
                 "accessToken": "t", "subscriptionType": "pro",
                 "rateLimitTier": "default_claude_ai",
-                "refreshTokenExpiresAt": int((time.time() + 90 * 86400) * 1000)}}, f)
+                "refreshTokenExpiresAt": int(end * 1000)}}, f)
         with open(os.path.join(config, ".claude.json"), "w") as f:
             json.dump({"oauthAccount": {"accountUuid": "uuid-%d" % index,
                                         "emailAddress": "a%d@example.com" % index},
@@ -10737,6 +10744,14 @@ def test_setup_says_when_each_login_ends():
                        ew.fmt_time(ping_end) in found[0])
             check_true("and the command that signs in to its ping directory",
                        "CLAUDE_CONFIG_DIR={} claude".format(ping) in found[0])
+            # Both ping logins were made with four weeks, so neither is close
+            # enough to warn about: the line must say how to renew, and not
+            # sound like an alarm.
+            check_true("a login with weeks left is not called urgent",
+                       "Pay attention" not in found[0])
+            check_true("and says how to renew it before then",
+                       "to renew it before then run" in found[0]
+                       and "then /login" in found[0])
 
 
 def test_status_says_when_each_login_ends():
@@ -10817,6 +10832,254 @@ def test_a_login_with_no_end_date_says_nothing():
               [l for l in said.splitlines() if "Parked ends" in l], [])
     finally:
         ew._systemctl = saved
+        restore()
+
+
+def _write_end_date(login, value):
+    """Set a login's refreshTokenExpiresAt, as Claude Code would have written it."""
+    with open(ew.credentials_path(login)) as f:
+        document = json.load(f)
+    document["claudeAiOauth"]["refreshTokenExpiresAt"] = value
+    with open(ew.credentials_path(login), "w") as f:
+        json.dump(document, f)
+
+
+def test_status_survives_a_malformed_parked_store():
+    """
+    A store is only as tidy as the last thing that wrote it. A .claude.json
+    that parses as a list, or a credential whose claudeAiOauth is a string, is
+    valid JSON in the wrong shape. status reads every parked store, so either
+    shape must read as "no details" and not raise.
+    """
+    section("A malformed parked store does not stop status")
+
+    for label, config_text, claude_ai in (
+            ("a list where .claude.json should be", "[]", None),
+            ("a string where claudeAiOauth should be", None, "oops")):
+        now = float(int(time.time()))
+        restore, home, accounts = _switch_sandbox(parked=("1",), now=now)
+        saved = ew._systemctl
+        ew._systemctl = _reachable_manager
+        try:
+            store = ew.switch_store(accounts[0])
+            if config_text is not None:
+                with open(store.config_json, "w") as f:
+                    f.write(config_text)
+            if claude_ai is not None:
+                with open(ew.credentials_path(store)) as f:
+                    document = json.load(f)
+                document["claudeAiOauth"] = claude_ai
+                with open(ew.credentials_path(store), "w") as f:
+                    json.dump(document, f)
+            try:
+                result = _capture(lambda: ew.status(accounts))
+                check("status answers with {}".format(label), result[2], 0)
+                check_true("and prints no traceback",
+                           "Traceback" not in result[0] + result[1])
+            except Exception as exc:                          # noqa: BLE001
+                check("status answers with {}".format(label),
+                      "{}: {}".format(type(exc).__name__, exc), "no exception")
+        finally:
+            ew._systemctl = saved
+            restore()
+
+
+def test_setup_survives_a_malformed_parked_store():
+    """
+    Setup reads the same parked stores as status, through the same identity
+    check, so it must not fall over on a malformed one either. Account 1's
+    store holds a list where its .claude.json should be; account 2's holds a
+    string where claudeAiOauth should be.
+    """
+    section("A malformed parked store does not stop setup")
+
+    root = tempfile.mkdtemp()
+    home = os.path.join(root, "home")
+    os.makedirs(home)
+    near = int(time.time()) + 30 * 86400
+    shapes = (("1", "[]", {"accessToken": "t", "subscriptionType": "pro",
+                           "refreshTokenExpiresAt": near * 1000}),
+              ("2", "{}", "oops"))
+    for name, config_text, claude_ai in shapes:
+        directory = os.path.join(home, ".claude-switch", name)
+        os.makedirs(directory, 0o700)
+        with open(os.path.join(directory, ".claude.json"), "w") as f:
+            f.write(config_text)
+        with open(os.path.join(directory, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": claude_ai}, f)
+
+    try:
+        result = _capture(lambda: _clean_install(
+            "", home=home, setup_kwargs={"argv_accounts": 2, "pings": True,
+                                         "assume_yes": True}))
+        check("setup finishes with malformed stores", result[2][0], 0)
+        check_true("and prints no traceback",
+                   "Traceback" not in result[0] + result[1])
+    except Exception as exc:                                  # noqa: BLE001
+        check("setup finishes with malformed stores",
+              "{}: {}".format(type(exc).__name__, exc), "no exception")
+
+
+def test_a_date_no_clock_could_show_says_nothing():
+    """
+    Claude Code writes milliseconds. A value far outside any real end date --
+    1e308, a date in the year 33000, or one years ahead -- is corrupt, and a
+    sentence built from it is made-up text. Outside 2020 to two years ahead the
+    note must be empty, while a login that really expired days ago still says
+    so.
+    """
+    section("An end date no clock could show says nothing")
+
+    now = float(int(time.time()))
+    restore, home, accounts = _switch_sandbox(parked=("1",), now=now)
+    saved = ew._systemctl
+    ew._systemctl = _reachable_manager
+    try:
+        store = ew.switch_store(accounts[0])
+        name = "Account 1's parked login"
+        for label, value in (("1e308", 1e308),
+                             ("1e15", 1e15),
+                             ("1e12 (2001)", 1e12),
+                             ("three years ahead", (now + 3 * 365 * 86400) * 1000)):
+            _write_end_date(store, value)
+            check("no note for {} ms, with a name".format(label),
+                  ew.login_end_note(store, name), "")
+            check("no note for {} ms, without one".format(label),
+                  ew.login_end_note(store), "")
+
+        _write_end_date(store, (now - 3 * 86400) * 1000)
+        expired = ew.login_end_note(store, name)
+        check_true("a login that expired three days ago still says so",
+                   expired.startswith("Pay attention: " + name + " ended "))
+        check_true("in days ago", "(3 days ago)" in expired)
+        check_true("and the bare form says ago too",
+                   ew.login_end_note(store).endswith("(3 days ago)"))
+    finally:
+        ew._systemctl = saved
+        restore()
+
+
+def test_a_healthy_login_is_not_flagged_as_urgent():
+    """
+    "Pay attention" is for a login inside REFRESH_WARNING_DAYS, or one that has
+    expired. A login with weeks left gets the neutral sentence, because the same
+    alarm on every healthy login teaches people to skip it.
+    """
+    section("Only a login near its end is called urgent")
+
+    now = float(int(time.time()))
+    restore, home, accounts = _switch_sandbox(parked=("1",), now=now)
+    saved = ew._systemctl
+    ew._systemctl = _reachable_manager
+    try:
+        store = ew.switch_store(accounts[0])
+        name = "Account 1's parked login"
+        renew = "to renew it before then run {}, then /login.".format(
+            ew.sign_in_command(store))
+
+        _write_end_date(store, (now + 20 * 86400) * 1000)
+        healthy = ew.login_end_note(store, name)
+        check_true("twenty days out is said plainly",
+                   healthy.startswith(name + " ends "))
+        check_true("with how to renew it", renew in healthy)
+        check_true("and no alarm", "Pay attention" not in healthy)
+
+        _write_end_date(store, (now + 3 * 86400) * 1000)
+        soon = ew.login_end_note(store, name)
+        check_true("three days out is called urgent",
+                   soon.startswith("Pay attention: " + name + " ends "))
+        check_true("and says to sign in before then",
+                   "Run {}, then /login, before then.".format(
+                       ew.sign_in_command(store)) in soon)
+
+        check("the window: no date means no window", ew.login_window(None), None)
+        check("the window: a past date is expired",
+              ew.login_window(now - 1, now), "expired")
+        check("the window: under seven days is soon",
+              ew.login_window(now + 7 * 86400 - 1, now), "soon")
+        check("the window: seven days or more is later",
+              ew.login_window(now + 7 * 86400, now), "later")
+    finally:
+        ew._systemctl = saved
+        restore()
+
+
+def test_setup_says_each_login_end_once():
+    """
+    Setup prints each login's end date, and validate_accounts warns about one
+    that is close or expired. Inside that window both would give the same date,
+    so setup leaves its ping line out there and the warning carries it. A
+    parked login is never validated, so its line is kept, and its date shows
+    once.
+    """
+    section("Setup says each end date once")
+
+    for offset in (3 * 86400, -3 * 86400):
+        root = tempfile.mkdtemp()
+        home = os.path.join(root, "home")
+        os.makedirs(home)
+        now = time.time()
+        ping_end = int(now) + offset                       # the ping login
+        parked_end = int(now) + 5 * 86400                  # the parked login
+
+        store = os.path.join(home, ".claude-switch", "1")
+        os.makedirs(store, 0o700)
+        with open(os.path.join(store, ".credentials.json"), "w") as f:
+            json.dump({"claudeAiOauth": {
+                "accessToken": "access-parked", "refreshToken": "refresh-parked",
+                "subscriptionType": "pro",
+                "refreshTokenExpiresAt": parked_end * 1000}}, f)
+        with open(os.path.join(store, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {"accountUuid": "parked-1",
+                                        "emailAddress": "parked1@example.com"}}, f)
+
+        label = "a ping login {} days {}".format(
+            abs(offset) // 86400, "ahead" if offset > 0 else "ago")
+        out, err, result = _capture(lambda: _clean_install(
+            "", home=home, setup_kwargs={"argv_accounts": 2, "pings": True,
+                                         "assume_yes": True},
+            expires_at={1: ping_end}))
+        # An expired login stops setup, as validate_accounts' error does, so
+        # setup exits 1 there; the date still has to appear once.
+        check("setup finishes with {}".format(label), result[0],
+              0 if offset > 0 else 1)
+        # Count lines that name account 1, not the raw date: the usage line can
+        # carry the same reset time, which is not an end line.
+        ping_lines = [l for l in out.splitlines()
+                      if ew.fmt_time(ping_end) in l and "Account 1" in l]
+        check("{}: its date is said once".format(label), len(ping_lines), 1)
+        check("{}: the parked login's date is said once".format(label),
+              out.count(ew.fmt_time(parked_end)), 1)
+
+
+def test_the_doctor_sign_in_hint_ends_in_then_login():
+    """
+    The hint names the command to run, and that command only renews the login
+    once /login is typed inside Claude Code. Left out, the user runs the
+    command and sees nothing change.
+    """
+    section("doctor's sign-in hint says to finish with /login")
+
+    restore, home, accounts = _switch_sandbox(signed_in_as="1", pings=True)
+    saved = ew._systemctl, ew.ACCOUNTS_FILE
+    ew._systemctl = _reachable_manager
+    ew.ACCOUNTS_FILE = os.path.join(home, "accounts.json")
+    try:
+        with open(ew.ACCOUNTS_FILE, "w") as f:
+            json.dump({"pings": True, "accounts": [{"name": "1"},
+                                                   {"name": "2"}]}, f)
+        os.remove(ew.credentials_path(accounts[1]))
+        out, _, _ = _capture(lambda: ew.doctor(accounts))
+        # Account 1 has no login here either, so match on account 2's command.
+        command = ew.sign_in_command(accounts[1])
+        hints = [l for l in out.splitlines()
+                 if "Sign in again with: " + command in l]
+        check("the account with no login is told to sign in", len(hints), 1)
+        check_true("and the hint ends with then /login",
+                   bool(hints) and hints[0].rstrip().endswith(
+                       command + ", then /login"))
+    finally:
+        ew._systemctl, ew.ACCOUNTS_FILE = saved
         restore()
 
 
@@ -12530,6 +12793,12 @@ def main():
                  test_setup_says_when_each_login_ends,
                  test_status_says_when_each_login_ends,
                  test_a_login_with_no_end_date_says_nothing,
+                 test_status_survives_a_malformed_parked_store,
+                 test_setup_survives_a_malformed_parked_store,
+                 test_a_date_no_clock_could_show_says_nothing,
+                 test_a_healthy_login_is_not_flagged_as_urgent,
+                 test_setup_says_each_login_end_once,
+                 test_the_doctor_sign_in_hint_ends_in_then_login,
                  test_the_installer_insists_on_claude_code_in_both_modes,
                  test_a_machine_without_systemd_can_still_install_the_switcher,
                  test_the_first_switch_on_a_machine_that_has_never_run_claude_code,

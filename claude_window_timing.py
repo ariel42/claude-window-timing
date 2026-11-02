@@ -2258,6 +2258,25 @@ Finding = collections.namedtuple("Finding", "level message hint")
 
 REFRESH_WARNING_DAYS = 7
 
+
+def login_window(epoch, now=None):
+    """
+    Where a login's end date falls: "expired", "soon" or "later"; None if unknown.
+
+    "soon" is inside REFRESH_WARNING_DAYS. validate_accounts reports the
+    expired and soon cases, and setup's end-date lines must leave those out so
+    the same date is not said twice. Both take their answer from here, so the
+    two cannot disagree about which dates are alarming.
+    """
+    if not epoch:
+        return None
+    now = time.time() if now is None else now
+    if epoch <= now:
+        return "expired"
+    if epoch - now < REFRESH_WARNING_DAYS * 86400:
+        return "soon"
+    return "later"
+
 # Markers left by file-sync tools in the directories they manage. A ping
 # directory holds a login, and Claude Code rewrites its token in place on every
 # refresh — so two machines syncing one directory take turns invalidating each
@@ -2274,6 +2293,11 @@ def _epoch_seconds(value):
     return value / 1000.0 if value > 1e11 else float(value)
 
 
+def _object_or_empty(value):
+    """A parsed JSON value that should be an object, or {} when it is not one."""
+    return value if isinstance(value, dict) else {}
+
+
 def account_identity(account):
     """
     Who an account is, from Claude Code's own files. Empty when never logged in.
@@ -2281,10 +2305,17 @@ def account_identity(account):
     Two places are involved: the identity lives in .claude.json's
     oauthAccount, while the token and plan live in the credential -- a file
     inside the config directory on Linux, a Keychain item on macOS.
+
+    Every level is checked as it is read. A file that parses as JSON but is
+    the wrong shape -- a list where the object should be, or a string where
+    claudeAiOauth should be -- must read as empty, not raise: `status` and
+    setup both call this on a parked store, and a store is only as tidy as the
+    last thing that wrote it.
     """
-    oauth = (_read_json(account.config_json).get("oauthAccount") or {})
+    oauth = _object_or_empty(
+        _object_or_empty(_read_json(account.config_json)).get("oauthAccount"))
     creds = credential_json(account)
-    claude_ai = creds.get("claudeAiOauth") or {}
+    claude_ai = _object_or_empty(creds.get("claudeAiOauth"))
     return {
         "account_uuid": oauth.get("accountUuid"),
         "email": oauth.get("emailAddress"),
@@ -2303,6 +2334,14 @@ def sign_in_command(account):
     return "CLAUDE_CONFIG_DIR={} claude".format(account.config_dir)
 
 
+# What a believable login end date looks like. Nothing this tool or Claude Code
+# writes predates 2020, and a sign-in lasts about four weeks, so two years ahead
+# is generous. Outside that the field is corrupt, and saying a date is worse
+# than saying nothing.
+_PLAUSIBLE_END_EARLIEST = 1577836800          # 2020-01-01 00:00 UTC
+_PLAUSIBLE_END_AHEAD_SEC = 2 * 365 * 86400
+
+
 def login_end_note(login, name=None):
     """
     When this login stops working, and what to do about it. "" when not known.
@@ -2318,31 +2357,42 @@ def login_end_note(login, name=None):
     Without one, just the date and how far off it is, for a column in `status`.
     Both come from here so that the two cannot disagree about the date.
 
+    The name form says "Pay attention" only inside REFRESH_WARNING_DAYS or
+    after expiry. A login with weeks left gets the neutral sentence, because
+    "pay attention" on every healthy login teaches people to skip it.
+
     "" when the credential has no date, because a date made up for a login
-    that has none would be worse than saying nothing.
+    that has none would be worse than saying nothing. The same goes for a date
+    no clock should show: Claude Code writes milliseconds, and a value read as
+    seconds gives "in 11553315 days". Outside 2020 to two years ahead, the field
+    is corrupt. Expired logins inside that range keep their "ended" wording.
     """
     epoch = account_identity(login)["refresh_expires_at"]
-    if not epoch:
+    # The bounds test also rejects NaN and infinity, which pass _epoch_seconds:
+    # every comparison with NaN is false, so `not (...)` is true for both.
+    if not (_PLAUSIBLE_END_EARLIEST <= (epoch or 0)
+            <= time.time() + _PLAUSIBLE_END_AHEAD_SEC):
         return ""
     seconds = epoch - time.time()
-    try:
-        days = round(abs(seconds) / 86400.0)
-    except (ValueError, OverflowError):
-        # NaN and infinity pass _epoch_seconds, and round() refuses both.
-        return ""
+    window = login_window(epoch)
     # Rounded, so "in 3 days" holds when the login was made a few seconds
     # ago and the arithmetic has already slipped to 2.9999 days.
+    days = round(abs(seconds) / 86400.0)
     span = ("less than a day" if days == 0
             else "{} day{}".format(days, "" if days == 1 else "s"))
     when = fmt_time(epoch)
     if name is None:
         return "{} (in {})".format(when, span) if seconds >= 0 \
             else "{} ({} ago)".format(when, span)
-    if seconds >= 0:
+    command = sign_in_command(login)
+    if window == "later":
+        return ("{} ends {} (in {}); to renew it before then run {}, then "
+                "/login.".format(name, when, span, command))
+    if window == "soon":
         return ("Pay attention: {} ends {} (in {}). Run {}, then /login, "
-                "before then.".format(name, when, span, sign_in_command(login)))
+                "before then.".format(name, when, span, command))
     return ("Pay attention: {} ended {} ({} ago). Sign in again now: {}, then "
-            "/login.".format(name, when, span, sign_in_command(login)))
+            "/login.".format(name, when, span, command))
 
 
 def _sync_marker(path):
@@ -2401,20 +2451,24 @@ def validate_accounts(accounts):
         # then" -- present tense about the past, and an instruction nobody can
         # follow -- directly under the error correctly reporting the same login
         # as unusable. `switch_findings` has always drawn the line; this did not.
-        if expires and expires <= time.time():
+        # Each sign-in command ends in "then /login": a re-sign-in only renews
+        # the login once that is typed inside Claude Code.
+        window = login_window(expires)
+        if window == "expired":
             findings.append(Finding(
                 "error",
                 "Account {}'s login expired {}".format(
                     account.name, fmt_time(expires)),
                 "Nothing can be read or pinged with it until you sign in "
-                "again: {}".format(sign_in_command(account))))
-        elif expires and expires - time.time() < REFRESH_WARNING_DAYS * 86400:
+                "again: {}, then /login".format(sign_in_command(account))))
+        elif window == "soon":
             findings.append(Finding(
                 "warning",
                 "Account {}'s login expires {}".format(
                     account.name, fmt_time(expires)),
-                "Sign in again before then; an expired login looks exactly like "
-                "the tool having stopped working."))
+                "Sign in again before then with: {}, then /login. An expired "
+                "login looks exactly like the tool having stopped working."
+                .format(sign_in_command(account))))
 
         mode = _permissions(account.config_dir)
         if mode is not None and mode & 0o077:
@@ -5026,7 +5080,8 @@ def doctor(accounts):
             findings.append(Finding(
                 "error", "Account {}'s login is not usable: {}".format(
                     account.name, detail),
-                "Sign in again with: {}".format(sign_in_command(account))))
+                "Sign in again with: {}, then /login".format(
+                    sign_in_command(account))))
 
         enabled = _systemctl("is-enabled", account.timer_unit)
         if not reachable:
@@ -8291,7 +8346,12 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
     # the date shown is the one the new login actually has.
     end_lines = []
     for account in accounts:
-        if pings:
+        # A ping login inside the warning window, or expired, is already in the
+        # Checking section's findings with the same date, so saying it here too
+        # would print the date twice. The same window test decides both.
+        ping_reported = login_window(
+            account_identity(account)["refresh_expires_at"]) in ("soon", "expired")
+        if pings and not ping_reported:
             end_lines.append(login_end_note(
                 account, "Account {}'s ping login".format(account.display)))
         end_lines.append(login_end_note(
