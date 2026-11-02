@@ -2329,9 +2329,30 @@ def account_identity(account):
     }
 
 
+def sign_in_command_in(config_dir):
+    """
+    The command that signs Claude Code in to one config directory.
+
+    Every sign-in hint is built from this and sign_in_step, so the spelling
+    cannot drift between `setup`, `doctor`, `switch` and `status`.
+    """
+    return "CLAUDE_CONFIG_DIR={} claude".format(config_dir)
+
+
 def sign_in_command(account):
     """How to sign in to this account's ping directory."""
-    return "CLAUDE_CONFIG_DIR={} claude".format(account.config_dir)
+    return sign_in_command_in(account.config_dir)
+
+
+def sign_in_step(account):
+    """
+    The whole sign-in instruction for an account: the command, then /login.
+
+    A re-sign-in only renews the login once /login is typed inside Claude Code,
+    so a hint that stops at the command leaves the user thinking they are done.
+    Every hint goes through here so that none can forget it.
+    """
+    return "{}, then /login".format(sign_in_command(account))
 
 
 # What a believable login end date looks like. Nothing this tool or Claude Code
@@ -2384,15 +2405,15 @@ def login_end_note(login, name=None):
     if name is None:
         return "{} (in {})".format(when, span) if seconds >= 0 \
             else "{} ({} ago)".format(when, span)
-    command = sign_in_command(login)
+    step = sign_in_step(login)
     if window == "later":
-        return ("{} ends {} (in {}); to renew it before then run {}, then "
-                "/login.".format(name, when, span, command))
+        return ("{} ends {} (in {}); to renew it before then run {}."
+                .format(name, when, span, step))
     if window == "soon":
-        return ("Pay attention: {} ends {} (in {}). Run {}, then /login, "
-                "before then.".format(name, when, span, command))
-    return ("Pay attention: {} ended {} ({} ago). Sign in again now: {}, then "
-            "/login.".format(name, when, span, command))
+        return ("Pay attention: {} ends {} (in {}). Run {}, before then."
+                .format(name, when, span, step))
+    return ("Pay attention: {} ended {} ({} ago). Sign in again now: {}."
+            .format(name, when, span, step))
 
 
 def _sync_marker(path):
@@ -2427,15 +2448,15 @@ def validate_accounts(accounts):
                 "error",
                 "Account {}: {} does not exist".format(
                     account.name, account.config_dir),
-                "Create it and sign in with: {}".format(sign_in_command(account))))
+                "Create it and sign in with: {}".format(sign_in_step(account))))
             continue
 
         if not identity["has_token"] and not identity["account_uuid"]:
             findings.append(Finding(
                 "error",
                 "Account {} is not signed in".format(account.name),
-                "Sign in with: {}   then /login (this sends no message, so it "
-                "starts no usage window)".format(sign_in_command(account))))
+                "Sign in with: {} (this sends no message, so it "
+                "starts no usage window)".format(sign_in_step(account))))
 
         subscription = (identity["subscription"] or "").lower()
         if subscription and subscription in ("free", "none"):
@@ -2460,15 +2481,15 @@ def validate_accounts(accounts):
                 "Account {}'s login expired {}".format(
                     account.name, fmt_time(expires)),
                 "Nothing can be read or pinged with it until you sign in "
-                "again: {}, then /login".format(sign_in_command(account))))
+                "again: {}".format(sign_in_step(account))))
         elif window == "soon":
             findings.append(Finding(
                 "warning",
                 "Account {}'s login expires {}".format(
                     account.name, fmt_time(expires)),
-                "Sign in again before then with: {}, then /login. An expired "
+                "Sign in again before then with: {}. An expired "
                 "login looks exactly like the tool having stopped working."
-                .format(sign_in_command(account))))
+                .format(sign_in_step(account))))
 
         mode = _permissions(account.config_dir)
         if mode is not None and mode & 0o077:
@@ -4456,8 +4477,8 @@ def _init(account):
                      "is no reply to build the checkpoint from — {}".format(
                          describe_ping_error(result["error"])))
         if result["error"].get("needs_you"):
-            log(account, "Sign in again with: {}, then run ./install.sh "
-                         "again.".format(sign_in_command(account)))
+            log(account, "Sign in again with: {}. Then run ./install.sh "
+                         "again.".format(sign_in_step(account)))
         _discard_session(account, checkpoint_id)
         sys.exit(1)
 
@@ -5080,8 +5101,8 @@ def doctor(accounts):
             findings.append(Finding(
                 "error", "Account {}'s login is not usable: {}".format(
                     account.name, detail),
-                "Sign in again with: {}, then /login".format(
-                    sign_in_command(account))))
+                "Sign in again with: {}".format(
+                    sign_in_step(account))))
 
         enabled = _systemctl("is-enabled", account.timer_unit)
         if not reachable:
@@ -5170,7 +5191,7 @@ def doctor(accounts):
                 "than this machine: a lapsed subscription, an organisation "
                 "that has turned Claude Code off, or a revoked sign-in. Fix it "
                 "on claude.ai or sign in again: {}".format(
-                    sign_in_command(account))))
+                    sign_in_step(account))))
         elif failures >= UNHEALTHY_AFTER:
             why = describe_ping_error(error)
             findings.append(Finding(
@@ -7157,10 +7178,9 @@ def switch_blockers(account, usable=None):
             "error",
             "No login is parked for account {}".format(account.display),
             "Sign in once, in a browser, and it stays parked:\n"
-            "       {}\n"
-            "     then /login. Give it its own sign-in rather than copying one: "
+            "       {}. Give it its own sign-in rather than copying one: "
             "two holders of a single login sign each other out.".format(
-                sign_in_command(store))))
+                sign_in_step(store))))
         return findings          # nothing further can be said about an absent login
 
     identity = account_identity(store)
@@ -7168,14 +7188,14 @@ def switch_blockers(account, usable=None):
         findings.append(Finding(
             "error",
             "Account {}'s parked login has no access token".format(account.display),
-            "Sign in again: {}".format(sign_in_command(store))))
+            "Sign in again: {}".format(sign_in_step(store))))
     expires = identity["refresh_expires_at"]
     if expires and expires <= time.time():
         findings.append(Finding(
             "error",
             "Account {}'s parked login expired {}".format(
                 account.display, fmt_time(expires)),
-            "Sign in again: {}".format(sign_in_command(store))))
+            "Sign in again: {}".format(sign_in_step(store))))
     # Judged on the login that is about to be installed, which is the only one
     # that decides whether the session works. The account's *ping* directory is
     # a different login and answers a different question -- see the warning at
@@ -7188,7 +7208,7 @@ def switch_blockers(account, usable=None):
                 account.display, identity["subscription"]),
             "Switching to it would leave your Claude Code signed in to an "
             "account that cannot serve a request. Sign in as a subscriber: "
-            "{}".format(sign_in_command(store))))
+            "{}".format(sign_in_step(store))))
 
     # Who this slot is, where this machine can say: its ping directory. A
     # machine that only switches has none, and the slot is then defined by the
@@ -7205,7 +7225,7 @@ def switch_blockers(account, usable=None):
                 account.display, identity["email"] or got[:8]),
             "The schedule copied here lists {} accounts, and that is not one "
             "of them. Sign in as one that is: {}".format(
-                len(known), sign_in_command(store))))
+                len(known), sign_in_step(store))))
     if not got:
         # Without it the identity in ~/.claude.json would keep naming the old
         # account while the new one is billed — the mixture this whole section
@@ -7216,14 +7236,14 @@ def switch_blockers(account, usable=None):
             "is".format(account.display),
             "Its .claude.json has no oauthAccount block, so switching would "
             "leave Claude Code naming the account you left. Sign in again: "
-            "{}".format(sign_in_command(store))))
+            "{}".format(sign_in_step(store))))
     elif want and want != got:
         findings.append(Finding(
             "error",
             "The login parked for account {} is signed in as {}, which is not "
             "the account this slot pings".format(
                 account.display, identity["email"] or got[:8]),
-            "Sign in as the right account: {}".format(sign_in_command(store))))
+            "Sign in as the right account: {}".format(sign_in_step(store))))
 
     parked_grant = login_fingerprint(store)
     # Against the live login as well as the ping directory. `doctor` already
@@ -7237,7 +7257,7 @@ def switch_blockers(account, usable=None):
             "using right now".format(account.display),
             "Installing it would put one grant in two places, and about eight "
             "hours later one of them would be signed out. Sign in again so the "
-            "store holds its own: {}".format(sign_in_command(store))))
+            "store holds its own: {}".format(sign_in_step(store))))
     if parked_grant and parked_grant == login_fingerprint(account):
         findings.append(Finding(
             "error",
@@ -7245,7 +7265,7 @@ def switch_blockers(account, usable=None):
             "separate one".format(account.display),
             "Refresh tokens rotate, so the two would take turns invalidating "
             "each other and one of them would be signed out. Sign in again so "
-            "the store holds its own: {}".format(sign_in_command(store))))
+            "the store holds its own: {}".format(sign_in_step(store))))
 
     if not readable_json(USER_CONFIG_JSON):
         findings.append(Finding(
@@ -7832,7 +7852,7 @@ def switch_findings(accounts):
                 "Two slots, one subscription: switching between them changes "
                 "nothing and the second buys no quota. Sign one of them in as "
                 "a different account: {}".format(
-                    sign_in_command(switch_store(shared[-1])))))
+                    sign_in_step(switch_store(shared[-1])))))
     for shared in grants.values():
         if len(shared) > 1:
             findings.append(Finding(
@@ -7843,7 +7863,7 @@ def switch_findings(accounts):
                 "rotate, so they will take turns invalidating each other until "
                 "one is signed out. Sign in again in {} so it has its own: "
                 "{}".format(switch_store(shared[-1]).config_dir,
-                            sign_in_command(switch_store(shared[-1])))))
+                            sign_in_step(switch_store(shared[-1])))))
     # An empty store is only a gap when that account's login is somewhere else
     # entirely. For the account you are signed in as it is the healthy state --
     # its login is live in ~/.claude, which is the whole point of the store
@@ -7861,7 +7881,7 @@ def switch_findings(accounts):
                     "Account {} has a switch directory but no login parked in "
                     "it".format(account.display),
                     "You cannot switch to it until there is one: {}".format(
-                        sign_in_command(store))))
+                        sign_in_step(store))))
             continue
         identity = account_identity(store)
         expires = identity["refresh_expires_at"]
@@ -7876,7 +7896,7 @@ def switch_findings(accounts):
                 "Account {}'s parked login expired {}".format(
                     account.display, fmt_time(expires)),
                 "You cannot switch to it until you sign in again: {}".format(
-                    sign_in_command(store))))
+                    sign_in_step(store))))
         elif expires and expires - time.time() < REFRESH_WARNING_DAYS * 86400:
             findings.append(Finding(
                 "warning",
@@ -7913,7 +7933,7 @@ def switch_findings(accounts):
                 "It can still answer, but not everything Claude Code does — "
                 "and a narrowed sign-in cannot be widened again, only "
                 "replaced. Sign in once more: {}".format(
-                    sign_in_command(store))))
+                    sign_in_step(store))))
 
         parked_grant = login_fingerprint(store)
         if parked_grant and parked_grant == login_fingerprint(user_login()):
@@ -7926,7 +7946,7 @@ def switch_findings(accounts):
                 "creates this state, so it is either a switch that was "
                 "interrupted or a credential copied by hand. {} Then sign in "
                 "again there: {}".format(
-                    delete_hint(store), sign_in_command(store))))
+                    delete_hint(store), sign_in_step(store))))
         if parked_grant and parked_grant == login_fingerprint(account):
             findings.append(Finding(
                 "error",
@@ -7934,7 +7954,7 @@ def switch_findings(accounts):
                 "use".format(account.display),
                 "Refresh tokens rotate, so these two will take turns "
                 "invalidating each other until one is signed out. Give the "
-                "store its own sign-in: {}".format(sign_in_command(store))))
+                "store its own sign-in: {}".format(sign_in_step(store))))
     return findings
 
 
@@ -8326,7 +8346,7 @@ def setup(argv_accounts=None, pings=None, assume_yes=False):
             print()
             print("  Account {}".format(account.display))
             for what, directory in rows:
-                print("    CLAUDE_CONFIG_DIR={} claude".format(directory))
+                print("    {}".format(sign_in_command_in(directory)))
                 print("      then /login — for {}".format(what))
         print()
         print("That is {} browser sign-in{}, once on this machine.".format(

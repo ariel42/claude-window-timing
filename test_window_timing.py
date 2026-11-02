@@ -996,7 +996,34 @@ def test_init_refuses_to_checkpoint_a_refusal():
         ew.run_interactive = original_run
 
 
-# ---------------------------------------------------------------------------
+def test_init_sign_in_hint_after_a_failed_first_message_ends_in_then_login():
+    """
+    A first message that Claude Code answers with an expired login is logged with
+    the sign-in instruction. The instruction only renews the login once /login is
+    typed, so the logged line has to end in it, or the user stops at the command.
+    """
+    section("Setup's failed-first-message hint says to type /login")
+    account = temp_account()
+    original_run = ew.run_interactive
+    ew.run_interactive = lambda *a, **k: {
+        "completed": False, "limited": False, "text": "",
+        "error": {"error": "authentication_error", "status": 401,
+                  "text": "Please run /login", "needs_you": True}}
+    try:
+        try:
+            ew.init(account)
+            check("setup exits rather than continuing", "returned normally", "SystemExit")
+        except SystemExit as exc:
+            check("setup exits non-zero", exc.code, 1)
+        with open(account.log_file) as f:
+            logged = f.read()
+        expected = "Sign in again with: {}. Then run ./install.sh again.".format(
+            ew.sign_in_command(account) + ", then /login")
+        check_true("the hint names the account's own sign-in, then /login",
+                   expected in logged)
+    finally:
+        ew.run_interactive = original_run
+
 
 # ---------------------------------------------------------------------------
 # PTY teardown
@@ -5762,6 +5789,46 @@ def claude_code_forgets(login):
         os.remove(path)
 
 
+def _edit_credential(login, change):
+    """
+    Change a login's credential as a repair or a stale tool would: read what
+    Claude Code would use, apply `change` to the parsed document, and save it
+    back where Claude Code keeps it. On macOS that is the Keychain item, so an
+    edit made to the file beside it would be silently overridden.
+    """
+    document = json.loads(claude_code_reads(login))
+    change(document)
+    claude_code_saves(login, json.dumps(document))
+
+
+class _in_home(object):
+    """
+    Point the stand-in Keychain at `home` for the block.
+
+    The stand-in belongs to whichever home ew.USER_CONFIG_DIR names. A sandbox
+    made by _clean_install or _switch_sandbox is not the one main() set up, so a
+    login written before the wizard runs would land in a Keychain the wizard
+    never reads. Setup's own sandbox names the same home, so it needs no change.
+    """
+
+    def __init__(self, home):
+        self.home = home
+
+    def __enter__(self):
+        self.saved = ew.USER_CONFIG_DIR
+        ew.USER_CONFIG_DIR = os.path.join(self.home, ".claude")
+        return self
+
+    def __exit__(self, *exc):
+        ew.USER_CONFIG_DIR = self.saved
+        return False
+
+
+def _login_at(directory):
+    """A login whose directory is `directory`, for the claude_code_* helpers."""
+    return ew.Login("fixture", directory, os.path.join(directory, ".claude.json"))
+
+
 def _clean_install(answers, accounts=2, claude_control=None,
                    home=None, repo=None, after=None, setup_kwargs=None,
                    expires_at=None):
@@ -8394,6 +8461,36 @@ def test_switching_refuses_what_cannot_possibly_work():
     finally:
         restore()
 
+    # The same dead logins with --no-sign-in, which is how a script runs this.
+    # Nothing is offered, so the refusal's own sentence is all the user gets:
+    # it has to say what to run, and that run only counts once /login is typed.
+    def expired(creds):
+        creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
+            (time.time() - 86400) * 1000)
+
+    def no_access_token(creds):
+        del creds["claudeAiOauth"]["accessToken"]
+
+    for label, damage, expect in (
+            ("an expired parked login", expired, "expired"),
+            ("a parked login with no access token", no_access_token,
+             "no access token")):
+        restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
+        try:
+            _edit_credential(ew.switch_store(accounts[1]), damage)
+            before = _snapshot_user_files()
+            out, err, code = _capture(lambda: ew.switch_account(
+                accounts, "2", sign_in=False))
+            check("{} is refused with --no-sign-in".format(label), code, 1)
+            check_true("{}: says why ({})".format(label, expect),
+                       expect in (out + err))
+            check_true("{}: says to sign in, then /login".format(label),
+                       "then /login" in (out + err))
+            check("{}: with the user's files untouched".format(label),
+                  _snapshot_user_files(), before)
+        finally:
+            restore()
+
     # A store holding a copy of the login the pings use: the mistake that looks
     # like it works and signs you out later.
     restore, home, accounts = _switch_sandbox(signed_in_as="1", parked=("2",))
@@ -10706,8 +10803,9 @@ def test_setup_says_when_each_login_ends():
             ("2", {"accessToken": "t", "subscriptionType": "pro"})):
         directory = stores[name]
         os.makedirs(directory, 0o700)
-        with open(os.path.join(directory, ".credentials.json"), "w") as f:
-            json.dump({"claudeAiOauth": claude_ai}, f)
+        with _in_home(home):
+            claude_code_saves(_login_at(directory),
+                              json.dumps({"claudeAiOauth": claude_ai}))
         with open(os.path.join(directory, ".claude.json"), "w") as f:
             json.dump({"oauthAccount": {"accountUuid": "parked-" + name,
                                         "emailAddress": "p%s@example.com" % name}}, f)
@@ -10733,8 +10831,9 @@ def test_setup_says_when_each_login_ends():
 
     for name in ("1", "2"):
         ping = os.path.join(home, ".claude-" + name)
-        with open(os.path.join(ping, ".credentials.json")) as f:
-            ping_end = json.load(f)["claudeAiOauth"]["refreshTokenExpiresAt"] / 1000.0
+        with _in_home(home):
+            credential = json.loads(claude_code_reads(_login_at(ping)))
+        ping_end = credential["claudeAiOauth"]["refreshTokenExpiresAt"] / 1000.0
         found = [l for l in lines
                  if "Account {} ".format(name) in l and "'s ping login ends " in l]
         check("account {} gets one line for its ping login".format(name),
@@ -10800,22 +10899,11 @@ def test_a_login_with_no_end_date_says_nothing():
     ew._systemctl = _reachable_manager
     try:
         ping, store = accounts[0], ew.switch_store(accounts[0])
-        for login, value in ((ping, None), (store, float("nan"))):
-            with open(ew.credentials_path(login)) as f:
-                document = json.load(f)
-            if value is None:
-                del document["claudeAiOauth"]["refreshTokenExpiresAt"]
-            else:
-                document["claudeAiOauth"]["refreshTokenExpiresAt"] = value
-            with open(ew.credentials_path(login), "w") as f:
-                json.dump(document, f)
+        _write_end_date(ping, None)
+        _write_end_date(store, float("nan"))
         # Infinity on the second account's ping directory, which is still
         # perfectly well signed in.
-        with open(ew.credentials_path(accounts[1])) as f:
-            document = json.load(f)
-        document["claudeAiOauth"]["refreshTokenExpiresAt"] = float("inf")
-        with open(ew.credentials_path(accounts[1]), "w") as f:
-            json.dump(document, f)
+        _write_end_date(accounts[1], float("inf"))
 
         check("no note for a missing date", ew.login_end_note(ping), "")
         check("no note for a date that is not a number",
@@ -10836,12 +10924,16 @@ def test_a_login_with_no_end_date_says_nothing():
 
 
 def _write_end_date(login, value):
-    """Set a login's refreshTokenExpiresAt, as Claude Code would have written it."""
-    with open(ew.credentials_path(login)) as f:
-        document = json.load(f)
-    document["claudeAiOauth"]["refreshTokenExpiresAt"] = value
-    with open(ew.credentials_path(login), "w") as f:
-        json.dump(document, f)
+    """
+    Set a login's refreshTokenExpiresAt, as Claude Code would have written it,
+    or remove the field when `value` is None.
+    """
+    def change(document):
+        if value is None:
+            del document["claudeAiOauth"]["refreshTokenExpiresAt"]
+        else:
+            document["claudeAiOauth"]["refreshTokenExpiresAt"] = value
+    _edit_credential(login, change)
 
 
 def test_status_survives_a_malformed_parked_store():
@@ -10866,11 +10958,9 @@ def test_status_survives_a_malformed_parked_store():
                 with open(store.config_json, "w") as f:
                     f.write(config_text)
             if claude_ai is not None:
-                with open(ew.credentials_path(store)) as f:
-                    document = json.load(f)
-                document["claudeAiOauth"] = claude_ai
-                with open(ew.credentials_path(store), "w") as f:
-                    json.dump(document, f)
+                def malform(document):
+                    document["claudeAiOauth"] = claude_ai
+                _edit_credential(store, malform)
             try:
                 result = _capture(lambda: ew.status(accounts))
                 check("status answers with {}".format(label), result[2], 0)
@@ -10905,8 +10995,9 @@ def test_setup_survives_a_malformed_parked_store():
         os.makedirs(directory, 0o700)
         with open(os.path.join(directory, ".claude.json"), "w") as f:
             f.write(config_text)
-        with open(os.path.join(directory, ".credentials.json"), "w") as f:
-            json.dump({"claudeAiOauth": claude_ai}, f)
+        with _in_home(home):
+            claude_code_saves(_login_at(directory),
+                              json.dumps({"claudeAiOauth": claude_ai}))
 
     try:
         result = _capture(lambda: _clean_install(
@@ -11024,11 +11115,11 @@ def test_setup_says_each_login_end_once():
 
         store = os.path.join(home, ".claude-switch", "1")
         os.makedirs(store, 0o700)
-        with open(os.path.join(store, ".credentials.json"), "w") as f:
-            json.dump({"claudeAiOauth": {
+        with _in_home(home):
+            claude_code_saves(_login_at(store), json.dumps({"claudeAiOauth": {
                 "accessToken": "access-parked", "refreshToken": "refresh-parked",
                 "subscriptionType": "pro",
-                "refreshTokenExpiresAt": parked_end * 1000}}, f)
+                "refreshTokenExpiresAt": parked_end * 1000}}))
         with open(os.path.join(store, ".claude.json"), "w") as f:
             json.dump({"oauthAccount": {"accountUuid": "parked-1",
                                         "emailAddress": "parked1@example.com"}}, f)
@@ -11068,7 +11159,7 @@ def test_the_doctor_sign_in_hint_ends_in_then_login():
         with open(ew.ACCOUNTS_FILE, "w") as f:
             json.dump({"pings": True, "accounts": [{"name": "1"},
                                                    {"name": "2"}]}, f)
-        os.remove(ew.credentials_path(accounts[1]))
+        claude_code_forgets(accounts[1])
         out, _, _ = _capture(lambda: ew.doctor(accounts))
         # Account 1 has no login here either, so match on account 2's command.
         command = ew.sign_in_command(accounts[1])
@@ -12526,6 +12617,15 @@ CREDENTIAL_TESTS = (
     test_setup_can_install_the_switcher_without_the_pings,
     test_a_login_never_moves_while_claude_code_is_refreshing_it,
     test_a_claude_code_kept_somewhere_else_is_not_switched,
+    test_setup_says_when_each_login_ends,
+    test_status_says_when_each_login_ends,
+    test_a_login_with_no_end_date_says_nothing,
+    test_status_survives_a_malformed_parked_store,
+    test_setup_survives_a_malformed_parked_store,
+    test_a_date_no_clock_could_show_says_nothing,
+    test_a_healthy_login_is_not_flagged_as_urgent,
+    test_setup_says_each_login_end_once,
+    test_the_doctor_sign_in_hint_ends_in_then_login,
 )
 
 
@@ -12648,6 +12748,7 @@ def main():
                  test_resume_baseline_race, test_without_systemd, test_formatting,
                  test_a_time_says_which_clock_it_is_on,
                  test_usage_line, test_init_refuses_to_checkpoint_a_refusal,
+                 test_init_sign_in_hint_after_a_failed_first_message_ends_in_then_login,
                  test_pty_drain_tolerates_a_departed_child,
                  test_run_interactive_survives_an_immediate_exit,
                  test_account_paths, test_the_accounts_file_itself,
