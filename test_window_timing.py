@@ -1018,7 +1018,7 @@ def test_init_sign_in_hint_after_a_failed_first_message_ends_in_then_login():
         with open(account.log_file) as f:
             logged = f.read()
         expected = "Sign in again with: {}. Then run ./install.sh again.".format(
-            ew.sign_in_command(account) + ", then /login")
+            ew.sign_in_step(account))
         check_true("the hint names the account's own sign-in, then /login",
                    expected in logged)
     finally:
@@ -11065,8 +11065,8 @@ def test_a_healthy_login_is_not_flagged_as_urgent():
     try:
         store = ew.switch_store(accounts[0])
         name = "Account 1's parked login"
-        renew = "to renew it before then run {}, then /login.".format(
-            ew.sign_in_command(store))
+        renew = "to renew it before then run {}.".format(
+            ew.sign_in_step(store))
 
         _write_end_date(store, (now + 20 * 86400) * 1000)
         healthy = ew.login_end_note(store, name)
@@ -11080,8 +11080,8 @@ def test_a_healthy_login_is_not_flagged_as_urgent():
         check_true("three days out is called urgent",
                    soon.startswith("Pay attention: " + name + " ends "))
         check_true("and says to sign in before then",
-                   "Run {}, then /login, before then.".format(
-                       ew.sign_in_command(store)) in soon)
+                   "Run {}, before then.".format(
+                       ew.sign_in_step(store)) in soon)
 
         check("the window: no date means no window", ew.login_window(None), None)
         check("the window: a past date is expired",
@@ -11168,7 +11168,7 @@ def test_the_doctor_sign_in_hint_ends_in_then_login():
         check("the account with no login is told to sign in", len(hints), 1)
         check_true("and the hint ends with then /login",
                    bool(hints) and hints[0].rstrip().endswith(
-                       command + ", then /login"))
+                       ew.sign_in_step(accounts[1])))
     finally:
         ew._systemctl, ew.ACCOUNTS_FILE = saved
         restore()
